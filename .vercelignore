@@ -1,0 +1,19 @@
+# Never upload secrets, local data or dev artefacts to Vercel
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.db-shm
+*.db-wal
+.venv/
+__pycache__/
+.pytest_cache/
+.git/
+.DS_Store
+docs/
+tests/
+scripts/
+Dockerfile
+compose.yaml
+Caddyfile

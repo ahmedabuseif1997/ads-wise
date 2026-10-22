@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en" data-product-theme="dark">
+<head>
+ <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#05060f">
+ <link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/assets/adwise-ad-mark-v2.png">
+ <title>Super Admin — Adwise</title><link rel="stylesheet" href="/assets/admin.css"><link rel="stylesheet" href="/assets/brand-palette.css"><script src="/assets/admin.js" defer></script>
+</head>
+<body>
+ <header><a class="brand" href="/"><img src="/assets/adwise-ad-mark-v2.png" alt=""><b>adwise<span>.</span></b></a><div><small>SUPER ADMIN</small><button class="theme-switch" type="button" data-theme-toggle aria-label="Switch color theme">☀ Light</button><a href="/app">← Workspace</a></div></header>
+ <main><section class="intro"><div><p>PLATFORM OPERATIONS</p><h1>Every workspace.<br><em>One clear view.</em></h1></div><div id="adminIdentity"></div></section>
+ <section id="adminError" class="error hidden"></section>
+ <section id="adminContent" class="hidden"><div id="totals" class="totals"></div>
+  <section class="panel requests"><div class="panel-head"><div><p>ACCESS CONTROL</p><h2>Registration requests</h2></div><span id="requestCount"></span></div><div id="requestRows"></div></section>
+  <div class="layout"><section class="panel tenants"><div class="panel-head"><div><p>BUSINESSES</p><h2>Tenant workspaces</h2></div><span id="tenantCount"></span></div><div class="table-wrap"><table><thead><tr><th>Business</th><th>Owner</th><th>Members</th><th>Campaigns</th><th>Connections</th><th>Created</th><th>Access</th></tr></thead><tbody id="tenantRows"></tbody></table></div></section>
+  <section class="panel activity"><div class="panel-head"><div><p>AUDIT STREAM</p><h2>Recent activity</h2></div></div><div id="activityRows"></div></section></div>
+ </section></main>
+</body></html>

@@ -1,0 +1,41 @@
+services:
+  ads-agent:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ads_data:/app/data
+    networks:
+      - private
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health', timeout=3).read()"]
+      interval: 30s
+      timeout: 4s
+      retries: 3
+      start_period: 15s
+    security_opt:
+      - no-new-privileges:true
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      ADS_DOMAIN: ${ADS_DOMAIN:?Set ADS_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      ads-agent:
+        condition: service_healthy
+    networks:
+      - private
+networks:
+  private:
+volumes:
+  ads_data:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,8 @@
+{$ADS_DOMAIN} {
+    encode gzip zstd
+    reverse_proxy ads-agent:8000
+    header {
+        -Server
+        X-Content-Type-Options "nosniff"
+    }
+}
