@@ -531,3 +531,49 @@ html[data-product-theme="light"] {
 .forgot-link { display: inline-block; margin: -2px 0 16px; color: #29f4e2 !important; font-size: 12px; font-weight: 800; text-decoration: none; }
 .forgot-link:hover { text-decoration: underline; }
 .form-success { color: #29f4e2; font-weight: 700; line-height: 1.6; }
+
+button, a, [role="button"] { -webkit-tap-highlight-color: transparent; }
+.tap-feedback { animation: adwise-tap .22s ease-out !important; }
+@keyframes adwise-tap { 45% { transform: scale(.975); filter: brightness(1.12); } }
+.mobile-menu-button, .mobile-menu-backdrop { display: none; }
+body.data-syncing .status-pill i { animation: sync-pulse .8s ease-in-out infinite alternate; }
+@keyframes sync-pulse { to { transform: scale(1.65); box-shadow: 0 0 12px #29f4e2; } }
+
+@media (max-width: 760px) {
+  .app { display: block !important; }
+  .sidebar {
+    display: flex !important; position: fixed !important; inset: 0 auto 0 0 !important;
+    width: min(86vw, 310px) !important; height: 100dvh !important; z-index: 90 !important;
+    padding: 20px 16px !important; transform: translateX(-105%); overflow-y: auto;
+    transition: transform .28s cubic-bezier(.2,.8,.2,1) !important;
+  }
+  .mobile-menu-open .sidebar { transform: translateX(0); }
+  .mobile-menu-backdrop { position: fixed; inset: 0; z-index: 80; border: 0; background: rgba(4,6,20,.58); backdrop-filter: blur(4px); }
+  .mobile-menu-open .mobile-menu-backdrop { display: block; }
+  .mobile-menu-button { display: grid; gap: 4px; place-content: center; width: 42px; height: 42px; flex: 0 0 42px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); color: var(--ink); }
+  .mobile-menu-button span { display: block; width: 18px; height: 2px; border-radius: 2px; background: currentColor; }
+  .sidebar .nav { display: grid !important; grid-template-columns: 1fr !important; gap: 4px !important; }
+  .sidebar .nav-item { padding: 10px 13px !important; min-height: 40px; font-size: 13px !important; }
+  .sidebar .side-label { margin: 12px 10px 4px !important; font-size: 9px !important; }
+  .sidebar .brand { margin-bottom: 14px !important; }
+  .sidebar .workspace-switch { margin-bottom: 8px !important; }
+  .sidebar .sidebar-footer { margin-top: auto !important; }
+  .main { width: 100%; min-width: 0; }
+  .topbar { gap: 10px; min-height: 64px !important; padding: 10px 14px !important; }
+  .crumb { flex: 1; min-width: 0; font-size: 10px !important; }
+  .top-actions { gap: 6px !important; }
+  .top-actions .status-pill, .top-actions .top-date, .top-actions [data-view="settings"] { display: none !important; }
+  .top-actions .ghost { min-height: 38px; padding: 8px 10px !important; font-size: 11px !important; }
+  .content { padding: 26px 14px 70px !important; overflow: hidden; }
+  .page-head { gap: 15px; }
+  .page-head h1 { font-size: clamp(31px, 10vw, 40px) !important; letter-spacing: -1.7px !important; }
+  .page-head #headAction, .page-head #headAction > button { width: 100%; }
+  .kpis, .analytics-kpis, .settings-grid, .analytics-grid, .ai-grid, .two-col { grid-template-columns: 1fr !important; }
+  .panel-pad, .panel-heading { padding: 19px !important; }
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table { min-width: 650px; }
+  .dialog-grid { grid-template-columns: 1fr !important; }
+  dialog.dialog { max-height: calc(100dvh - 20px); overflow-y: auto; }
+}
+
+@media (prefers-reduced-motion: reduce) { .tap-feedback { animation: none !important; } }

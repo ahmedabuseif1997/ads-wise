@@ -1001,6 +1001,11 @@ def privacy_css():
     return FileResponse(ROOT / 'static' / 'privacy.css', media_type='text/css')
 
 
+@app.get('/assets/legal.js')
+def legal_js():
+    return FileResponse(ROOT / 'static' / 'legal.js', media_type='text/javascript')
+
+
 @app.get('/assets/landing.css')
 def landing_css():
     return FileResponse(ROOT / 'static' / 'landing.css', media_type='text/css')
@@ -1589,32 +1594,39 @@ def google_growth_data(access_token: str, include_analytics: bool = True,
         end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
         start_date = end_date - timedelta(days=29)
         try:
-            response = httpx.post(
-                f'https://searchconsole.googleapis.com/webmasters/v3/sites/{quote(site_url, safe="")}/searchAnalytics/query',
-                headers={**headers, 'Content-Type': 'application/json'}, json={
-                    'startDate': start_date.isoformat(), 'endDate': end_date.isoformat(),
-                    'dimensions': ['query', 'page'], 'rowLimit': 250}, timeout=30)
-            response.raise_for_status()
-            rows = response.json().get('rows', [])
-            clicks = sum(float(row.get('clicks', 0)) for row in rows)
-            impressions = sum(float(row.get('impressions', 0)) for row in rows)
-            weighted_position = (sum(float(row.get('position', 0)) * float(row.get('impressions', 0))
-                                     for row in rows) / impressions) if impressions else 0
-            queries, pages = {}, {}
-            for row in rows:
-                keys = row.get('keys', ['', ''])
-                for bucket, key in ((queries, keys[0] if keys else ''),
-                                    (pages, keys[1] if len(keys) > 1 else '')):
-                    item = bucket.setdefault(key, {'name': key, 'clicks': 0, 'impressions': 0})
-                    item['clicks'] += float(row.get('clicks', 0))
-                    item['impressions'] += float(row.get('impressions', 0))
+            report_url = (
+                'https://searchconsole.googleapis.com/webmasters/v3/sites/'
+                f'{quote(site_url, safe="")}/searchAnalytics/query')
+            report_headers = {**headers, 'Content-Type': 'application/json'}
+            base_body = {'startDate': start_date.isoformat(), 'endDate': end_date.isoformat()}
+
+            def search_report(dimensions=None, row_limit=10):
+                body = {**base_body, 'rowLimit': row_limit}
+                if dimensions:
+                    body['dimensions'] = dimensions
+                response = httpx.post(report_url, headers=report_headers, json=body, timeout=30)
+                response.raise_for_status()
+                return response.json().get('rows', [])
+
+            total_rows = search_report(row_limit=1)
+            total = total_rows[0] if total_rows else {}
+            query_rows = search_report(['query'])
+            page_rows = search_report(['page'])
+
+            def named_rows(rows):
+                return [{'name': (row.get('keys') or [''])[0],
+                         'clicks': float(row.get('clicks', 0)),
+                         'impressions': float(row.get('impressions', 0))}
+                        for row in rows]
+
             result['search_console'] = {
                 'site_url': site_url, 'start_date': start_date.isoformat(), 'end_date': end_date.isoformat(),
-                'totals': {'clicks': round(clicks, 2), 'impressions': round(impressions, 2),
-                           'ctr_percent': round(clicks * 100 / impressions, 2) if impressions else 0,
-                           'position': round(weighted_position, 2)},
-                'top_queries': sorted(queries.values(), key=lambda x: x['clicks'], reverse=True)[:10],
-                'top_pages': sorted(pages.values(), key=lambda x: x['clicks'], reverse=True)[:10]}
+                'totals': {'clicks': round(float(total.get('clicks', 0)), 2),
+                           'impressions': round(float(total.get('impressions', 0)), 2),
+                           'ctr_percent': round(float(total.get('ctr', 0)) * 100, 2),
+                           'position': round(float(total.get('position', 0)), 2)},
+                'top_queries': named_rows(query_rows),
+                'top_pages': named_rows(page_rows)}
         except httpx.HTTPError:
             result['errors'].append('Search performance could not be loaded')
     if include_analytics:

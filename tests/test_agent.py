@@ -688,11 +688,22 @@ def test_google_growth_keeps_selected_search_console_property(monkeypatch):
                                           {'siteUrl':'https://tenant.example/'}]})
         return Response({'accountSummaries':[]})
 
+    requests=[]
     def fake_post(url,**kwargs):
         assert 'https%3A%2F%2Ftenant.example%2F' in url
-        return Response({'rows':[]})
+        requests.append(kwargs['json'])
+        dimensions=kwargs['json'].get('dimensions')
+        if not dimensions:
+            return Response({'rows':[{'clicks':12,'impressions':240,'ctr':.05,'position':7.25}]})
+        name='tenant search' if dimensions==['query'] else 'https://tenant.example/page'
+        return Response({'rows':[{'keys':[name],'clicks':7,'impressions':90}]})
 
     monkeypatch.setattr(main.httpx,'get',fake_get)
     monkeypatch.setattr(main.httpx,'post',fake_post)
     snapshot=main.google_growth_data('token',search_console_site='https://tenant.example/')
     assert snapshot['search_console']['site_url']=='https://tenant.example/'
+    assert snapshot['search_console']['totals']=={
+        'clicks':12.0,'impressions':240.0,'ctr_percent':5.0,'position':7.25}
+    assert snapshot['search_console']['top_queries'][0]['name']=='tenant search'
+    assert snapshot['search_console']['top_pages'][0]['name']=='https://tenant.example/page'
+    assert [request.get('dimensions') for request in requests]==[None,['query'],['page']]
