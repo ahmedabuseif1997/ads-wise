@@ -533,6 +533,7 @@ html[data-product-theme="light"] {
 .form-success { color: #29f4e2; font-weight: 700; line-height: 1.6; }
 
 button, a, [role="button"] { -webkit-tap-highlight-color: transparent; }
+button:active, a:active, [role="button"]:active { transform: scale(.98); filter: brightness(1.08); }
 .tap-feedback { animation: adwise-tap .22s ease-out !important; }
 @keyframes adwise-tap { 45% { transform: scale(.975); filter: brightness(1.12); } }
 .mobile-menu-button, .mobile-menu-backdrop { display: none; }
