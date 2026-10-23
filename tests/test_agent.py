@@ -71,6 +71,7 @@ def test_health_and_static(client):
     assert client.get('/assets/style.css').status_code==200
     assert client.get('/assets/analytics.css').status_code==200
     assert client.get('/assets/app.js').status_code==200
+    assert client.get('/assets/workspace-isolation.js').status_code==200
     assert client.get('/assets/landing.css').status_code==200
     assert client.get('/assets/cinematic.css').status_code==200
     assert client.get('/assets/landing-footer.css').status_code==200
@@ -707,3 +708,42 @@ def test_google_growth_keeps_selected_search_console_property(monkeypatch):
     assert snapshot['search_console']['top_queries'][0]['name']=='tenant search'
     assert snapshot['search_console']['top_pages'][0]['name']=='https://tenant.example/page'
     assert [request.get('dimensions') for request in requests]==[None,['query'],['page']]
+
+
+def test_google_growth_does_not_default_to_another_profile(monkeypatch):
+    class Response:
+        def __init__(self, payload): self.payload = payload
+        def raise_for_status(self): return None
+        def json(self): return self.payload
+
+    def fake_get(url, **kwargs):
+        if 'mybusinessaccountmanagement' in url:
+            return Response({'accounts': [{'name': 'accounts/1', 'accountName': 'Another business'}]})
+        if 'searchconsole' in url:
+            return Response({'siteEntry': [{'siteUrl': 'https://another.example/'}]})
+        return Response({'accountSummaries': [{'propertySummaries': [
+            {'property': 'properties/999', 'displayName': 'Another website'}]}]})
+
+    monkeypatch.setattr(main.httpx, 'get', fake_get)
+    monkeypatch.setattr(main.httpx, 'post', lambda *args, **kwargs: pytest.fail('No profile report should run'))
+    snapshot = main.google_growth_data('token')
+    assert snapshot['locations'] == []
+    assert snapshot['search_console'] is None
+    assert snapshot['google_analytics'] is None
+
+
+def test_workspace_growth_snapshot_exposes_only_assigned_profiles():
+    snapshot = {
+        'business_accounts': [{'name': 'accounts/1'}, {'name': 'accounts/2'}],
+        'locations': [{'name': 'locations/1'}],
+        'search_console_sites': [{'siteUrl': 'https://one.example/'},
+                                 {'siteUrl': 'https://two.example/'}],
+        'search_console': {'site_url': 'https://two.example/'},
+        'analytics_properties': [{'property': 'properties/1'}, {'property': 'properties/2'}],
+        'google_analytics': {'property': 'properties/2'}
+    }
+    public = main.workspace_growth_snapshot(snapshot, {'customer_id': 'accounts/2'})
+    assert public['business_accounts'] == [{'name': 'accounts/2'}]
+    assert public['search_console_sites'] == [{'siteUrl': 'https://two.example/'}]
+    assert public['analytics_properties'] == [{'property': 'properties/2'}]
+    assert len(snapshot['business_accounts']) == 2

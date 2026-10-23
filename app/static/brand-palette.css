@@ -578,3 +578,13 @@ body.data-syncing .status-pill i { animation: sync-pulse .8s ease-in-out infinit
 }
 
 @media (prefers-reduced-motion: reduce) { .tap-feedback { animation: none !important; } }
+
+.sidebar-logout {
+  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  min-height: 34px; padding: 7px 9px; border: 1px solid rgba(255,255,255,.13);
+  border-radius: 10px; background: rgba(255,255,255,.06); color: #d8ddf2;
+  font: 700 10px/1 "Inter", sans-serif;
+}
+.sidebar-logout:hover { background: rgba(255,255,255,.12); color: #fff; }
+[data-product-theme="light"] .sidebar-logout { border-color: #d9def1; background: #f4f5fb; color: #353c68; }
+@media (max-width:760px) { .sidebar-logout { min-height: 40px; padding-inline: 12px; font-size: 12px; } }

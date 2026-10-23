@@ -806,6 +806,10 @@ class SearchConsolePropertyBody(BaseModel):
         raise ValueError('Choose a valid Search Console property')
 
 
+class GoogleBusinessAccountBody(BaseModel):
+    account_name: str = Field(pattern=r'^accounts/\d+$', max_length=80)
+
+
 class GoogleAudienceSegment(BaseModel):
     kind: Literal['user_interest', 'user_list']
     id: str = Field(pattern=r'^\d+$', max_length=30)
@@ -994,6 +998,11 @@ def css():
 @app.get('/assets/app.js')
 def js():
     return FileResponse(ROOT / 'static' / 'app.js', media_type='text/javascript')
+
+
+@app.get('/assets/workspace-isolation.js')
+def workspace_isolation_js():
+    return FileResponse(ROOT / 'static' / 'workspace-isolation.js', media_type='text/javascript')
 
 
 @app.get('/assets/privacy.css')
@@ -1409,6 +1418,8 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
     publications_by_campaign = {item['campaign_id']: item for item in publications}
     specs_by_campaign = {item['campaign_id']: json.loads(item['payload']) for item in specs}
     integrations = {item['provider']: {k:v for k,v in item.items() if k != 'provider'} for item in connections}
+    growth_connection = integrations.get('google_growth')
+    growth_payload = json.loads(growth_snapshot['payload']) if growth_snapshot else None
     return {'tenant':t,'settings':{'mode':settings['mode'],'stopped':bool(settings['stopped']),
             'budget_limit_aed':f"{Decimal(settings['budget_limit_fils'])/100:.2f}",
             'approved_budget_aed':f"{Decimal(total_authorized)/100:.2f}"},
@@ -1418,7 +1429,7 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
             'integrations':{p:integrations.get(p, {'status':'not_connected'})
                             for p in ('google','meta','tiktok','google_growth')},
             'google_metrics':json.loads(google_snapshot['payload']) if google_snapshot else None,
-            'growth_metrics':json.loads(growth_snapshot['payload']) if growth_snapshot else None,
+            'growth_metrics':workspace_growth_snapshot(growth_payload, growth_connection),
             'tracking':{'meta_pixel_id':tracking['meta_pixel_id'] if tracking else '',
                         'tiktok_pixel_id':tracking['tiktok_pixel_id'] if tracking else '',
                         'events':json.loads(tracking['events']) if tracking else
@@ -1557,7 +1568,8 @@ def new_oauth_state(tenant_id: str, user_id: str) -> str:
 
 
 def google_growth_data(access_token: str, include_analytics: bool = True,
-                       analytics_property: str = '', search_console_site: str = '') -> dict:
+                       analytics_property: str = '', search_console_site: str = '',
+                       business_account: str = '') -> dict:
     headers = {'Authorization': f'Bearer {access_token}'}
     result = {'business_accounts': [], 'locations': [], 'search_console_sites': [],
               'search_console': None, 'analytics_properties': [], 'google_analytics': None,
@@ -1569,8 +1581,9 @@ def google_growth_data(access_token: str, include_analytics: bool = True,
         result['business_accounts'] = response.json().get('accounts', [])
     except httpx.HTTPError:
         result['errors'].append('Business Profile accounts could not be loaded')
-    if result['business_accounts']:
-        account_name = result['business_accounts'][0].get('name', '')
+    available_accounts = {item.get('name') for item in result['business_accounts']}
+    if business_account and business_account in available_accounts:
+        account_name = business_account
         try:
             response = httpx.get(
                 f'https://mybusinessbusinessinformation.googleapis.com/v1/{account_name}/locations',
@@ -1587,10 +1600,9 @@ def google_growth_data(access_token: str, include_analytics: bool = True,
         result['search_console_sites'] = response.json().get('siteEntry', [])
     except httpx.HTTPError:
         result['errors'].append('Search Console properties could not be loaded')
-    if include_analytics and result['search_console_sites']:
+    if include_analytics and search_console_site and result['search_console_sites']:
         available_sites = {item.get('siteUrl') for item in result['search_console_sites']}
-        site_url = search_console_site if search_console_site in available_sites else (
-            result['search_console_sites'][0].get('siteUrl', ''))
+        site_url = search_console_site if search_console_site in available_sites else ''
         end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
         start_date = end_date - timedelta(days=29)
         try:
@@ -1644,8 +1656,7 @@ def google_growth_data(access_token: str, include_analytics: bool = True,
         except httpx.HTTPError:
             result['errors'].append('Google Analytics properties could not be loaded')
         available = {item['property'] for item in result['analytics_properties']}
-        selected = analytics_property if analytics_property in available else (
-            result['analytics_properties'][0]['property'] if result['analytics_properties'] else '')
+        selected = analytics_property if analytics_property in available else ''
         if selected:
             end_date = datetime.now(timezone.utc).date() - timedelta(days=1)
             start_date = end_date - timedelta(days=29)
@@ -1687,6 +1698,25 @@ def google_growth_data(access_token: str, include_analytics: bool = True,
     return result
 
 
+def workspace_growth_snapshot(snapshot: dict | None, connection: dict | None = None) -> dict | None:
+    """Expose only the profiles explicitly assigned to this workspace."""
+    if not snapshot:
+        return None
+    public = dict(snapshot)
+    selected_site = (snapshot.get('search_console') or {}).get('site_url', '')
+    selected_property = (snapshot.get('google_analytics') or {}).get('property', '')
+    selected_account = (connection or {}).get('customer_id', '')
+    public['search_console_sites'] = [item for item in snapshot.get('search_console_sites', [])
+                                      if item.get('siteUrl') == selected_site]
+    public['analytics_properties'] = [item for item in snapshot.get('analytics_properties', [])
+                                      if item.get('property') == selected_property]
+    public['business_accounts'] = [item for item in snapshot.get('business_accounts', [])
+                                   if item.get('name') == selected_account]
+    if not selected_account:
+        public['locations'] = []
+    return public
+
+
 @app.post('/api/workspaces/{tenant_id}/integrations/google-growth/start')
 def google_growth_oauth_start(tenant_id: str, user=Depends(tenant_writer)):
     if not google_growth_configured():
@@ -1718,11 +1748,7 @@ def google_growth_oauth_callback(code: str = '', state: str = '', error: str = '
         if not refresh_token or not access_token:
             raise ValueError('Missing Google OAuth tokens')
         snapshot = google_growth_data(access_token, include_analytics=True)
-        account = (snapshot['business_accounts'] or [{}])[0]
-        site = (snapshot['search_console_sites'] or [{}])[0]
-        account_id = account.get('name') or site.get('siteUrl', '')
-        account_name = account.get('accountName') or site.get('siteUrl') or 'Google Growth'
-        save_provider_connection(saved['tenant_id'], 'google_growth', refresh_token, account_id, account_name)
+        save_provider_connection(saved['tenant_id'], 'google_growth', refresh_token, '', 'Google Growth')
         with connect() as db:
             db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)
                           ON CONFLICT(tenant_id,provider) DO UPDATE SET payload=excluded.payload,
@@ -1749,7 +1775,8 @@ def google_growth_sync(tenant_id: str, user=Depends(tenant_writer)):
     selected_property = (old_snapshot.get('google_analytics') or {}).get('property', '')
     selected_site = (old_snapshot.get('search_console') or {}).get('site_url', '')
     snapshot = google_growth_data(google_growth_access_token(connection), include_analytics=True,
-                                  analytics_property=selected_property, search_console_site=selected_site)
+                                  analytics_property=selected_property, search_console_site=selected_site,
+                                  business_account=connection.get('customer_id', ''))
     with connect() as db:
         db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)
                       ON CONFLICT(tenant_id,provider) DO UPDATE SET payload=excluded.payload,
@@ -1757,7 +1784,7 @@ def google_growth_sync(tenant_id: str, user=Depends(tenant_writer)):
                    (tenant_id, 'google_growth', json.dumps(snapshot), utcnow()))
         audit(db, user['user_id'], tenant_id, 'integration.google_growth_synced',
               {'locations': len(snapshot['locations']), 'errors': snapshot['errors']})
-    return snapshot
+    return workspace_growth_snapshot(snapshot, connection)
 
 
 @app.post('/api/workspaces/{tenant_id}/integrations/google-growth/search-console-property')
@@ -1777,7 +1804,8 @@ def google_growth_select_search_console_property(tenant_id: str, body: SearchCon
     selected_property = (old_snapshot.get('google_analytics') or {}).get('property', '')
     snapshot = google_growth_data(google_growth_access_token(connection), include_analytics=True,
                                   analytics_property=selected_property,
-                                  search_console_site=body.site_url)
+                                  search_console_site=body.site_url,
+                                  business_account=connection.get('customer_id', ''))
     with connect() as db:
         db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)
                       ON CONFLICT(tenant_id,provider) DO UPDATE SET payload=excluded.payload,
@@ -1785,7 +1813,7 @@ def google_growth_select_search_console_property(tenant_id: str, body: SearchCon
                    (tenant_id, 'google_growth', json.dumps(snapshot), utcnow()))
         audit(db, user['user_id'], tenant_id, 'integration.search_console_property_selected',
               {'site_url': body.site_url})
-    return snapshot
+    return workspace_growth_snapshot(snapshot, connection)
 
 
 @app.post('/api/workspaces/{tenant_id}/integrations/google-growth/analytics-property')
@@ -1804,7 +1832,8 @@ def google_growth_select_analytics_property(tenant_id: str, body: GoogleAnalytic
         raise HTTPException(409, 'Choose a Google Analytics property connected to this workspace')
     snapshot = google_growth_data(google_growth_access_token(connection), include_analytics=True,
                                   analytics_property=body.property,
-                                  search_console_site=(old_snapshot.get('search_console') or {}).get('site_url', ''))
+                                  search_console_site=(old_snapshot.get('search_console') or {}).get('site_url', ''),
+                                  business_account=connection.get('customer_id', ''))
     with connect() as db:
         db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)
                       ON CONFLICT(tenant_id,provider) DO UPDATE SET payload=excluded.payload,
@@ -1812,7 +1841,42 @@ def google_growth_select_analytics_property(tenant_id: str, body: GoogleAnalytic
                    (tenant_id, 'google_growth', json.dumps(snapshot), utcnow()))
         audit(db, user['user_id'], tenant_id, 'integration.google_analytics_property_selected',
               {'property': body.property})
-    return snapshot
+    return workspace_growth_snapshot(snapshot, connection)
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/google-growth/business-account')
+def google_growth_select_business_account(tenant_id: str, body: GoogleBusinessAccountBody,
+                                           user=Depends(tenant_writer)):
+    with connect() as db:
+        connection = qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='google_growth'",
+                          (tenant_id,))
+        snapshot_row = qrow(db, "SELECT payload FROM provider_snapshots WHERE tenant_id=? AND provider='google_growth'",
+                            (tenant_id,))
+    if not connection:
+        raise HTTPException(409, 'Connect Google Business Profile first')
+    old_snapshot = json.loads(snapshot_row['payload']) if snapshot_row else {}
+    accounts = {item.get('name'): item for item in old_snapshot.get('business_accounts', [])}
+    selected = accounts.get(body.account_name)
+    if not selected:
+        raise HTTPException(409, 'Choose a Business Profile account connected to this workspace')
+    connection['customer_id'] = body.account_name
+    snapshot = google_growth_data(
+        google_growth_access_token(connection), include_analytics=True,
+        analytics_property=(old_snapshot.get('google_analytics') or {}).get('property', ''),
+        search_console_site=(old_snapshot.get('search_console') or {}).get('site_url', ''),
+        business_account=body.account_name)
+    account_name = selected.get('accountName') or body.account_name
+    with connect() as db:
+        db.execute("UPDATE provider_connections SET customer_id=?,account_name=?,updated_at=? "
+                   "WHERE tenant_id=? AND provider='google_growth'",
+                   (body.account_name, account_name, utcnow(), tenant_id))
+        db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)
+                      ON CONFLICT(tenant_id,provider) DO UPDATE SET payload=excluded.payload,
+                      updated_at=excluded.updated_at''',
+                   (tenant_id, 'google_growth', json.dumps(snapshot), utcnow()))
+        audit(db, user['user_id'], tenant_id, 'integration.business_profile_account_selected',
+              {'account_name': body.account_name})
+    return workspace_growth_snapshot(snapshot, connection)
 
 
 @app.post('/api/workspaces/{tenant_id}/integrations/google-growth/sitemaps')

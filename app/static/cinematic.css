@@ -215,3 +215,6 @@ footer{position:relative;z-index:1;padding:60px 0 40px;color:var(--muted);font-s
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}.hero{height:auto}.hero-pin{position:relative}.tap-feedback{animation:none!important}}
 html:not(.js) .stages{height:auto}html:not(.js) .st-pin{position:relative;height:auto}html:not(.js) .track{flex-direction:column;gap:60px}html:not(.js) .stage{width:100%}
+
+/* Let the browser skip rendering distant sections until they approach the viewport. */
+.feature-section,#platform,#control,#privacy,#start,.site-footer{content-visibility:auto;contain-intrinsic-size:auto 900px}
