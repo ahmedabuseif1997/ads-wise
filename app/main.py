@@ -947,7 +947,7 @@ async def headers(request: Request, call_next):
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
-    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' https://www.googletagmanager.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://www.google-analytics.com; connect-src 'self' https://www.google-analytics.com https://analytics.google.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     if COOKIE_SECURE:
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Cache-Control'] = 'no-store' if request.url.path.startswith('/api/') else 'no-cache'
@@ -1057,6 +1057,11 @@ def reset_password_js():
 @app.get('/assets/landing.js')
 def landing_js():
     return FileResponse(ROOT / 'static' / 'landing.js', media_type='text/javascript')
+
+
+@app.get('/assets/analytics-tag.js')
+def analytics_tag_js():
+    return FileResponse(ROOT / 'static' / 'analytics-tag.js', media_type='text/javascript')
 
 
 @app.get('/assets/admin.css')

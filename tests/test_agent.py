@@ -77,6 +77,10 @@ def test_health_and_static(client):
     assert client.get('/assets/landing-footer.css').status_code==200
     assert client.get('/assets/brand-palette.css').status_code==200
     assert client.get('/assets/landing.js').status_code==200
+    analytics_tag=client.get('/assets/analytics-tag.js')
+    assert analytics_tag.status_code==200
+    assert 'G-4F7P3370QN' in analytics_tag.text
+    assert 'G-4F7P3370QN' in homepage.text
     assert client.get('/assets/responsive-fixes.css').status_code==200
     assert client.get('/assets/dashboard-redesign.css').status_code==200
     assert client.get('/assets/adwise-mark.svg').status_code==200
