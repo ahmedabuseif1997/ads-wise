@@ -592,6 +592,20 @@ def test_approved_google_search_campaign_is_created_paused_with_assets_and_audie
     assert saved['status']=='created' and saved['remote_resource'].endswith('/987')
 
 
+def test_google_post_parses_stream_error_list(monkeypatch):
+    response=main.httpx.Response(
+        403,
+        request=main.httpx.Request('POST','https://googleads.googleapis.com/v26/test'),
+        json=[{'error':{'message':'Developer token is not approved'}}],
+    )
+    monkeypatch.setattr(main.httpx,'post',lambda *args,**kwargs: response)
+    with pytest.raises(main.HTTPException) as exc:
+        main.google_post({'customer_id':'123','login_customer_id':'123'},'token',
+                         'googleAds:searchStream',{},'Account lookup failed')
+    assert exc.value.status_code==502
+    assert 'Developer token is not approved' in exc.value.detail
+
+
 def test_google_publish_requires_approved_budget(client, monkeypatch):
     tid,hdr=session(client)
     body=draft();body['provider']='google'

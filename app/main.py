@@ -506,7 +506,11 @@ def google_post(connection: dict, access_token: str, path: str, payload: dict,
         return response.json()
     except httpx.HTTPStatusError as exc:
         try:
-            provider_error = exc.response.json().get('error', {})
+            provider_payload = exc.response.json()
+            if isinstance(provider_payload, list):
+                provider_payload = next((item for item in provider_payload
+                                         if isinstance(item, dict) and item.get('error')), {})
+            provider_error = provider_payload.get('error', {}) if isinstance(provider_payload, dict) else {}
             provider_message = provider_error.get('message', '')
             failures = []
             for item in provider_error.get('details', []):
