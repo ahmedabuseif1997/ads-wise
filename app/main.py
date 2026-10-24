@@ -2216,7 +2216,8 @@ def google_search_operations(customer_id: str, campaign: dict, body: GoogleSearc
             'resourceName': campaign_resource, 'name': remote_name, 'status': 'PAUSED',
             'advertisingChannelType': 'SEARCH', 'campaignBudget': budget_resource,
             'maximizeConversions': {},
-            'startDate': start_date.strftime('%Y%m%d'), 'endDate': end_date.strftime('%Y%m%d'),
+            'startDateTime': f'{start_date.isoformat()} 00:00:00',
+            'endDateTime': f'{end_date.isoformat()} 23:59:59',
             'containsEuPoliticalAdvertising': 'DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING',
             'networkSettings': {'targetGoogleSearch': True, 'targetSearchNetwork': False,
                                 'targetPartnerSearchNetwork': False, 'targetContentNetwork': False}}}
