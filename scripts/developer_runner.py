@@ -52,7 +52,8 @@ def mcp(tool: str, arguments: dict) -> object:
 def cli_ready(agent: str) -> bool:
     try:
         if agent == "codex":
-            return "Logged in" in run(["codex", "login", "status"], timeout=20).stdout
+            result = run(["codex", "login", "status"], timeout=20)
+            return "Logged in" in (result.stdout + result.stderr)
         status = json.loads(run(["claude", "auth", "status"], timeout=20).stdout)
         return bool(status.get("loggedIn"))
     except (FileNotFoundError, subprocess.SubprocessError, json.JSONDecodeError):
