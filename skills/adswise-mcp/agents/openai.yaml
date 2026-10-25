@@ -1,0 +1,4 @@
+interface:
+  display_name: "AdsWise MCP"
+  short_description: "Operate Ads-Wise through its secured MCP tools"
+  default_prompt: "Use AdsWise MCP to inspect project context and manage development tasks."
