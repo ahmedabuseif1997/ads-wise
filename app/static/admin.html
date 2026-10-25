@@ -1,21 +1,84 @@
 <!doctype html>
 <html lang="en" data-product-theme="dark">
 <head>
- <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#05060f">
- <link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/assets/adwise-ad-mark-v2.png">
- <title>Super Admin — Adwise</title><link rel="stylesheet" href="/assets/admin.css"><link rel="stylesheet" href="/assets/brand-palette.css"><script src="/assets/admin.js" defer></script><script async src="https://www.googletagmanager.com/gtag/js?id=G-4F7P3370QN"></script><script src="/assets/analytics-tag.js" defer></script>
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width,initial-scale=1">
+ <meta name="theme-color" content="#05060f">
+ <link rel="manifest" href="/manifest.webmanifest">
+ <link rel="icon" href="/assets/adwise-ad-mark-v2.png">
+ <title>Super Admin — Adwise</title>
+ <link rel="stylesheet" href="/assets/admin.css">
+ <link rel="stylesheet" href="/assets/brand-palette.css">
+ <script src="/assets/admin.js" defer></script>
+ <script async src="https://www.googletagmanager.com/gtag/js?id=G-4F7P3370QN"></script>
+ <script src="/assets/analytics-tag.js" defer></script>
 </head>
-<body>
- <header><a class="brand" href="/"><img src="/assets/adwise-ad-mark-v2.png" alt=""><b>adwise<span>.</span></b></a><div><small>SUPER ADMIN</small><button class="theme-switch" type="button" data-theme-toggle aria-label="Switch color theme">☀ Light</button><a href="/app">← Workspace</a></div></header>
- <main><section class="intro"><div><p>PLATFORM OPERATIONS</p><h1>Every workspace.<br><em>One clear view.</em></h1></div><div id="adminIdentity"></div></section>
- <section id="adminError" class="error hidden"></section>
- <section id="adminContent" class="hidden"><div id="totals" class="totals"></div>
-  <section class="panel platform"><div class="panel-head"><div><p>LIVE ENVIRONMENT</p><h2>Application & infrastructure</h2></div><span id="platformState">Healthy</span></div><div id="platformFacts" class="facts"></div></section>
-  <div class="health-layout"><section class="panel"><div class="panel-head"><div><p>INTEGRATIONS</p><h2>APIs & connection health</h2></div></div><div id="apiHealth" class="health-grid"></div></section>
-  <section class="panel"><div class="panel-head"><div><p>INTELLIGENCE</p><h2>AI providers & controls</h2></div><button id="globalAiToggle" class="control-button"></button></div><div id="aiHealth" class="health-grid"></div></section></div>
-  <section class="panel requests"><div class="panel-head"><div><p>ACCESS CONTROL</p><h2>Registration requests</h2></div><span id="requestCount"></span></div><div id="requestRows"></div></section>
-  <section class="panel tenants"><div class="panel-head"><div><p>BUSINESSES</p><h2>Tenant workspaces & controls</h2></div><span id="tenantCount"></span></div><div class="table-wrap"><table><thead><tr><th>Business</th><th>Owner</th><th>Usage</th><th>Integrations</th><th>Status</th><th>Controls</th><th>Access</th></tr></thead><tbody id="tenantRows"></tbody></table></div></section>
-  <div class="layout lower"><section class="panel developer"><div class="panel-head"><div><p>SECURE DEVELOPMENT</p><h2>Codex & Claude task desk</h2></div><span>Approval-gated</span></div><form id="agentRequestForm"><label>Agent<select id="agentChoice"><option value="codex">OpenAI Codex</option><option value="claude">Anthropic Claude</option></select></label><label>Development request<textarea id="agentInstructions" minlength="10" maxlength="12000" required placeholder="Describe the code change. The secured runner creates a branch, tests it and opens a pull request for approval."></textarea></label><button type="submit" class="approve">Queue secure task</button><p id="agentNotice" class="muted"></p></form><div id="agentRequests"></div></section>
-  <section class="panel activity"><div class="panel-head"><div><p>AUDIT STREAM</p><h2>Recent activity</h2></div></div><div id="activityRows"></div></section></div>
- </section></main>
-</body></html>
+<body class="admin-shell">
+ <button class="nav-backdrop" id="navBackdrop" type="button" aria-label="Close navigation"></button>
+ <aside class="admin-sidebar" id="adminNav" aria-label="Super Admin navigation">
+  <a class="brand" href="/"><img src="/assets/adwise-ad-mark-v2.png" alt=""><span><b>adwise<span>.</span></b><small>PLATFORM CONTROL</small></span></a>
+  <div class="admin-profile"><span class="admin-avatar">A</span><div><small>SUPER ADMIN</small><strong id="adminIdentity">Loading account…</strong></div></div>
+  <nav class="admin-nav">
+   <small>COMMAND CENTER</small>
+   <a class="active" href="#overview"><span>⌂</span>Overview</a>
+   <a href="#health"><span>⌁</span>System health</a>
+   <a href="#access"><span>✓</span>Access requests</a>
+   <a href="#workspaces"><span>▦</span>Workspaces</a>
+   <small>OPERATIONS</small>
+   <a href="#agents"><span>✦</span>Developer agents</a>
+   <a href="#activity"><span>◷</span>Audit activity</a>
+  </nav>
+  <div class="sidebar-footer">
+   <a href="/app">← Return to workspace</a>
+   <button class="theme-switch" type="button" data-theme-toggle aria-label="Switch color theme">☀ Light</button>
+  </div>
+ </aside>
+
+ <div class="admin-main">
+  <header class="admin-topbar">
+   <div class="topbar-title"><button id="navToggle" class="nav-toggle" type="button" aria-controls="adminNav" aria-expanded="false" aria-label="Open navigation"><span></span><span></span><span></span></button><div><small>ADWISE / SUPER ADMIN</small><b>Platform operations</b></div></div>
+   <div class="topbar-actions"><span class="live-state"><i></i>Production</span><span class="last-updated" id="lastUpdated">Syncing…</span><button id="refreshAdmin" class="icon-button" type="button" aria-label="Refresh admin data" title="Refresh data">↻</button></div>
+  </header>
+
+  <main>
+   <section class="intro" id="overview">
+    <div><p>PLATFORM OPERATIONS</p><h1>Control every workspace.<br><em>See every signal.</em></h1><span>Infrastructure, integrations, access and automation in one operational view.</span></div>
+    <div class="intro-status"><small>PLATFORM STATE</small><strong><i></i> Operational</strong></div>
+   </section>
+
+   <section id="adminError" class="error hidden" role="alert"></section>
+   <section id="adminContent" class="hidden">
+    <div id="totals" class="totals" aria-label="Platform totals"></div>
+
+    <section class="panel platform" id="health">
+     <div class="panel-head"><div><p>LIVE ENVIRONMENT</p><h2>Application & infrastructure</h2><small>Current production configuration and deployment details.</small></div><span id="platformState">Healthy</span></div>
+     <div id="platformFacts" class="facts"></div>
+    </section>
+
+    <div class="health-layout">
+     <section class="panel"><div class="panel-head"><div><p>INTEGRATIONS</p><h2>API connection health</h2><small>Configuration and tenant adoption by provider.</small></div></div><div id="apiHealth" class="health-grid"></div></section>
+     <section class="panel"><div class="panel-head"><div><p>INTELLIGENCE</p><h2>AI & agent controls</h2><small>Provider readiness and global execution controls.</small></div><button id="globalAiToggle" class="control-button"></button></div><div id="aiHealth" class="health-grid"></div></section>
+    </div>
+
+    <section class="panel requests" id="access">
+     <div class="panel-head"><div><p>ACCESS CONTROL</p><h2>Registration requests</h2><small>Approve only verified businesses and owners.</small></div><span id="requestCount"></span></div>
+     <div id="requestRows"></div>
+    </section>
+
+    <section class="panel tenants" id="workspaces">
+     <div class="panel-head tenant-heading"><div><p>BUSINESSES</p><h2>Tenant workspaces</h2><small>Review usage, integrations and account-level controls.</small></div><span id="tenantCount"></span></div>
+     <div class="table-tools"><label class="search-box"><span>⌕</span><input id="tenantSearch" type="search" placeholder="Search workspace or owner" autocomplete="off"></label><label class="filter-box"><span>Status</span><select id="tenantFilter"><option value="all">All workspaces</option><option value="active">Active</option><option value="paused">Paused</option><option value="ai_paused">AI paused</option></select></label></div>
+     <div class="table-wrap"><table><thead><tr><th>Business</th><th>Owner</th><th>Usage</th><th>Integrations</th><th>Status</th><th>Controls</th><th>Access</th></tr></thead><tbody id="tenantRows"></tbody></table></div>
+     <div id="tenantEmpty" class="empty-state hidden">No workspaces match this filter.</div>
+    </section>
+
+    <div class="layout lower">
+     <section class="panel developer" id="agents"><div class="panel-head"><div><p>SECURE DEVELOPMENT</p><h2>Codex & Claude task desk</h2><small>Queue auditable work for approval-gated runners.</small></div><span>Approval-gated</span></div><form id="agentRequestForm"><div class="form-row"><label>Agent<select id="agentChoice"><option value="codex">OpenAI Codex</option><option value="claude">Anthropic Claude</option></select></label><div class="agent-safety"><i></i><span>Branch-only execution<br><small>No direct production writes</small></span></div></div><label>Development request<textarea id="agentInstructions" minlength="10" maxlength="12000" required placeholder="Describe the code change. The secured runner creates a branch, tests it and opens a pull request for approval."></textarea></label><div class="form-actions"><p id="agentNotice" class="muted"></p><button type="submit" class="approve">Queue secure task</button></div></form><div id="agentRequests"></div></section>
+     <section class="panel activity" id="activity"><div class="panel-head"><div><p>AUDIT STREAM</p><h2>Recent activity</h2><small>Latest administrative and tenant events.</small></div></div><div id="activityRows"></div></section>
+    </div>
+   </section>
+  </main>
+ </div>
+ <div id="toastRegion" class="toast-region" role="status" aria-live="polite"></div>
+</body>
+</html>
