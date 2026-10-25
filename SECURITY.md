@@ -7,6 +7,7 @@
 - CSRF header is required for all authenticated mutations; configured Origin checking; restrictive CSP/anti-frame headers.
 - Login attempts throttled on a rolling per-IP 15-minute window in app memory.
 - Each workspace read/write checks membership; mutations additionally require the owner role. All campaign, settings and audit queries scoped to workspace.
+- Provider resources are exclusively bound at database level: one Google/Meta/TikTok ad account, GA4 property, Search Console site, or Business Profile account cannot be attached to two workspaces. Reauthorization clears stale snapshots without releasing the existing binding until replacement or explicit disconnect.
 - All monetary values stored as integer fils, accepted to two AED decimal places. Workspace budget cap verified atomically using an SQLite write transaction.
 - AI model credentials only read from server environment. AI responses never trigger ad publishing.
 - There is **no** Google/Meta OAuth or publishing code and no route that can spend real money.

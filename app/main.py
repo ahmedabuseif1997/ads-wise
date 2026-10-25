@@ -197,6 +197,15 @@ def init_db():
           currency_code TEXT NOT NULL DEFAULT '', time_zone TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
           connected_at TEXT NOT NULL, updated_at TEXT NOT NULL,
           PRIMARY KEY(tenant_id,provider), FOREIGN KEY(tenant_id) REFERENCES tenants(id));
+        CREATE UNIQUE INDEX IF NOT EXISTS provider_ad_account_one_workspace
+          ON provider_connections(provider,customer_id)
+          WHERE customer_id <> '' AND provider IN ('google','meta','tiktok');
+        CREATE TABLE IF NOT EXISTS provider_resource_bindings(
+          tenant_id TEXT NOT NULL, provider TEXT NOT NULL, resource_type TEXT NOT NULL,
+          resource_id TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(tenant_id,provider,resource_type),
+          UNIQUE(provider,resource_type,resource_id),
+          FOREIGN KEY(tenant_id) REFERENCES tenants(id));
         CREATE TABLE IF NOT EXISTS provider_snapshots(
           tenant_id TEXT NOT NULL, provider TEXT NOT NULL, payload TEXT NOT NULL, updated_at TEXT NOT NULL,
           PRIMARY KEY(tenant_id,provider), FOREIGN KEY(tenant_id) REFERENCES tenants(id));
@@ -385,6 +394,10 @@ def save_provider_connection(tenant_id: str, provider: str, token: str, account_
     encrypted = google_cipher().encrypt(token.encode()).decode()
     now = utcnow()
     with connect() as db:
+        if account_id:
+            bind_provider_resource(db, tenant_id, provider, 'ad_account', account_id)
+        db.execute('DELETE FROM provider_snapshots WHERE tenant_id=? AND provider=?',
+                   (tenant_id, provider))
         db.execute('''INSERT INTO provider_connections(
             tenant_id,provider,refresh_token_encrypted,customer_id,login_customer_id,account_name,
             currency_code,time_zone,status,connected_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
@@ -395,6 +408,51 @@ def save_provider_connection(tenant_id: str, provider: str, token: str, account_
             status=excluded.status, connected_at=excluded.connected_at, updated_at=excluded.updated_at''',
             (tenant_id, provider, encrypted, account_id, '', account_name, currency, time_zone,
              'connected', now, now))
+
+
+class ProviderResourceConflict(ValueError):
+    pass
+
+
+def assert_provider_resource_available(db, tenant_id: str, provider: str,
+                                       resource_type: str, resource_id: str) -> None:
+    if not resource_id:
+        return
+    owner = qrow(db, '''SELECT tenant_id FROM provider_resource_bindings
+                       WHERE provider=? AND resource_type=? AND resource_id=?''',
+                 (provider, resource_type, resource_id))
+    if owner and owner['tenant_id'] != tenant_id:
+        raise ProviderResourceConflict('This external account is already connected to another workspace')
+    if resource_type == 'ad_account':
+        owner = qrow(db, '''SELECT tenant_id FROM provider_connections
+                           WHERE provider=? AND customer_id=? AND tenant_id<>?''',
+                     (provider, resource_id, tenant_id))
+        if owner:
+            raise ProviderResourceConflict('This external account is already connected to another workspace')
+
+
+def bind_provider_resource(db, tenant_id: str, provider: str,
+                           resource_type: str, resource_id: str) -> None:
+    assert_provider_resource_available(db, tenant_id, provider, resource_type, resource_id)
+    try:
+        db.execute('''INSERT INTO provider_resource_bindings(
+                      tenant_id,provider,resource_type,resource_id,created_at) VALUES(?,?,?,?,?)
+                      ON CONFLICT(tenant_id,provider,resource_type) DO UPDATE SET
+                      resource_id=excluded.resource_id,created_at=excluded.created_at''',
+                   (tenant_id, provider, resource_type, resource_id, utcnow()))
+    except Exception as exc:
+        if isinstance(exc, sqlite3.IntegrityError) or getattr(exc, 'sqlstate', '') == '23505':
+            raise ProviderResourceConflict(
+                'This external account is already connected to another workspace') from exc
+        raise
+
+
+def bind_provider_resource_or_409(db, tenant_id: str, provider: str,
+                                  resource_type: str, resource_id: str) -> None:
+    try:
+        bind_provider_resource(db, tenant_id, provider, resource_type, resource_id)
+    except ProviderResourceConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 def google_cipher() -> Fernet:
@@ -1502,6 +1560,8 @@ def google_oauth_callback(code: str = '', state: str = '', error: str = '', user
         encrypted = google_cipher().encrypt(refresh_token.encode()).decode()
         now = utcnow()
         with connect() as db:
+            db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='google'",
+                       (saved['tenant_id'],))
             db.execute('''INSERT INTO provider_connections(
                 tenant_id,provider,refresh_token_encrypted,customer_id,login_customer_id,account_name,
                 currency_code,time_zone,status,connected_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
@@ -1546,11 +1606,16 @@ def google_account_select(tenant_id: str, body: GoogleAccountSelectionBody,
         raise HTTPException(403, 'That Google Ads account is not accessible to this Google user')
     now = utcnow()
     with connect() as db:
-        db.execute('''UPDATE provider_connections SET customer_id=?,login_customer_id=?,account_name=?,
-                      currency_code=?,time_zone=?,status='connected',updated_at=?
-                      WHERE tenant_id=? AND provider='google' ''',
-                   (selected['customer_id'], selected['login_customer_id'], selected['account_name'],
-                    selected['currency_code'], selected['time_zone'], now, tenant_id))
+        try:
+            bind_provider_resource(db, tenant_id, 'google', 'ad_account', selected['customer_id'])
+            db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='google'", (tenant_id,))
+            db.execute('''UPDATE provider_connections SET customer_id=?,login_customer_id=?,account_name=?,
+                          currency_code=?,time_zone=?,status='connected',updated_at=?
+                          WHERE tenant_id=? AND provider='google' ''',
+                       (selected['customer_id'], selected['login_customer_id'], selected['account_name'],
+                        selected['currency_code'], selected['time_zone'], now, tenant_id))
+        except ProviderResourceConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
         audit(db, user['user_id'], tenant_id, 'integration.google_account_selected',
               {'customer_id': selected['customer_id'],
                'login_customer_id': selected['login_customer_id']})
@@ -1562,6 +1627,7 @@ def google_disconnect(tenant_id: str, user=Depends(tenant_writer)):
     with connect() as db:
         db.execute("DELETE FROM provider_connections WHERE tenant_id=? AND provider='google'", (tenant_id,))
         db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='google'", (tenant_id,))
+        db.execute("DELETE FROM provider_resource_bindings WHERE tenant_id=? AND provider='google'", (tenant_id,))
         audit(db,user['user_id'],tenant_id,'integration.google_disconnected',{})
     return {'ok':True}
 
@@ -1816,6 +1882,8 @@ def google_growth_select_search_console_property(tenant_id: str, body: SearchCon
                                   search_console_site=body.site_url,
                                   business_account=connection.get('customer_id', ''))
     with connect() as db:
+        bind_provider_resource_or_409(db, tenant_id, 'google_growth',
+                                      'search_console_site', body.site_url)
         db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)
                       ON CONFLICT(tenant_id,provider) DO UPDATE SET payload=excluded.payload,
                       updated_at=excluded.updated_at''',
@@ -1844,6 +1912,8 @@ def google_growth_select_analytics_property(tenant_id: str, body: GoogleAnalytic
                                   search_console_site=(old_snapshot.get('search_console') or {}).get('site_url', ''),
                                   business_account=connection.get('customer_id', ''))
     with connect() as db:
+        bind_provider_resource_or_409(db, tenant_id, 'google_growth',
+                                      'analytics_property', body.property)
         db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)
                       ON CONFLICT(tenant_id,provider) DO UPDATE SET payload=excluded.payload,
                       updated_at=excluded.updated_at''',
@@ -1876,6 +1946,8 @@ def google_growth_select_business_account(tenant_id: str, body: GoogleBusinessAc
         business_account=body.account_name)
     account_name = selected.get('accountName') or body.account_name
     with connect() as db:
+        bind_provider_resource_or_409(db, tenant_id, 'google_growth',
+                                      'business_account', body.account_name)
         db.execute("UPDATE provider_connections SET customer_id=?,account_name=?,updated_at=? "
                    "WHERE tenant_id=? AND provider='google_growth'",
                    (body.account_name, account_name, utcnow(), tenant_id))
@@ -1925,6 +1997,8 @@ def google_growth_disconnect(tenant_id: str, user=Depends(tenant_writer)):
     with connect() as db:
         db.execute("DELETE FROM provider_connections WHERE tenant_id=? AND provider='google_growth'", (tenant_id,))
         db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='google_growth'", (tenant_id,))
+        db.execute("DELETE FROM provider_resource_bindings WHERE tenant_id=? AND provider='google_growth'",
+                   (tenant_id,))
         audit(db, user['user_id'], tenant_id, 'integration.google_growth_disconnected', {})
     return {'ok': True}
 
@@ -2027,6 +2101,8 @@ def disconnect_provider(tenant_id: str, provider: Literal['meta', 'tiktok'], use
     with connect() as db:
         db.execute('DELETE FROM provider_connections WHERE tenant_id=? AND provider=?', (tenant_id, provider))
         db.execute('DELETE FROM provider_snapshots WHERE tenant_id=? AND provider=?', (tenant_id, provider))
+        db.execute('DELETE FROM provider_resource_bindings WHERE tenant_id=? AND provider=?',
+                   (tenant_id, provider))
         audit(db, user['user_id'], tenant_id, f'integration.{provider}_disconnected', {})
     return {'ok': True}
 

@@ -537,6 +537,46 @@ def test_google_oauth_connects_and_encrypts_refresh_token(client,monkeypatch):
     assert campaign_mutate[1]['json']['operations'][0]['updateMask']=='status'
 
 
+def test_ad_account_cannot_be_connected_to_two_workspaces(client, monkeypatch):
+    tenant_id,headers=session(client)
+    other=client.post('/api/workspaces',headers=headers,json={'name':'Other Business'}).json()['id']
+    monkeypatch.setattr(main,'GOOGLE_TOKEN_ENCRYPTION_KEY',Fernet.generate_key().decode())
+    main.save_provider_connection(tenant_id,'google','first-token','111','First Business')
+    main.save_provider_connection(other,'google','second-token','','Google Ads')
+    account={'customer_id':'111','login_customer_id':'222','account_name':'First Business',
+             'currency_code':'AED','time_zone':'Asia/Dubai'}
+    monkeypatch.setattr(main,'google_access_token',lambda connection:'access-token')
+    monkeypatch.setattr(main,'google_accessible_accounts',lambda token:[account])
+
+    response=client.post(f'/api/workspaces/{other}/integrations/google/account',headers=headers,
+                         json={'customer_id':'111','login_customer_id':'222'})
+
+    assert response.status_code==409
+    assert response.json()['detail']=='This external account is already connected to another workspace'
+    with main.connect() as db:
+        connection=main.qrow(db,"SELECT customer_id FROM provider_connections "
+                                "WHERE tenant_id=? AND provider='google'",(other,))
+        bindings=main.qrows(db,"SELECT tenant_id FROM provider_resource_bindings "
+                                "WHERE provider='google' AND resource_id='111'")
+    assert connection['customer_id']==''
+    assert bindings==[{'tenant_id':tenant_id}]
+
+
+def test_all_external_resource_types_are_exclusive_to_one_workspace(client):
+    tenant_id,headers=session(client)
+    other=client.post('/api/workspaces',headers=headers,json={'name':'Other Business'}).json()['id']
+    resources=[('meta','ad_account'),('tiktok','ad_account'),
+               ('google_growth','analytics_property'),
+               ('google_growth','search_console_site'),
+               ('google_growth','business_account')]
+    with main.connect() as db:
+        for provider,resource_type in resources:
+            resource_id=f'{provider}-{resource_type}'
+            main.bind_provider_resource(db,tenant_id,provider,resource_type,resource_id)
+            with pytest.raises(main.ProviderResourceConflict):
+                main.bind_provider_resource(db,other,provider,resource_type,resource_id)
+
+
 def test_approved_google_search_campaign_is_created_paused_with_assets_and_audience(client, monkeypatch):
     tid,hdr=session(client)
     body=draft();body.update({'provider':'google','name':'Be Relax Search','service':'Massage Abu Dhabi',
