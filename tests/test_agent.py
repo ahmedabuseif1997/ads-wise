@@ -299,14 +299,21 @@ def test_super_admin_health_controls_and_developer_queue(client,monkeypatch):
         'jsonrpc':'2.0','id':2,'method':'tools/call','params':{
             'name':'list_development_tasks','arguments':{'agent':'codex'}}})
     assert listed.status_code==200 and queued.json()['id'] in listed.json()['result']['content'][0]['text']
+    heartbeat=client.post('/mcp/developer',headers=mcp_headers,json={
+        'jsonrpc':'2.0','id':3,'method':'tools/call','params':{
+            'name':'report_runner_status','arguments':{
+                'agent':'codex','status':'ready','runner_name':'test-runner'}}})
+    assert heartbeat.status_code==200
     updated=client.post('/mcp/developer',headers=mcp_headers,json={
-        'jsonrpc':'2.0','id':3,'method':'tools/call','params':{'name':'update_development_task','arguments':{
+        'jsonrpc':'2.0','id':4,'method':'tools/call','params':{'name':'update_development_task','arguments':{
             'id':queued.json()['id'],'status':'needs_approval','branch_name':'codex/admin-a11y',
             'pull_request_url':'https://github.com/ahmedabuseif1997/ads-wise/pull/123'}}})
     assert updated.status_code==200
     refreshed=client.get('/api/admin/overview').json()
     assert refreshed['health']['global_ai_paused'] is True
     assert refreshed['agent_requests'][0]['agent']=='codex'
+    assert next(item for item in refreshed['health']['developer_agents']
+                if item['key']=='codex')['configured'] is True
     with main.connect() as db:
         member_id=secrets.token_hex(12)
         db.execute('INSERT INTO users VALUES(?,?,?,?)',

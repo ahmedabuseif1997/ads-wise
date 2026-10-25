@@ -191,6 +191,9 @@ def init_db():
           id TEXT PRIMARY KEY, agent TEXT NOT NULL, instructions TEXT NOT NULL, status TEXT NOT NULL,
           branch_name TEXT NOT NULL DEFAULT '', pull_request_url TEXT NOT NULL DEFAULT '',
           created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS developer_agent_runners(
+          agent TEXT PRIMARY KEY, runner_name TEXT NOT NULL, status TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS campaigns(
           id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, creator_id TEXT NOT NULL,
           name TEXT NOT NULL, provider TEXT NOT NULL, objective TEXT NOT NULL,
@@ -1449,6 +1452,8 @@ def super_admin_overview(user=Depends(super_admin_user)):
         agent_requests = qrows(db, '''SELECT id,agent,instructions,status,branch_name,pull_request_url,
                                       created_at,updated_at FROM developer_agent_requests
                                       ORDER BY created_at DESC LIMIT 30''')
+        runner_rows = qrows(db, '''SELECT agent,runner_name,status,last_seen_at
+                                  FROM developer_agent_runners''')
         global_ai_paused = platform_flag(db, 'global_ai_paused')
         db.execute('SELECT 1')
     hosting = ('Vercel' if os.getenv('VERCEL') else
@@ -1478,10 +1483,22 @@ def super_admin_overview(user=Depends(super_admin_user)):
         {'name':'MiniMax','model':MINIMAX_MODEL,'configured':bool(MINIMAX_API_KEY and MINIMAX_BASE_URL)},
         {'name':'OpenAI','model':AI_MODEL,'configured':bool(AI_API_KEY and AI_BASE_URL)},
     ]
-    developer_agents = [
-        {'name':'OpenAI Codex','key':'codex','configured':bool(os.getenv('CODEX_AGENT_ENDPOINT'))},
-        {'name':'Anthropic Claude','key':'claude','configured':bool(os.getenv('CLAUDE_AGENT_ENDPOINT'))},
-    ]
+    runners = {row['agent']: row for row in runner_rows}
+    runner_cutoff = datetime.now(timezone.utc) - timedelta(minutes=3)
+    developer_agents = []
+    for name,key,legacy_endpoint in (
+        ('OpenAI Codex','codex',os.getenv('CODEX_AGENT_ENDPOINT')),
+        ('Anthropic Claude','claude',os.getenv('CLAUDE_AGENT_ENDPOINT')),
+    ):
+        runner = runners.get(key)
+        try:
+            recently_seen = bool(runner and datetime.fromisoformat(runner['last_seen_at']) >= runner_cutoff)
+        except (TypeError, ValueError):
+            recently_seen = False
+        ready = bool((runner and runner['status'] == 'ready' and recently_seen) or legacy_endpoint)
+        developer_agents.append({'name':name,'key':key,'configured':ready,
+                                 'runner_name':runner['runner_name'] if runner else '',
+                                 'last_seen_at':runner['last_seen_at'] if runner else ''})
     return {'totals': totals, 'tenants': tenants, 'recent_activity': recent, 'registration_requests': requests,
             'agent_requests':agent_requests,'admin': {'email': user['email']},
             'platform':{'app_name':'Ads-Wise — AI Marketing OS','production_url':PUBLIC_ORIGIN or 'https://ads-wise.com',
@@ -1557,6 +1574,11 @@ def developer_mcp(request_body: dict, request: Request):
              'inputSchema':{'type':'object','required':['id','status'],'properties':{
                  'id':{'type':'string'},'status':{'type':'string','enum':['in_progress','needs_approval','completed','failed']},
                  'branch_name':{'type':'string'},'pull_request_url':{'type':'string'}},'additionalProperties':False}}
+            ,{'name':'report_runner_status','description':'Report a secured local runner heartbeat.',
+              'inputSchema':{'type':'object','required':['agent','status','runner_name'],'properties':{
+                  'agent':{'type':'string','enum':['codex','claude']},
+                  'status':{'type':'string','enum':['ready','unavailable']},
+                  'runner_name':{'type':'string','minLength':1,'maxLength':120}},'additionalProperties':False}}
         ]}
     elif method == 'tools/call':
         params=request_body.get('params') or {}
@@ -1589,6 +1611,18 @@ def developer_mcp(request_body: dict, request: Request):
                               WHERE id=?''',(status,str(args.get('branch_name',''))[:200],pull_request_url,
                                              utcnow(),task['id']))
             payload={'ok':True,'status':status}
+        elif name == 'report_runner_status':
+            agent,status=str(args.get('agent','')),str(args.get('status',''))
+            runner_name=str(args.get('runner_name','')).strip()[:120]
+            if agent not in ('codex','claude') or status not in ('ready','unavailable') or not runner_name:
+                raise HTTPException(422, 'Valid agent, status and runner name are required')
+            now=utcnow()
+            with connect() as db:
+                db.execute('''INSERT INTO developer_agent_runners(agent,runner_name,status,last_seen_at)
+                              VALUES(?,?,?,?) ON CONFLICT(agent) DO UPDATE SET
+                              runner_name=excluded.runner_name,status=excluded.status,
+                              last_seen_at=excluded.last_seen_at''',(agent,runner_name,status,now))
+            payload={'ok':True,'agent':agent,'status':status,'last_seen_at':now}
         else:
             raise HTTPException(404, 'Unknown MCP tool')
         result={'content':[{'type':'text','text':json.dumps(payload,ensure_ascii=False)}]}
