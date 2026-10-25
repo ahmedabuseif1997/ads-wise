@@ -70,6 +70,8 @@ TIKTOK_APP_ID = os.getenv('TIKTOK_APP_ID', '').strip()
 TIKTOK_APP_SECRET = os.getenv('TIKTOK_APP_SECRET', '').strip()
 TIKTOK_AUTHORIZATION_URL = os.getenv('TIKTOK_AUTHORIZATION_URL', '').strip()
 TIKTOK_API_VERSION = os.getenv('TIKTOK_API_VERSION', 'v2.0').strip()
+GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY', 'ahmedabuseif1997/ads-wise').strip()
+MCP_AGENT_TOKEN = os.getenv('MCP_AGENT_TOKEN', '').strip()
 COOKIE_NAME = 'spa_ads_session'
 SESSION_DAYS = 7
 _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
@@ -133,6 +135,16 @@ def qrows(db, sql, params=()):
     return [dict(r) for r in db.execute(sql, params).fetchall()]
 
 
+def platform_flag(db, key: str) -> bool:
+    row = qrow(db, 'SELECT value FROM platform_settings WHERE key=?', (key,))
+    return bool(row and row['value'] == '1')
+
+
+def tenant_access(db, tenant_id: str) -> dict:
+    settings = qrow(db, 'SELECT tenant_paused,ai_paused FROM tenant_settings WHERE tenant_id=?', (tenant_id,))
+    return settings or {'tenant_paused': 0, 'ai_paused': 0}
+
+
 def audit(db, user_id: str, tenant_id: str, action: str, detail: dict):
     db.execute('INSERT INTO audit_log(id,tenant_id,user_id,action,detail,created_at) VALUES(?,?,?,?,?,?)',
                (secrets.token_hex(12), tenant_id, user_id, action, json.dumps(detail, ensure_ascii=False), utcnow()))
@@ -170,8 +182,15 @@ def init_db():
           ON password_reset_tokens(user_id,created_at DESC);
         CREATE TABLE IF NOT EXISTS tenant_settings(
           tenant_id TEXT PRIMARY KEY, mode TEXT NOT NULL DEFAULT 'supervised', stopped INTEGER NOT NULL DEFAULT 0,
-          budget_limit_fils INTEGER NOT NULL DEFAULT 0,
+          budget_limit_fils INTEGER NOT NULL DEFAULT 0, tenant_paused INTEGER NOT NULL DEFAULT 0,
+          ai_paused INTEGER NOT NULL DEFAULT 0,
           FOREIGN KEY(tenant_id) REFERENCES tenants(id));
+        CREATE TABLE IF NOT EXISTS platform_settings(
+          key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS developer_agent_requests(
+          id TEXT PRIMARY KEY, agent TEXT NOT NULL, instructions TEXT NOT NULL, status TEXT NOT NULL,
+          branch_name TEXT NOT NULL DEFAULT '', pull_request_url TEXT NOT NULL DEFAULT '',
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS campaigns(
           id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, creator_id TEXT NOT NULL,
           name TEXT NOT NULL, provider TEXT NOT NULL, objective TEXT NOT NULL,
@@ -221,6 +240,15 @@ def init_db():
           tiktok_pixel_id TEXT NOT NULL DEFAULT '', events TEXT NOT NULL DEFAULT '{}',
           updated_at TEXT NOT NULL, FOREIGN KEY(tenant_id) REFERENCES tenants(id));
         ''')
+        if db.postgres:
+            db.execute('ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS tenant_paused INTEGER NOT NULL DEFAULT 0')
+            db.execute('ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS ai_paused INTEGER NOT NULL DEFAULT 0')
+        else:
+            columns = {row['name'] for row in qrows(db, 'PRAGMA table_info(tenant_settings)')}
+            if 'tenant_paused' not in columns:
+                db.execute('ALTER TABLE tenant_settings ADD COLUMN tenant_paused INTEGER NOT NULL DEFAULT 0')
+            if 'ai_paused' not in columns:
+                db.execute('ALTER TABLE tenant_settings ADD COLUMN ai_paused INTEGER NOT NULL DEFAULT 0')
         first_user = qrow(db, 'SELECT id FROM users LIMIT 1')
         if not first_user:
             email = os.getenv('ADMIN_EMAIL', '').strip().lower()
@@ -302,8 +330,11 @@ def tenant_member(tenant_id: str, user=Depends(current_user)):
                 raise HTTPException(404, 'Workspace not found')
             return {**user, 'role': 'owner', 'super_admin': True}
         m = qrow(db, 'SELECT role FROM memberships WHERE user_id=? AND tenant_id=?', (user['user_id'], tenant_id))
+        access = tenant_access(db, tenant_id)
     if not m:
         raise HTTPException(404, 'Workspace not found')
+    if access['tenant_paused']:
+        raise HTTPException(423, 'This workspace is paused by the platform administrator')
     return {**user, 'role': m['role']}
 
 
@@ -314,8 +345,11 @@ def tenant_writer(tenant_id: str, request: Request, user=Depends(mutation_user))
                 raise HTTPException(404, 'Workspace not found')
             return {**user, 'role': 'owner', 'super_admin': True}
         m = qrow(db, 'SELECT role FROM memberships WHERE user_id=? AND tenant_id=?', (user['user_id'], tenant_id))
+        access = tenant_access(db, tenant_id)
     if not m:
         raise HTTPException(404, 'Workspace not found')
+    if access['tenant_paused']:
+        raise HTTPException(423, 'This workspace is paused by the platform administrator')
     if m['role'] != 'owner':
         raise HTTPException(403, 'Owner approval required')
     return {**user, 'role': m['role']}
@@ -329,8 +363,11 @@ def tenant_editor(tenant_id: str, request: Request, user=Depends(mutation_user))
             return {**user, 'role': 'owner', 'super_admin': True}
         m = qrow(db, 'SELECT role FROM memberships WHERE user_id=? AND tenant_id=?',
                  (user['user_id'], tenant_id))
+        access = tenant_access(db, tenant_id)
     if not m:
         raise HTTPException(404, 'Workspace not found')
+    if access['tenant_paused']:
+        raise HTTPException(423, 'This workspace is paused by the platform administrator')
     if m['role'] not in ('owner', 'manager'):
         raise HTTPException(403, 'Manager or owner access required')
     return {**user, 'role': m['role']}
@@ -707,6 +744,20 @@ class WorkspaceBody(BaseModel):
     name: str = Field(min_length=2, max_length=90)
 
 
+class AdminTenantControlBody(BaseModel):
+    tenant_paused: bool | None = None
+    ai_paused: bool | None = None
+
+
+class AdminGlobalAIControlBody(BaseModel):
+    paused: bool
+
+
+class DeveloperAgentRequestBody(BaseModel):
+    agent: Literal['codex', 'claude']
+    instructions: str = Field(min_length=10, max_length=12000)
+
+
 class CampaignBody(BaseModel):
     name: str = Field(min_length=3, max_length=120)
     provider: str = Field(pattern='^(meta|google|tiktok)$')
@@ -1032,9 +1083,14 @@ def reset_password_page():
     return FileResponse(ROOT / 'static' / 'reset-password.html')
 
 
-@app.get('/super-admin')
-def super_admin_page(user=Depends(super_admin_user)):
+@app.get('/admin')
+def admin_page(user=Depends(super_admin_user)):
     return FileResponse(ROOT / 'static' / 'admin.html')
+
+
+@app.get('/super-admin')
+def legacy_super_admin_page(user=Depends(super_admin_user)):
+    return RedirectResponse('/admin', status_code=308)
 
 
 @app.get('/privacy')
@@ -1228,7 +1284,7 @@ def register(body: RegisterBody, response: Response, request: Request):
                        (request_id, email, body.business_name.strip(), hash_password(body.password),
                         'pending', utcnow(), ''))
             sent = send_registration_email(REGISTRATION_INBOX, 'New Adwise registration request',
-                f'Business: {body.business_name.strip()}\nEmail: {email}\n\nReview: {PUBLIC_ORIGIN}/super-admin')
+                f'Business: {body.business_name.strip()}\nEmail: {email}\n\nReview: {PUBLIC_ORIGIN}/admin')
             return {'ok': True, 'status': 'pending', 'message': 'Your request was sent for approval.',
                     'notification_sent': sent}
 
@@ -1358,25 +1414,187 @@ def super_admin_overview(user=Depends(super_admin_user)):
             'connections': qrow(db, "SELECT COUNT(*) AS n FROM provider_connections WHERE status='connected'")['n'],
             'pending_requests': qrow(db, "SELECT COUNT(*) AS n FROM registration_requests WHERE status='pending'")['n'],
         }
-        tenants = qrows(db, '''SELECT t.id,t.name,t.created_at,
+        tenants = qrows(db, '''SELECT t.id,t.name,t.created_at,ts.tenant_paused,ts.ai_paused,ts.stopped,
             COUNT(DISTINCT m.user_id) AS member_count,
             COUNT(DISTINCT c.id) AS campaign_count,
             COUNT(DISTINCT pc.provider) AS connection_count,
             MAX(CASE WHEN m.role='owner' THEN u.email ELSE '' END) AS owner_email
             FROM tenants t
             LEFT JOIN memberships m ON m.tenant_id=t.id
+            LEFT JOIN tenant_settings ts ON ts.tenant_id=t.id
             LEFT JOIN users u ON u.id=m.user_id
             LEFT JOIN campaigns c ON c.tenant_id=t.id
             LEFT JOIN provider_connections pc ON pc.tenant_id=t.id AND pc.status='connected'
-            GROUP BY t.id,t.name,t.created_at ORDER BY t.created_at DESC''')
+            GROUP BY t.id,t.name,t.created_at,ts.tenant_paused,ts.ai_paused,ts.stopped
+            ORDER BY t.created_at DESC''')
+        connections = qrows(db, '''SELECT pc.tenant_id,pc.provider,pc.account_name,pc.customer_id,pc.status,
+                                    pc.updated_at,ps.updated_at AS last_sync
+                                    FROM provider_connections pc LEFT JOIN provider_snapshots ps
+                                    ON ps.tenant_id=pc.tenant_id AND ps.provider=pc.provider
+                                    ORDER BY pc.updated_at DESC''')
+        by_tenant = {}
+        for connection in connections:
+            by_tenant.setdefault(connection.pop('tenant_id'), []).append(connection)
+        for tenant in tenants:
+            tenant['tenant_paused'] = bool(tenant['tenant_paused'])
+            tenant['ai_paused'] = bool(tenant['ai_paused'])
+            tenant['automation_stopped'] = bool(tenant.pop('stopped'))
+            tenant['integrations'] = by_tenant.get(tenant['id'], [])
         recent = qrows(db, '''SELECT a.action,a.created_at,t.name AS tenant_name,u.email
                              FROM audit_log a LEFT JOIN tenants t ON t.id=a.tenant_id
                              LEFT JOIN users u ON u.id=a.user_id
                              ORDER BY a.created_at DESC LIMIT 30''')
         requests = qrows(db, '''SELECT id,email,business_name,status,created_at,reviewed_at,decision_note
                                FROM registration_requests ORDER BY created_at DESC LIMIT 100''')
+        agent_requests = qrows(db, '''SELECT id,agent,instructions,status,branch_name,pull_request_url,
+                                      created_at,updated_at FROM developer_agent_requests
+                                      ORDER BY created_at DESC LIMIT 30''')
+        global_ai_paused = platform_flag(db, 'global_ai_paused')
+        db.execute('SELECT 1')
+    hosting = ('Vercel' if os.getenv('VERCEL') else
+               'DigitalOcean App Platform' if os.getenv('DIGITALOCEAN_APP_ID') or os.getenv('APP_ID') else
+               'Docker / self-hosted')
+    database = 'SQLite'
+    if DATABASE_URL:
+        hostname = (urlparse(DATABASE_URL).hostname or '').lower()
+        database = ('Neon PostgreSQL' if 'neon.tech' in hostname else
+                    'Supabase PostgreSQL' if 'supabase' in hostname else 'PostgreSQL')
+    provider_counts = {}
+    for connection in connections:
+        provider_counts[connection['provider']] = provider_counts.get(connection['provider'], 0) + 1
+    services = [
+        {'key':'google','name':'Google Ads API','configured':google_configured(),
+         'connected_tenants':provider_counts.get('google',0)},
+        {'key':'meta','name':'Meta Marketing API','configured':meta_configured(),
+         'connected_tenants':provider_counts.get('meta',0)},
+        {'key':'tiktok','name':'TikTok Marketing API','configured':tiktok_configured(),
+         'connected_tenants':provider_counts.get('tiktok',0)},
+        {'key':'google_growth','name':'Google Business Profile, Search Console & Analytics APIs',
+         'configured':bool(GOOGLE_GROWTH_CLIENT_ID and GOOGLE_GROWTH_CLIENT_SECRET and GOOGLE_TOKEN_ENCRYPTION_KEY),
+         'connected_tenants':provider_counts.get('google_growth',0)},
+        {'key':'resend','name':'Resend Email API','configured':bool(RESEND_API_KEY),'connected_tenants':0},
+    ]
+    ai_services = [
+        {'name':'MiniMax','model':MINIMAX_MODEL,'configured':bool(MINIMAX_API_KEY and MINIMAX_BASE_URL)},
+        {'name':'OpenAI','model':AI_MODEL,'configured':bool(AI_API_KEY and AI_BASE_URL)},
+    ]
+    developer_agents = [
+        {'name':'OpenAI Codex','key':'codex','configured':bool(os.getenv('CODEX_AGENT_ENDPOINT'))},
+        {'name':'Anthropic Claude','key':'claude','configured':bool(os.getenv('CLAUDE_AGENT_ENDPOINT'))},
+    ]
     return {'totals': totals, 'tenants': tenants, 'recent_activity': recent, 'registration_requests': requests,
-            'admin': {'email': user['email']}}
+            'agent_requests':agent_requests,'admin': {'email': user['email']},
+            'platform':{'app_name':'Ads-Wise — AI Marketing OS','production_url':PUBLIC_ORIGIN or 'https://ads-wise.com',
+                        'hosting':hosting,'region':os.getenv('VERCEL_REGION') or os.getenv('REGION') or 'Not reported',
+                        'deployment':os.getenv('VERCEL_GIT_COMMIT_SHA') or os.getenv('SOURCE_VERSION') or
+                                     os.getenv('GITHUB_SHA') or 'Not reported',
+                        'database':database,'repository':GITHUB_REPOSITORY},
+            'health':{'app':'healthy','database':'healthy','apis':services,'ai':ai_services,
+                      'global_ai_paused':global_ai_paused,'developer_agents':developer_agents,
+                      'mcp':{'name':'Ads-Wise Developer MCP','configured':bool(MCP_AGENT_TOKEN),
+                             'endpoint':f'{PUBLIC_ORIGIN or "https://ads-wise.com"}/mcp/developer'}}}
+
+
+@app.post('/api/admin/tenants/{tenant_id}/controls')
+def admin_tenant_controls(tenant_id: str, body: AdminTenantControlBody,
+                          user=Depends(super_admin_mutation)):
+    if body.tenant_paused is None and body.ai_paused is None:
+        raise HTTPException(422, 'Choose at least one control')
+    with connect() as db:
+        if not qrow(db, 'SELECT id FROM tenants WHERE id=?', (tenant_id,)):
+            raise HTTPException(404, 'Workspace not found')
+        if body.tenant_paused is not None:
+            db.execute('UPDATE tenant_settings SET tenant_paused=? WHERE tenant_id=?',
+                       (int(body.tenant_paused), tenant_id))
+        if body.ai_paused is not None:
+            db.execute('UPDATE tenant_settings SET ai_paused=? WHERE tenant_id=?',
+                       (int(body.ai_paused), tenant_id))
+        audit(db,user['user_id'],tenant_id,'admin.tenant_controls_updated',
+              {'tenant_paused':body.tenant_paused,'ai_paused':body.ai_paused})
+    return {'ok':True,'tenant_paused':body.tenant_paused,'ai_paused':body.ai_paused}
+
+
+@app.post('/api/admin/ai-control')
+def admin_global_ai_control(body: AdminGlobalAIControlBody, user=Depends(super_admin_mutation)):
+    with connect() as db:
+        db.execute('''INSERT INTO platform_settings(key,value,updated_at,updated_by) VALUES(?,?,?,?)
+                      ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at,
+                      updated_by=excluded.updated_by''',
+                   ('global_ai_paused','1' if body.paused else '0',utcnow(),user['user_id']))
+    return {'ok':True,'paused':body.paused}
+
+
+@app.post('/api/admin/developer-agent-requests')
+def create_developer_agent_request(body: DeveloperAgentRequestBody, user=Depends(super_admin_mutation)):
+    request_id,now=secrets.token_hex(12),utcnow()
+    with connect() as db:
+        db.execute('''INSERT INTO developer_agent_requests(
+                      id,agent,instructions,status,created_by,created_at,updated_at)
+                      VALUES(?,?,?,?,?,?,?)''',
+                   (request_id,body.agent,body.instructions.strip(),'awaiting_runner',user['user_id'],now,now))
+    return {'id':request_id,'agent':body.agent,'status':'awaiting_runner',
+            'message':'Request saved. A secured Codex or Claude runner must be configured before execution.'}
+
+
+@app.post('/mcp/developer')
+def developer_mcp(request_body: dict, request: Request):
+    authorization = request.headers.get('Authorization', '')
+    supplied = authorization[7:] if authorization.startswith('Bearer ') else ''
+    if not MCP_AGENT_TOKEN or not supplied or not hmac.compare_digest(supplied, MCP_AGENT_TOKEN):
+        raise HTTPException(401, 'Valid MCP agent token required')
+    method,request_id=request_body.get('method'),request_body.get('id')
+    if method == 'initialize':
+        result={'protocolVersion':'2025-06-18','capabilities':{'tools':{}},
+                'serverInfo':{'name':'Ads-Wise Developer MCP','version':'1.0.0'}}
+    elif method == 'tools/list':
+        result={'tools':[
+            {'name':'get_project_context','description':'Get the approved Ads-Wise repository and workflow boundaries.',
+             'inputSchema':{'type':'object','properties':{},'additionalProperties':False}},
+            {'name':'list_development_tasks','description':'List queued tasks for Codex or Claude.',
+             'inputSchema':{'type':'object','properties':{
+                 'agent':{'type':'string','enum':['codex','claude']}},'additionalProperties':False}},
+            {'name':'update_development_task','description':'Report branch, pull request, completion, or failure.',
+             'inputSchema':{'type':'object','required':['id','status'],'properties':{
+                 'id':{'type':'string'},'status':{'type':'string','enum':['in_progress','needs_approval','completed','failed']},
+                 'branch_name':{'type':'string'},'pull_request_url':{'type':'string'}},'additionalProperties':False}}
+        ]}
+    elif method == 'tools/call':
+        params=request_body.get('params') or {}
+        name,args=params.get('name'),params.get('arguments') or {}
+        if name == 'get_project_context':
+            payload={'repository':GITHUB_REPOSITORY,'production_url':PUBLIC_ORIGIN or 'https://ads-wise.com',
+                     'workflow':['create a branch','make scoped changes','run targeted tests',
+                                 'open a pull request','wait for owner approval before merge'],
+                     'forbidden':['production secrets','direct production shell','unapproved merge or deployment']}
+        elif name == 'list_development_tasks':
+            agent=args.get('agent','')
+            if agent not in ('codex','claude'):
+                raise HTTPException(422, 'Choose codex or claude')
+            with connect() as db:
+                payload=qrows(db,'''SELECT id,agent,instructions,status,branch_name,pull_request_url,created_at
+                                    FROM developer_agent_requests WHERE agent=? AND status IN ('awaiting_runner','in_progress')
+                                    ORDER BY created_at''',(agent,))
+        elif name == 'update_development_task':
+            status=args.get('status','')
+            if status not in ('in_progress','needs_approval','completed','failed'):
+                raise HTTPException(422, 'Invalid task status')
+            pull_request_url=str(args.get('pull_request_url',''))[:1000]
+            if pull_request_url and not pull_request_url.startswith(f'https://github.com/{GITHUB_REPOSITORY}/pull/'):
+                raise HTTPException(422, 'Pull request must belong to the configured repository')
+            with connect() as db:
+                task=qrow(db,'SELECT id FROM developer_agent_requests WHERE id=?',(str(args.get('id','')),))
+                if not task:
+                    raise HTTPException(404, 'Development task not found')
+                db.execute('''UPDATE developer_agent_requests SET status=?,branch_name=?,pull_request_url=?,updated_at=?
+                              WHERE id=?''',(status,str(args.get('branch_name',''))[:200],pull_request_url,
+                                             utcnow(),task['id']))
+            payload={'ok':True,'status':status}
+        else:
+            raise HTTPException(404, 'Unknown MCP tool')
+        result={'content':[{'type':'text','text':json.dumps(payload,ensure_ascii=False)}]}
+    else:
+        return {'jsonrpc':'2.0','id':request_id,'error':{'code':-32601,'message':'Method not found'}}
+    return {'jsonrpc':'2.0','id':request_id,'result':result}
 
 
 @app.post('/api/admin/registration-requests/{request_id}/{decision}')
@@ -1488,6 +1706,7 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
     growth_connection = integrations.get('google_growth')
     growth_payload = json.loads(growth_snapshot['payload']) if growth_snapshot else None
     return {'tenant':t,'settings':{'mode':settings['mode'],'stopped':bool(settings['stopped']),
+            'tenant_paused':bool(settings['tenant_paused']),'ai_paused':bool(settings['ai_paused']),
             'budget_limit_aed':f"{Decimal(settings['budget_limit_fils'])/100:.2f}",
             'approved_budget_aed':f"{Decimal(total_authorized)/100:.2f}"},
             'campaigns':[campaign_public(c, publications_by_campaign.get(c['id']), specs_by_campaign.get(c['id']))
@@ -2970,8 +3189,11 @@ async def recommend_campaign(tenant_id: str, body: CampaignRecommendationBody, u
     with connect() as db:
         settings = qrow(db, 'SELECT * FROM tenant_settings WHERE tenant_id=?', (tenant_id,))
         tenant = qrow(db, 'SELECT * FROM tenants WHERE id=?', (tenant_id,))
+        global_ai_paused = platform_flag(db, 'global_ai_paused')
     if settings['stopped']:
         raise HTTPException(409, 'Emergency stop active. Resume planning explicitly.')
+    if global_ai_paused or settings['ai_paused']:
+        raise HTTPException(423, 'AI is paused by the platform administrator')
     if not ai_configured():
         raise HTTPException(503, 'Deep research is not configured')
     fils(body.budget_aed)
@@ -3007,8 +3229,11 @@ async def agent_plan(tenant_id: str, body: AgentBody, user=Depends(tenant_editor
     with connect() as db:
         settings = qrow(db, 'SELECT * FROM tenant_settings WHERE tenant_id=?', (tenant_id,))
         tenant = qrow(db, 'SELECT * FROM tenants WHERE id=?', (tenant_id,))
+        global_ai_paused = platform_flag(db, 'global_ai_paused')
     if settings['stopped']:
         raise HTTPException(409,'Emergency stop active. Resume planning explicitly.')
+    if global_ai_paused or settings['ai_paused']:
+        raise HTTPException(423, 'AI is paused by the platform administrator')
     if amount <= 0:
         raise HTTPException(422,'Propose a positive planned budget')
     label = 'AI-generated (MiniMax)' if (MINIMAX_BASE_URL and MINIMAX_API_KEY and MINIMAX_MODEL) else (

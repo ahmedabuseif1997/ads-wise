@@ -267,6 +267,59 @@ def test_super_admin_can_access_and_manage_every_tenant(client):
     assert updated.status_code == 200
 
 
+def test_super_admin_health_controls_and_developer_queue(client,monkeypatch):
+    tenant_id,headers=session(client)
+    assert client.get('/admin').status_code==200
+    legacy=client.get('/super-admin',follow_redirects=False)
+    assert legacy.status_code==308 and legacy.headers['location']=='/admin'
+    overview=client.get('/api/admin/overview')
+    assert overview.status_code==200
+    payload=overview.json()
+    assert payload['platform']['app_name']=='Ads-Wise — AI Marketing OS'
+    assert payload['health']['database']=='healthy'
+    assert {item['name'] for item in payload['health']['apis']} >= {
+        'Google Ads API','Meta Marketing API','TikTok Marketing API','Resend Email API'}
+
+    paused=client.post(f'/api/admin/tenants/{tenant_id}/controls',headers=headers,
+                       json={'ai_paused':True})
+    assert paused.status_code==200
+    plan=client.post(f'/api/workspaces/{tenant_id}/agent/plan',headers=headers,json={
+        'service':'Massage','provider':'meta','objective':'bookings','budget_aed':'100',
+        'brief':'Create a booking campaign'})
+    assert plan.status_code==423
+    global_pause=client.post('/api/admin/ai-control',headers=headers,json={'paused':True})
+    assert global_pause.status_code==200 and global_pause.json()['paused'] is True
+    queued=client.post('/api/admin/developer-agent-requests',headers=headers,json={
+        'agent':'codex','instructions':'Add a tested accessibility improvement to the admin dashboard.'})
+    assert queued.status_code==200 and queued.json()['status']=='awaiting_runner'
+    assert client.post('/mcp/developer',json={'jsonrpc':'2.0','id':1,'method':'tools/list'}).status_code==401
+    monkeypatch.setattr(main,'MCP_AGENT_TOKEN','test-mcp-token')
+    mcp_headers={'Authorization':'Bearer test-mcp-token'}
+    listed=client.post('/mcp/developer',headers=mcp_headers,json={
+        'jsonrpc':'2.0','id':2,'method':'tools/call','params':{
+            'name':'list_development_tasks','arguments':{'agent':'codex'}}})
+    assert listed.status_code==200 and queued.json()['id'] in listed.json()['result']['content'][0]['text']
+    updated=client.post('/mcp/developer',headers=mcp_headers,json={
+        'jsonrpc':'2.0','id':3,'method':'tools/call','params':{'name':'update_development_task','arguments':{
+            'id':queued.json()['id'],'status':'needs_approval','branch_name':'codex/admin-a11y',
+            'pull_request_url':'https://github.com/ahmedabuseif1997/ads-wise/pull/123'}}})
+    assert updated.status_code==200
+    refreshed=client.get('/api/admin/overview').json()
+    assert refreshed['health']['global_ai_paused'] is True
+    assert refreshed['agent_requests'][0]['agent']=='codex'
+    with main.connect() as db:
+        member_id=secrets.token_hex(12)
+        db.execute('INSERT INTO users VALUES(?,?,?,?)',
+                   (member_id,'paused@example.com',main.hash_password('paused-tenant-password-123'),main.utcnow()))
+        db.execute('INSERT INTO memberships VALUES(?,?,?)',(member_id,tenant_id,'owner'))
+    assert client.post(f'/api/admin/tenants/{tenant_id}/controls',headers=headers,
+                       json={'tenant_paused':True}).status_code==200
+    client.post('/api/logout',headers=headers,json={})
+    assert client.post('/api/login',json={'email':'paused@example.com',
+                                           'password':'paused-tenant-password-123'}).status_code==200
+    assert client.get(f'/api/workspaces/{tenant_id}').status_code==423
+
+
 def test_approval_budget_and_audit(client):
     tid,hdr=session(client)
     r=client.post(f'/api/workspaces/{tid}/campaigns',json=draft(),headers=hdr)

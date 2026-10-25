@@ -47,6 +47,10 @@ ADMIN_EMAIL=test@example.com ADMIN_PASSWORD=a-valid-test-password-long-123 COOKI
 node --check app/static/app.js
 ```
 
+## Super Admin and developer MCP
+
+`/admin` shows deployment, database, API, AI and per-tenant integration health. Super Admins can pause a tenant or AI globally/per tenant. The optional `/mcp/developer` Streamable HTTP endpoint exposes only the approved developer-task queue and repository workflow; set a long random `MCP_AGENT_TOKEN` and configure that endpoint in Codex or Claude. It never exposes application secrets or a production shell.
+
 ## Documentation
 
 | Topic | File |
