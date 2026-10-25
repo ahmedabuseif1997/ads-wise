@@ -2,5 +2,48 @@
 html[data-product-theme="dark"] .facts article,html[data-product-theme="dark"] .developer select,html[data-product-theme="dark"] .developer textarea{background:#0f1229;color:#eef0ff}html[data-product-theme="dark"] .integration-tag{background:#202650;color:#cbd3ff}html[data-product-theme="dark"] .intro-status,html[data-product-theme="dark"] .search-box,html[data-product-theme="dark"] .filter-box,html[data-product-theme="dark"] .icon-button{background:rgba(15,18,41,.85)}html[data-product-theme="dark"] .request-actions .reject{background:transparent}html[data-product-theme="light"] .admin-sidebar{background:linear-gradient(165deg,#fff,#f0f2ff 58%,#ece6ff);color:#171b38;border-color:var(--line)}html[data-product-theme="light"] .brand small,html[data-product-theme="light"] .admin-profile small,html[data-product-theme="light"] .admin-nav>small{color:#707792}html[data-product-theme="light"] .admin-profile,html[data-product-theme="light"] .sidebar-footer a,html[data-product-theme="light"] .theme-switch{background:rgba(72,83,169,.05);border-color:var(--line);color:#171b38}html[data-product-theme="light"] .admin-nav a{color:#626b8b}html[data-product-theme="light"] .admin-nav a:hover{background:rgba(72,83,169,.08);color:#171b38}html[data-product-theme="light"] .admin-nav a.active{color:#fff}html[data-product-theme="light"] .sidebar-footer{border-color:var(--line)}
 @media(max-width:1180px){:root{--sidebar:220px}.totals{grid-template-columns:repeat(3,1fr)}.facts{grid-template-columns:repeat(3,1fr)}.layout{grid-template-columns:1fr}.activity{max-height:520px;overflow:auto}}
 @media(max-width:900px){.admin-sidebar{width:min(82vw,280px);transform:translateX(-105%);transition:transform .25s cubic-bezier(.2,.8,.2,1)}.nav-open .admin-sidebar{transform:translateX(0)}.nav-backdrop{position:fixed;z-index:19;inset:0;border:0;background:rgba(4,6,20,.6);backdrop-filter:blur(4px)}.nav-open .nav-backdrop{display:block}.admin-main{margin-left:0}.nav-toggle{display:grid}.last-updated{display:none}.health-layout{grid-template-columns:1fr}.facts{grid-template-columns:repeat(2,1fr)}}
+
+/* Theme-specific legibility: neutral ink in light mode, brand navy/violet in dark mode. */
+html[data-product-theme="dark"] .admin-sidebar{background:linear-gradient(165deg,#07091a 0%,#101431 58%,#251246 100%)!important}
+html[data-product-theme="light"] body.admin-shell,
+html[data-product-theme="light"] body.admin-shell .admin-sidebar,
+html[data-product-theme="light"] body.admin-shell .admin-main,
+html[data-product-theme="light"] body.admin-shell .brand,
+html[data-product-theme="light"] body.admin-shell .brand small,
+html[data-product-theme="light"] body.admin-shell .admin-profile,
+html[data-product-theme="light"] body.admin-shell .admin-profile small,
+html[data-product-theme="light"] body.admin-shell .admin-nav>small,
+html[data-product-theme="light"] body.admin-shell .admin-nav a,
+html[data-product-theme="light"] body.admin-shell .admin-nav a span,
+html[data-product-theme="light"] body.admin-shell .sidebar-footer a,
+html[data-product-theme="light"] body.admin-shell .theme-switch,
+html[data-product-theme="light"] body.admin-shell .topbar-title small,
+html[data-product-theme="light"] body.admin-shell .live-state,
+html[data-product-theme="light"] body.admin-shell .last-updated,
+html[data-product-theme="light"] body.admin-shell .intro p,
+html[data-product-theme="light"] body.admin-shell .intro>div>span,
+html[data-product-theme="light"] body.admin-shell .intro-status small,
+html[data-product-theme="light"] body.admin-shell .total span,
+html[data-product-theme="light"] body.admin-shell .panel-head p,
+html[data-product-theme="light"] body.admin-shell .panel-head small,
+html[data-product-theme="light"] body.admin-shell .facts small,
+html[data-product-theme="light"] body.admin-shell .health-item small,
+html[data-product-theme="light"] body.admin-shell .agent-item small,
+html[data-product-theme="light"] body.admin-shell .muted,
+html[data-product-theme="light"] body.admin-shell .request-item small,
+html[data-product-theme="light"] body.admin-shell .status,
+html[data-product-theme="light"] body.admin-shell th,
+html[data-product-theme="light"] body.admin-shell td small,
+html[data-product-theme="light"] body.admin-shell .form-actions p,
+html[data-product-theme="light"] body.admin-shell .agent-safety small,
+html[data-product-theme="light"] body.admin-shell .activity-item p,
+html[data-product-theme="light"] body.admin-shell .agent-item p,
+html[data-product-theme="light"] body.admin-shell .empty-state{color:#050505!important}
+html[data-product-theme="light"] body.admin-shell .admin-nav a.active,
+html[data-product-theme="light"] body.admin-shell .admin-nav a.active span,
+html[data-product-theme="light"] body.admin-shell .control-button,
+html[data-product-theme="light"] body.admin-shell .tenant-controls button,
+html[data-product-theme="light"] body.admin-shell .developer button,
+html[data-product-theme="light"] body.admin-shell .request-actions .approve{color:#fff!important}
 @media(max-width:620px){:root{--topbar:64px}.admin-topbar{padding:0 14px}.topbar-title small{display:none}.topbar-actions{gap:6px}.live-state{padding:6px 8px}.icon-button{width:36px;height:36px}main{padding:24px 14px 66px}.intro{display:block;margin-bottom:21px}.intro h1{font-size:38px;letter-spacing:-2.2px}.intro>div>span{font-size:10px}.intro-status{display:none}.totals{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.total{padding:15px;border-radius:14px}.total b{font-size:26px}.panel{border-radius:15px}.panel-head{align-items:flex-start;padding:17px;flex-wrap:wrap}.panel-head h2{font-size:16px}.facts{grid-template-columns:1fr 1fr}.facts article{padding:13px 16px}.request-item{grid-template-columns:1fr;gap:7px;padding:14px 17px}.request-actions{justify-content:flex-start}.table-tools{align-items:stretch;flex-direction:column;padding:0 16px 14px}.search-box{max-width:none}.filter-box{justify-content:space-between}.tenant-heading{padding-bottom:13px}.table-wrap{border-top:1px solid var(--line);overflow:visible}table{min-width:0}thead{display:none}tbody{display:grid;gap:10px;padding:12px}tr{display:grid;padding:14px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.02)}td{display:grid;grid-template-columns:82px 1fr;align-items:start;gap:10px;padding:7px 0;border:0;font-size:10px}td:before{content:attr(data-label);color:var(--muted);font-size:8px;font-weight:900;letter-spacing:.7px;text-transform:uppercase}.tenant-controls{justify-content:flex-start}.form-row{grid-template-columns:1fr}.form-actions{align-items:stretch;flex-direction:column}.form-actions p{max-width:none}.form-actions button{width:100%}.layout{display:block}.activity{margin-top:16px}.toast-region{right:14px;bottom:14px;max-width:calc(100vw - 28px)}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
