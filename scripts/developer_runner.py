@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 
@@ -18,6 +19,7 @@ MCP_URL = os.getenv("ADS_WISE_MCP_URL", "https://ads-wise.com/mcp/developer")
 REPOSITORY = os.getenv("ADS_WISE_REPOSITORY", "ahmedabuseif1997/ads-wise")
 POLL_SECONDS = max(20, int(os.getenv("ADS_WISE_RUNNER_POLL_SECONDS", "45")))
 RUNNER_NAME = f"{socket.gethostname()}-local"
+NOT_BEFORE = os.getenv("ADS_WISE_RUNNER_NOT_BEFORE", "").strip()
 
 
 def run(command: list[str], *, cwd: Path | None = None, stdin: str | None = None,
@@ -137,7 +139,9 @@ def cycle() -> None:
             continue
         tasks = mcp("list_development_tasks", {"agent": agent})
         for task in tasks:
-            if task.get("status") == "awaiting_runner":
+            created_at = datetime.fromisoformat(task["created_at"])
+            cutoff = datetime.fromisoformat(NOT_BEFORE.replace("Z", "+00:00")) if NOT_BEFORE else None
+            if task.get("status") == "awaiting_runner" and (not cutoff or created_at >= cutoff):
                 process_task(agent, task)
 
 
