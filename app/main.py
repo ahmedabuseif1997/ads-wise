@@ -52,6 +52,10 @@ GOOGLE_TOKEN_ENCRYPTION_KEY = os.getenv('GOOGLE_TOKEN_ENCRYPTION_KEY', '').strip
 GOOGLE_ADS_DEVELOPER_TOKEN = os.getenv('GOOGLE_ADS_DEVELOPER_TOKEN', '').strip()
 GOOGLE_ADS_API_VERSION = 'v26'
 GOOGLE_ADS_SCOPE = 'https://www.googleapis.com/auth/adwords'
+try:
+    GOOGLE_AUTO_SYNC_TTL_SECONDS = max(30, int(os.getenv('GOOGLE_AUTO_SYNC_TTL_SECONDS', '300')))
+except ValueError:
+    GOOGLE_AUTO_SYNC_TTL_SECONDS = 300
 GOOGLE_GROWTH_CLIENT_ID = os.getenv('GOOGLE_GROWTH_CLIENT_ID', '').strip()
 GOOGLE_GROWTH_CLIENT_SECRET = os.getenv('GOOGLE_GROWTH_CLIENT_SECRET', '').strip()
 GOOGLE_GROWTH_SCOPES = ('https://www.googleapis.com/auth/business.manage '
@@ -80,6 +84,23 @@ _RATE_LOCK = threading.Lock()
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def fresh_provider_snapshot(row: dict | None, expected_range: str = '') -> dict | None:
+    if not row:
+        return None
+    try:
+        updated_at = datetime.fromisoformat(row['updated_at'])
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - updated_at > timedelta(seconds=GOOGLE_AUTO_SYNC_TTL_SECONDS):
+            return None
+        payload = json.loads(row['payload'])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if expected_range and payload.get('range') != expected_range:
+        return None
+    return payload
 
 
 class Database:
@@ -2091,14 +2112,18 @@ def google_growth_oauth_callback(code: str = '', state: str = '', error: str = '
 
 
 @app.post('/api/workspaces/{tenant_id}/integrations/google-growth/sync')
-def google_growth_sync(tenant_id: str, user=Depends(tenant_writer)):
+def google_growth_sync(tenant_id: str, force: bool = False, user=Depends(tenant_writer)):
     with connect() as db:
         connection = qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='google_growth'",
                           (tenant_id,))
-        snapshot_row = qrow(db, "SELECT payload FROM provider_snapshots WHERE tenant_id=? AND provider='google_growth'",
+        snapshot_row = qrow(db, "SELECT payload,updated_at FROM provider_snapshots "
+                            "WHERE tenant_id=? AND provider='google_growth'",
                             (tenant_id,))
     if not connection:
         raise HTTPException(409, 'Connect Google Business Profile and Search Console first')
+    cached = None if force else fresh_provider_snapshot(snapshot_row)
+    if cached is not None:
+        return workspace_growth_snapshot(cached, connection)
     old_snapshot = json.loads(snapshot_row['payload']) if snapshot_row else {}
     selected_property = (old_snapshot.get('google_analytics') or {}).get('property', '')
     selected_site = (old_snapshot.get('search_console') or {}).get('site_url', '')
@@ -2361,9 +2386,9 @@ def disconnect_provider(tenant_id: str, provider: Literal['meta', 'tiktok'], use
 
 
 @app.post('/api/workspaces/{tenant_id}/integrations/google/sync')
-def google_metrics_sync(tenant_id: str, range: str = 'last_30_days', user=Depends(tenant_writer)):
+def google_metrics_sync(tenant_id: str, range: str = 'last_30_days', force: bool = False,
+                        user=Depends(tenant_writer)):
     connection = google_connection(tenant_id)
-    access_token = google_access_token(connection)
     try:
         account_zone = ZoneInfo(connection.get('time_zone') or 'Asia/Dubai')
     except ZoneInfoNotFoundError:
@@ -2378,6 +2403,14 @@ def google_metrics_sync(tenant_id: str, range: str = 'last_30_days', user=Depend
     }
     if range not in ranges:
         raise HTTPException(422, 'Analytics range must be yesterday, this_week, last_week or last_30_days')
+    if not force:
+        with connect() as db:
+            snapshot_row = qrow(db, "SELECT payload,updated_at FROM provider_snapshots "
+                                "WHERE tenant_id=? AND provider='google'", (tenant_id,))
+        cached = fresh_provider_snapshot(snapshot_row, range)
+        if cached is not None:
+            return cached
+    access_token = google_access_token(connection)
     start_date, end_date, period_label = ranges[range]
     query = ("SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, segments.date, "
              "metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions "

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import secrets
 from urllib.parse import parse_qs, urlparse
@@ -625,6 +626,51 @@ def test_ad_account_cannot_be_connected_to_two_workspaces(client, monkeypatch):
                                 "WHERE provider='google' AND resource_id='111'")
     assert connection['customer_id']==''
     assert bindings==[{'tenant_id':tenant_id}]
+
+
+def test_google_auto_sync_reuses_only_current_tenant_fresh_cache(client, monkeypatch):
+    tenant_id, headers = session(client)
+    other = client.post('/api/workspaces', headers=headers,
+                        json={'name': 'Other Business'}).json()['id']
+    monkeypatch.setattr(main, 'GOOGLE_TOKEN_ENCRYPTION_KEY', Fernet.generate_key().decode())
+    main.save_provider_connection(tenant_id, 'google', 'first-token', '111', 'First Ads', 'AED', 'Asia/Dubai')
+    main.save_provider_connection(other, 'google', 'second-token', '222', 'Other Ads', 'AED', 'Asia/Dubai')
+    main.save_provider_connection(tenant_id, 'google_growth', 'growth-token', 'accounts/1', 'First Growth')
+    first_ads = {'range': 'last_30_days', 'period': 'Last 30 days', 'synced_at': main.utcnow(),
+                 'totals': {'impressions': 111}, 'campaigns': [], 'daily': [], 'conversion_actions': []}
+    other_ads = {**first_ads, 'totals': {'impressions': 999}}
+    growth = {'synced_at': main.utcnow(), 'errors': [], 'locations': [],
+              'business_accounts': [{'name': 'accounts/1', 'accountName': 'First Growth'}],
+              'search_console_sites': [], 'analytics_properties': []}
+    with main.connect() as db:
+        for tid, provider, payload in ((tenant_id, 'google', first_ads),
+                                       (other, 'google', other_ads),
+                                       (tenant_id, 'google_growth', growth)):
+            db.execute('INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)',
+                       (tid, provider, json.dumps(payload), main.utcnow()))
+    monkeypatch.setattr(main, 'google_access_token',
+                        lambda connection: pytest.fail('fresh Google Ads cache should avoid an API call'))
+    monkeypatch.setattr(main, 'google_growth_access_token',
+                        lambda connection: pytest.fail('fresh Google Growth cache should avoid an API call'))
+
+    ads = client.post(f'/api/workspaces/{tenant_id}/integrations/google/sync',
+                      headers=headers, json={})
+    google_growth = client.post(f'/api/workspaces/{tenant_id}/integrations/google-growth/sync',
+                                headers=headers, json={})
+
+    assert ads.status_code == 200 and ads.json()['totals']['impressions'] == 111
+    assert google_growth.status_code == 200
+    assert google_growth.json()['business_accounts'] == [
+        {'name': 'accounts/1', 'accountName': 'First Growth'}]
+
+    monkeypatch.setattr(main, 'google_access_token', lambda connection: 'access-token')
+    monkeypatch.setattr(main, 'google_post', lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, 'google_conversion_actions', lambda *args: [])
+    forced = client.post(f'/api/workspaces/{tenant_id}/integrations/google/sync?force=true',
+                         headers=headers, json={})
+
+    assert forced.status_code == 200
+    assert forced.json()['totals']['impressions'] == 0
 
 
 def test_all_external_resource_types_are_exclusive_to_one_workspace(client):
