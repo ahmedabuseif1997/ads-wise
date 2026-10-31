@@ -24,7 +24,7 @@ import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 try:
     import psycopg
@@ -952,31 +952,113 @@ class GoogleAudienceSegment(BaseModel):
     id: str = Field(pattern=r'^\d+$', max_length=30)
 
 
+class GoogleTextAsset(BaseModel):
+    text: str
+    pinned_field: Literal['HEADLINE_1', 'HEADLINE_2', 'HEADLINE_3',
+                          'DESCRIPTION_1', 'DESCRIPTION_2'] | None = None
+
+
+class GoogleSitelink(BaseModel):
+    text: str = Field(min_length=1, max_length=25)
+    final_url: str = Field(max_length=2000)
+    description1: str = Field(default='', max_length=35)
+    description2: str = Field(default='', max_length=35)
+
+    @field_validator('final_url')
+    @classmethod
+    def sitelink_url_check(cls, value):
+        parsed = urlparse(value.strip())
+        if parsed.scheme != 'https' or not parsed.hostname:
+            raise ValueError('Sitelink URLs must use HTTPS')
+        return value.strip()
+
+    @model_validator(mode='after')
+    def description_pair_check(self):
+        if bool(self.description1) != bool(self.description2):
+            raise ValueError('Sitelink descriptions must be supplied together')
+        return self
+
+
+class GoogleStructuredSnippet(BaseModel):
+    header: Literal['Amenities', 'Brands', 'Courses', 'Degree programs', 'Destinations',
+                    'Featured hotels', 'Insurance coverage', 'Models', 'Neighborhoods',
+                    'Service catalog', 'Shows', 'Styles', 'Types']
+    values: list[str] = Field(min_length=3, max_length=10)
+
+    @field_validator('values')
+    @classmethod
+    def snippet_values_check(cls, values):
+        cleaned = [str(value).strip() for value in values]
+        if any(not value or len(value) > 25 for value in cleaned):
+            raise ValueError('Structured snippet values must be 1–25 characters')
+        return cleaned
+
+
+class GoogleAdSchedule(BaseModel):
+    day_of_week: Literal['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY',
+                         'FRIDAY', 'SATURDAY', 'SUNDAY']
+    start_hour: int = Field(ge=0, le=23)
+    start_minute: Literal['ZERO', 'FIFTEEN', 'THIRTY', 'FORTY_FIVE'] = 'ZERO'
+    end_hour: int = Field(ge=0, le=24)
+    end_minute: Literal['ZERO', 'FIFTEEN', 'THIRTY', 'FORTY_FIVE'] = 'ZERO'
+
+
 class GoogleSearchPublishBody(BaseModel):
-    version: Literal[1] = 1
+    version: Literal[1, 2] = 2
     daily_budget_aed: str = Field(max_length=20)
     duration_days: int = Field(default=7, ge=1, le=90)
+    bidding_strategy: Literal['MAXIMIZE_CONVERSIONS', 'MAXIMIZE_CONVERSION_VALUE',
+                              'MAXIMIZE_CLICKS', 'MANUAL_CPC',
+                              'TARGET_IMPRESSION_SHARE'] = 'MAXIMIZE_CONVERSIONS'
+    target_cpa_aed: str = Field(default='', max_length=20)
+    target_roas: float | None = Field(default=None, gt=0, le=100)
+    max_cpc_bid_aed: str = Field(default='', max_length=20)
+    target_impression_share_percent: int = Field(default=80, ge=1, le=100)
+    target_impression_share_location: Literal['ANYWHERE_ON_PAGE', 'TOP_OF_PAGE',
+                                              'ABSOLUTE_TOP_OF_PAGE'] = 'TOP_OF_PAGE'
+    search_partners: bool = False
+    content_network: bool = False
     location_ids: list[str] = Field(default_factory=lambda: ['2784'], min_length=1, max_length=20)
+    excluded_location_ids: list[str] = Field(default_factory=list, max_length=20)
     language_ids: list[str] = Field(default_factory=lambda: ['1000', '1019'], min_length=1, max_length=10)
+    ad_schedules: list[GoogleAdSchedule] = Field(default_factory=list, max_length=42)
+    excluded_devices: list[Literal['MOBILE', 'DESKTOP', 'TABLET']] = Field(default_factory=list,
+                                                                           max_length=3)
+    excluded_age_ranges: list[Literal['AGE_RANGE_18_24', 'AGE_RANGE_25_34',
+                                      'AGE_RANGE_35_44', 'AGE_RANGE_45_54',
+                                      'AGE_RANGE_55_64', 'AGE_RANGE_65_UP',
+                                      'AGE_RANGE_UNDETERMINED']] = Field(default_factory=list, max_length=7)
+    excluded_genders: list[Literal['MALE', 'FEMALE', 'UNDETERMINED']] = Field(default_factory=list,
+                                                                               max_length=3)
     keywords: list[str] = Field(min_length=1, max_length=50)
-    headlines: list[str] = Field(min_length=3, max_length=15)
-    descriptions: list[str] = Field(min_length=2, max_length=4)
+    keyword_match_type: Literal['BROAD', 'PHRASE', 'EXACT'] = 'PHRASE'
+    negative_keywords: list[str] = Field(default_factory=list, max_length=100)
+    negative_keyword_match_type: Literal['BROAD', 'PHRASE', 'EXACT'] = 'PHRASE'
+    headlines: list[GoogleTextAsset] = Field(min_length=3, max_length=15)
+    descriptions: list[GoogleTextAsset] = Field(min_length=2, max_length=4)
+    path1: str = Field(default='', max_length=15)
+    path2: str = Field(default='', max_length=15)
     callouts: list[str] = Field(default_factory=list, max_length=10)
+    sitelinks: list[GoogleSitelink] = Field(default_factory=list, max_length=20)
+    structured_snippets: list[GoogleStructuredSnippet] = Field(default_factory=list, max_length=5)
+    image_asset_ids: list[str] = Field(default_factory=list, max_length=20)
     audience_mode: Literal['OBSERVATION', 'TARGETING'] = 'OBSERVATION'
     audience_segments: list[GoogleAudienceSegment] = Field(default_factory=list, max_length=20)
     phone_number: str = Field(default='', max_length=30)
     phone_country_code: str = Field(default='AE', pattern=r'^[A-Z]{2}$')
     final_url: str = Field(default='', max_length=2000)
+    tracking_url_template: str = Field(default='', max_length=2048)
+    final_url_suffix: str = Field(default='', max_length=2048)
 
-    @field_validator('location_ids', 'language_ids')
+    @field_validator('location_ids', 'excluded_location_ids', 'language_ids', 'image_asset_ids')
     @classmethod
     def numeric_ids(cls, values):
         cleaned = [str(value).strip() for value in values]
         if any(not value.isdigit() for value in cleaned) or len(set(cleaned)) != len(cleaned):
-            raise ValueError('Location and language IDs must be unique numbers')
+            raise ValueError('Google resource IDs must be unique numbers')
         return cleaned
 
-    @field_validator('keywords')
+    @field_validator('keywords', 'negative_keywords')
     @classmethod
     def keyword_check(cls, values):
         cleaned = [str(value).strip() for value in values]
@@ -984,20 +1066,24 @@ class GoogleSearchPublishBody(BaseModel):
             raise ValueError('Keywords must be 1–80 characters')
         return cleaned
 
-    @field_validator('headlines')
+    @field_validator('headlines', mode='before')
     @classmethod
     def headline_check(cls, values):
-        cleaned = [str(value).strip() for value in values]
-        if any(not value or len(value) > 30 for value in cleaned):
+        cleaned = [value if isinstance(value, dict) else {'text': str(value).strip()} for value in values]
+        if any(not value.get('text') or len(value['text']) > 30 for value in cleaned):
             raise ValueError('Each headline must be 1–30 characters')
+        if any(value.get('pinned_field', '').startswith('DESCRIPTION_') for value in cleaned):
+            raise ValueError('Headlines can only be pinned to headline positions')
         return cleaned
 
-    @field_validator('descriptions')
+    @field_validator('descriptions', mode='before')
     @classmethod
     def description_check(cls, values):
-        cleaned = [str(value).strip() for value in values]
-        if any(not value or len(value) > 90 for value in cleaned):
+        cleaned = [value if isinstance(value, dict) else {'text': str(value).strip()} for value in values]
+        if any(not value.get('text') or len(value['text']) > 90 for value in cleaned):
             raise ValueError('Each description must be 1–90 characters')
+        if any(value.get('pinned_field', '').startswith('HEADLINE_') for value in cleaned):
+            raise ValueError('Descriptions can only be pinned to description positions')
         return cleaned
 
     @field_validator('callouts')
@@ -1021,6 +1107,30 @@ class GoogleSearchPublishBody(BaseModel):
     def final_url_check(cls, value):
         if value and (urlparse(value).scheme != 'https' or not urlparse(value).hostname or ' ' in value):
             raise ValueError('Final URL must use HTTPS')
+        return value
+
+    @field_validator('path1', 'path2')
+    @classmethod
+    def path_check(cls, value):
+        value = value.strip().strip('/')
+        if value and (not re.fullmatch(r'[A-Za-z0-9_-]+', value)):
+            raise ValueError('Display paths may contain only letters, numbers, hyphens and underscores')
+        return value
+
+    @field_validator('tracking_url_template')
+    @classmethod
+    def tracking_template_check(cls, value):
+        value = value.strip()
+        if value and (urlparse(value).scheme != 'https' or '{lpurl}' not in value.lower()):
+            raise ValueError('Tracking template must use HTTPS and contain {lpurl}')
+        return value
+
+    @field_validator('final_url_suffix')
+    @classmethod
+    def final_url_suffix_check(cls, value):
+        value = value.strip().lstrip('?')
+        if '#' in value or any(char.isspace() for char in value):
+            raise ValueError('Final URL suffix cannot contain spaces or fragments')
         return value
 
 
@@ -2566,36 +2676,102 @@ def google_search_operations(customer_id: str, campaign: dict, body: GoogleSearc
     campaign_resource = f'customers/{customer_id}/campaigns/-2'
     ad_group_resource = f'customers/{customer_id}/adGroups/-3'
     final_url = body.final_url.strip() or campaign['landing_url']
+    if body.path2 and not body.path1:
+        raise HTTPException(422, 'Display path 2 requires display path 1')
+    if set(body.location_ids) & set(body.excluded_location_ids):
+        raise HTTPException(422, 'A location cannot be both targeted and excluded')
+    if len(body.excluded_devices) == 3:
+        raise HTTPException(422, 'At least one device must remain enabled')
+    if len(body.excluded_age_ranges) == 7 or len(body.excluded_genders) == 3:
+        raise HTTPException(422, 'At least one demographic category must remain enabled')
     start_date = datetime.now(timezone.utc).date()
     end_date = start_date + timedelta(days=body.duration_days - 1)
+    campaign_create = {
+        'resourceName': campaign_resource, 'name': remote_name, 'status': 'PAUSED',
+        'advertisingChannelType': 'SEARCH', 'campaignBudget': budget_resource,
+        'startDateTime': f'{start_date.isoformat()} 00:00:00',
+        'endDateTime': f'{end_date.isoformat()} 23:59:59',
+        'containsEuPoliticalAdvertising': 'DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING',
+        'networkSettings': {'targetGoogleSearch': True,
+                            'targetSearchNetwork': body.search_partners,
+                            'targetPartnerSearchNetwork': False,
+                            'targetContentNetwork': body.content_network}}
+
+    def optional_bid_micros(value: str, field: str) -> str:
+        if not value.strip():
+            return ''
+        value_fils = fils(value)
+        if value_fils <= 0:
+            raise HTTPException(422, f'{field} must be greater than zero')
+        return str(value_fils * 10_000)
+
+    target_cpa_micros = optional_bid_micros(body.target_cpa_aed, 'Target CPA')
+    max_cpc_micros = optional_bid_micros(body.max_cpc_bid_aed, 'Maximum CPC bid')
+    if body.bidding_strategy == 'MAXIMIZE_CONVERSIONS':
+        campaign_create['maximizeConversions'] = ({'targetCpaMicros': target_cpa_micros}
+                                                   if target_cpa_micros else {})
+    elif body.bidding_strategy == 'MAXIMIZE_CONVERSION_VALUE':
+        campaign_create['maximizeConversionValue'] = ({'targetRoas': body.target_roas}
+                                                       if body.target_roas else {})
+    elif body.bidding_strategy == 'MAXIMIZE_CLICKS':
+        campaign_create['targetSpend'] = ({'cpcBidCeilingMicros': max_cpc_micros}
+                                          if max_cpc_micros else {})
+    elif body.bidding_strategy == 'MANUAL_CPC':
+        if not max_cpc_micros:
+            raise HTTPException(422, 'Manual CPC requires a maximum CPC bid')
+        campaign_create['manualCpc'] = {'enhancedCpcEnabled': False}
+    else:
+        if not max_cpc_micros:
+            raise HTTPException(422, 'Target Impression Share requires a maximum CPC bid')
+        campaign_create['targetImpressionShare'] = {
+            'location': body.target_impression_share_location,
+            'locationFractionMicros': str(body.target_impression_share_percent * 10_000),
+            'cpcBidCeilingMicros': max_cpc_micros}
+    if body.tracking_url_template:
+        campaign_create['trackingUrlTemplate'] = body.tracking_url_template
+    if body.final_url_suffix:
+        campaign_create['finalUrlSuffix'] = body.final_url_suffix
     operations = [{
         'campaignBudgetOperation': {'create': {
             'resourceName': budget_resource, 'name': f'{remote_name} budget',
             'amountMicros': str(daily_budget_fils * 10_000), 'deliveryMethod': 'STANDARD',
             'explicitlyShared': False}}
     }, {
-        'campaignOperation': {'create': {
-            'resourceName': campaign_resource, 'name': remote_name, 'status': 'PAUSED',
-            'advertisingChannelType': 'SEARCH', 'campaignBudget': budget_resource,
-            'maximizeConversions': {},
-            'startDateTime': f'{start_date.isoformat()} 00:00:00',
-            'endDateTime': f'{end_date.isoformat()} 23:59:59',
-            'containsEuPoliticalAdvertising': 'DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING',
-            'networkSettings': {'targetGoogleSearch': True, 'targetSearchNetwork': False,
-                                'targetPartnerSearchNetwork': False, 'targetContentNetwork': False}}}
+        'campaignOperation': {'create': campaign_create}
     }]
     for location_id in body.location_ids:
         operations.append({'campaignCriterionOperation': {'create': {
             'campaign': campaign_resource, 'negative': False,
             'location': {'geoTargetConstant': f'geoTargetConstants/{location_id}'}}}})
+    for location_id in body.excluded_location_ids:
+        operations.append({'campaignCriterionOperation': {'create': {
+            'campaign': campaign_resource, 'negative': True,
+            'location': {'geoTargetConstant': f'geoTargetConstants/{location_id}'}}}})
     for language_id in body.language_ids:
         operations.append({'campaignCriterionOperation': {'create': {
             'campaign': campaign_resource,
             'language': {'languageConstant': f'languageConstants/{language_id}'}}}})
+    for schedule in body.ad_schedules:
+        start_minutes = schedule.start_hour * 60 + {'ZERO': 0, 'FIFTEEN': 15,
+                                                     'THIRTY': 30, 'FORTY_FIVE': 45}[schedule.start_minute]
+        end_minutes = schedule.end_hour * 60 + {'ZERO': 0, 'FIFTEEN': 15,
+                                                 'THIRTY': 30, 'FORTY_FIVE': 45}[schedule.end_minute]
+        if end_minutes <= start_minutes or end_minutes > 24 * 60:
+            raise HTTPException(422, f'Invalid ad schedule for {schedule.day_of_week}')
+        operations.append({'campaignCriterionOperation': {'create': {
+            'campaign': campaign_resource, 'adSchedule': {
+                'dayOfWeek': schedule.day_of_week, 'startHour': schedule.start_hour,
+                'startMinute': schedule.start_minute, 'endHour': schedule.end_hour,
+                'endMinute': schedule.end_minute}}}})
+    for device in body.excluded_devices:
+        operations.append({'campaignCriterionOperation': {'create': {
+            'campaign': campaign_resource, 'bidModifier': 0, 'device': {'type': device}}}})
     ad_group = {
         'resourceName': ad_group_resource, 'campaign': campaign_resource,
         'name': f"{campaign['service'] or campaign['name']} — search", 'status': 'ENABLED',
         'type': 'SEARCH_STANDARD'}
+    if body.bidding_strategy == 'MANUAL_CPC':
+        ad_group['cpcBidMicros'] = max_cpc_micros
     if body.audience_segments:
         ad_group['targetingSetting'] = {'targetRestrictions': [{
             'targetingDimension': 'AUDIENCE', 'bidOnly': body.audience_mode == 'OBSERVATION'}]}
@@ -2603,7 +2779,19 @@ def google_search_operations(customer_id: str, campaign: dict, body: GoogleSearc
     for keyword in body.keywords:
         operations.append({'adGroupCriterionOperation': {'create': {
             'adGroup': ad_group_resource, 'status': 'ENABLED', 'negative': False,
-            'keyword': {'text': keyword, 'matchType': 'PHRASE'}}}})
+            'keyword': {'text': keyword, 'matchType': body.keyword_match_type}}}})
+    for keyword in body.negative_keywords:
+        operations.append({'adGroupCriterionOperation': {'create': {
+            'adGroup': ad_group_resource, 'status': 'ENABLED', 'negative': True,
+            'keyword': {'text': keyword, 'matchType': body.negative_keyword_match_type}}}})
+    for age_range in body.excluded_age_ranges:
+        operations.append({'adGroupCriterionOperation': {'create': {
+            'adGroup': ad_group_resource, 'status': 'ENABLED', 'negative': True,
+            'ageRange': {'type': age_range}}}})
+    for gender in body.excluded_genders:
+        operations.append({'adGroupCriterionOperation': {'create': {
+            'adGroup': ad_group_resource, 'status': 'ENABLED', 'negative': True,
+            'gender': {'type': gender}}}})
     for segment in body.audience_segments:
         criterion = {'adGroup': ad_group_resource, 'status': 'ENABLED', 'negative': False}
         if segment.kind == 'user_list':
@@ -2611,11 +2799,20 @@ def google_search_operations(customer_id: str, campaign: dict, body: GoogleSearc
         else:
             criterion['userInterest'] = {'userInterestCategory': f'userInterests/{segment.id}'}
         operations.append({'adGroupCriterionOperation': {'create': criterion}})
+    rsa = {
+        'headlines': [{'text': asset.text, **({'pinnedField': asset.pinned_field}
+                                               if asset.pinned_field else {})}
+                      for asset in body.headlines],
+        'descriptions': [{'text': asset.text, **({'pinnedField': asset.pinned_field}
+                                                  if asset.pinned_field else {})}
+                         for asset in body.descriptions]}
+    if body.path1:
+        rsa['path1'] = body.path1
+    if body.path2:
+        rsa['path2'] = body.path2
     operations.append({'adGroupAdOperation': {'create': {
         'adGroup': ad_group_resource, 'status': 'ENABLED', 'ad': {
-            'finalUrls': [final_url], 'responsiveSearchAd': {
-                'headlines': [{'text': text} for text in body.headlines],
-                'descriptions': [{'text': text} for text in body.descriptions]}}}}})
+            'finalUrls': [final_url], 'responsiveSearchAd': rsa}}}})
     asset_temp_id = -100
     for callout in body.callouts:
         asset_resource = f'customers/{customer_id}/assets/{asset_temp_id}'
@@ -2626,6 +2823,37 @@ def google_search_operations(customer_id: str, campaign: dict, body: GoogleSearc
                                                     'asset': asset_resource, 'fieldType': 'CALLOUT'}}},
         ])
         asset_temp_id -= 1
+    for sitelink in body.sitelinks:
+        asset_resource = f'customers/{customer_id}/assets/{asset_temp_id}'
+        sitelink_asset = {'linkText': sitelink.text}
+        if sitelink.description1:
+            sitelink_asset['description1'] = sitelink.description1
+        if sitelink.description2:
+            sitelink_asset['description2'] = sitelink.description2
+        operations.extend([
+            {'assetOperation': {'create': {'resourceName': asset_resource,
+                                           'finalUrls': [sitelink.final_url],
+                                           'sitelinkAsset': sitelink_asset}}},
+            {'campaignAssetOperation': {'create': {'campaign': campaign_resource,
+                                                    'asset': asset_resource, 'fieldType': 'SITELINK'}}},
+        ])
+        asset_temp_id -= 1
+    for snippet in body.structured_snippets:
+        asset_resource = f'customers/{customer_id}/assets/{asset_temp_id}'
+        operations.extend([
+            {'assetOperation': {'create': {'resourceName': asset_resource,
+                                           'structuredSnippetAsset': {
+                                               'header': snippet.header,
+                                               'values': snippet.values}}}},
+            {'campaignAssetOperation': {'create': {'campaign': campaign_resource,
+                                                    'asset': asset_resource,
+                                                    'fieldType': 'STRUCTURED_SNIPPET'}}},
+        ])
+        asset_temp_id -= 1
+    for asset_id in body.image_asset_ids:
+        operations.append({'campaignAssetOperation': {'create': {
+            'campaign': campaign_resource, 'asset': f'customers/{customer_id}/assets/{asset_id}',
+            'fieldType': 'AD_IMAGE'}}})
     if body.phone_number:
         asset_resource = f'customers/{customer_id}/assets/{asset_temp_id}'
         operations.extend([

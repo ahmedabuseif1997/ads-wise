@@ -712,16 +712,34 @@ def test_approved_google_search_campaign_is_created_paused_with_assets_and_audie
         return {'mutateOperationResponses':[{}, {'campaignResult': {
             'resourceName':'customers/3021854998/campaigns/987'}}]}
     monkeypatch.setattr(main,'google_post',fake_google_post)
-    publish={'version':1,'daily_budget_aed':'70.00','location_ids':['2784'],
-             'language_ids':['1000','1019'],'keywords':['massage abu dhabi','massage near me'],
-             'headlines':['Be Relax Massage','Massage in Abu Dhabi','Book Your Massage Today'],
-             'descriptions':['Professional massage treatments in Abu Dhabi.',
-                             'Book your relaxing visit online today.'],
-             'callouts':['Easy Online Booking'],'audience_mode':'OBSERVATION',
+    publish={'version':2,'daily_budget_aed':'70.00','duration_days':7,
+             'bidding_strategy':'MAXIMIZE_CONVERSIONS','target_cpa_aed':'25.00',
+             'search_partners':True,'content_network':False,
+             'location_ids':['2784'],'excluded_location_ids':['2100'],
+             'language_ids':['1000','1019'],
+             'ad_schedules':[{'day_of_week':'MONDAY','start_hour':9,'start_minute':'ZERO',
+                              'end_hour':18,'end_minute':'ZERO'}],
+             'excluded_devices':['TABLET'],'excluded_age_ranges':['AGE_RANGE_18_24'],
+             'excluded_genders':['UNDETERMINED'],
+             'keywords':['massage abu dhabi','massage near me'],'keyword_match_type':'EXACT',
+             'negative_keywords':['jobs'],'negative_keyword_match_type':'BROAD',
+             'headlines':[{'text':'Be Relax Massage','pinned_field':'HEADLINE_1'},
+                          {'text':'Massage in Abu Dhabi'},{'text':'Book Your Massage Today'}],
+             'descriptions':[{'text':'Professional massage treatments in Abu Dhabi.',
+                              'pinned_field':'DESCRIPTION_1'},
+                             {'text':'Book your relaxing visit online today.'}],
+             'path1':'massage','path2':'book','callouts':['Easy Online Booking'],
+             'sitelinks':[{'text':'Book Now','final_url':'https://example.com/book',
+                           'description1':'Reserve online','description2':'Choose your treatment'}],
+             'structured_snippets':[{'header':'Service catalog',
+                                     'values':['Massage','Facial','Hammam']}],
+             'image_asset_ids':['456'],'audience_mode':'OBSERVATION',
              'audience_segments':[{'kind':'user_interest','id':'80408'},
                                   {'kind':'user_list','id':'123'}],
              'phone_number':'+971501234567','phone_country_code':'AE',
-             'final_url':'https://example.com/book'}
+             'final_url':'https://example.com/book',
+             'tracking_url_template':'https://tracker.example/?url={lpurl}',
+             'final_url_suffix':'utm_source=google&utm_medium=cpc'}
     result=client.post(f'/api/workspaces/{tid}/campaigns/{cid}/publish/google-search',
                        headers=hdr,json=publish)
     assert result.status_code==200 and result.json()['status']=='PAUSED'
@@ -729,15 +747,41 @@ def test_approved_google_search_campaign_is_created_paused_with_assets_and_audie
     operations=mutate['mutateOperations']
     campaign_create=operations[1]['campaignOperation']['create']
     assert campaign_create['status']=='PAUSED'
-    assert campaign_create['maximizeConversions']=={}
+    assert campaign_create['maximizeConversions']=={'targetCpaMicros':'25000000'}
+    assert campaign_create['networkSettings']['targetSearchNetwork'] is True
+    assert campaign_create['trackingUrlTemplate'].endswith('{lpurl}')
+    assert campaign_create['finalUrlSuffix']=='utm_source=google&utm_medium=cpc'
     assert any('adGroupAdOperation' in operation for operation in operations)
     assert any(operation.get('assetOperation',{}).get('create',{}).get('calloutAsset')
                for operation in operations)
     assert any(operation.get('assetOperation',{}).get('create',{}).get('callAsset')
                for operation in operations)
+    assert any(operation.get('assetOperation',{}).get('create',{}).get('sitelinkAsset')
+               for operation in operations)
+    assert any(operation.get('assetOperation',{}).get('create',{}).get('structuredSnippetAsset')
+               for operation in operations)
+    assert any(operation.get('campaignAssetOperation',{}).get('create',{}).get('fieldType')=='AD_IMAGE'
+               for operation in operations)
     ad_group=next(operation['adGroupOperation']['create'] for operation in operations
                   if 'adGroupOperation' in operation)
     assert ad_group['targetingSetting']['targetRestrictions'][0]['bidOnly'] is True
+    criteria=[operation['campaignCriterionOperation']['create'] for operation in operations
+              if 'campaignCriterionOperation' in operation]
+    assert any(item.get('negative') and item.get('location') for item in criteria)
+    assert any(item.get('adSchedule',{}).get('dayOfWeek')=='MONDAY' for item in criteria)
+    assert any(item.get('device',{}).get('type')=='TABLET' and item.get('bidModifier')==0
+               for item in criteria)
+    keyword_criteria=[operation['adGroupCriterionOperation']['create'] for operation in operations
+                      if 'adGroupCriterionOperation' in operation and
+                      operation['adGroupCriterionOperation']['create'].get('keyword')]
+    assert any(not item['negative'] and item['keyword']['matchType']=='EXACT'
+               for item in keyword_criteria)
+    assert any(item['negative'] and item['keyword']['text']=='jobs' for item in keyword_criteria)
+    rsa=next(operation['adGroupAdOperation']['create']['ad']['responsiveSearchAd']
+             for operation in operations if 'adGroupAdOperation' in operation)
+    assert rsa['headlines'][0]['pinnedField']=='HEADLINE_1'
+    assert rsa['descriptions'][0]['pinnedField']=='DESCRIPTION_1'
+    assert rsa['path1']=='massage' and rsa['path2']=='book'
     call_count=len(calls)
     retry=client.post(f'/api/workspaces/{tid}/campaigns/{cid}/publish/google-search',
                       headers=hdr,json=publish)
@@ -745,6 +789,48 @@ def test_approved_google_search_campaign_is_created_paused_with_assets_and_audie
     assert len(calls)==call_count
     saved=client.get(f'/api/workspaces/{tid}').json()['campaigns'][0]['publication']
     assert saved['status']=='created' and saved['remote_resource'].endswith('/987')
+
+
+@pytest.mark.parametrize(('strategy', 'extra', 'expected_key'), [
+    ('MAXIMIZE_CONVERSION_VALUE', {'target_roas': 3.0}, 'maximizeConversionValue'),
+    ('MAXIMIZE_CLICKS', {'max_cpc_bid_aed': '5.00'}, 'targetSpend'),
+    ('MANUAL_CPC', {'max_cpc_bid_aed': '5.00'}, 'manualCpc'),
+    ('TARGET_IMPRESSION_SHARE', {'max_cpc_bid_aed': '5.00'}, 'targetImpressionShare'),
+])
+def test_google_search_supports_selectable_bidding_strategies(strategy, extra, expected_key):
+    body = main.GoogleSearchPublishBody(
+        daily_budget_aed='70.00', bidding_strategy=strategy,
+        keywords=['massage'], headlines=['One', 'Two', 'Three'],
+        descriptions=['First description', 'Second description'],
+        final_url='https://example.com/book', **extra)
+    operations = main.google_search_operations(
+        '123', {'landing_url': 'https://example.com/book', 'service': 'Massage', 'name': 'Search'},
+        body, 'Search campaign', 7000)
+    campaign = operations[1]['campaignOperation']['create']
+
+    assert expected_key in campaign
+    if strategy == 'MANUAL_CPC':
+        ad_group = next(item['adGroupOperation']['create'] for item in operations
+                        if 'adGroupOperation' in item)
+        assert ad_group['cpcBidMicros'] == '5000000'
+
+
+def test_google_search_rejects_unsafe_targeting_and_manual_cpc_without_bid():
+    common = {'daily_budget_aed': '70.00', 'keywords': ['massage'],
+              'headlines': ['One', 'Two', 'Three'],
+              'descriptions': ['First description', 'Second description'],
+              'final_url': 'https://example.com/book'}
+    campaign = {'landing_url': 'https://example.com/book', 'service': 'Massage', 'name': 'Search'}
+    with pytest.raises(main.HTTPException, match='Manual CPC requires'):
+        main.google_search_operations('123', campaign,
+                                      main.GoogleSearchPublishBody(**common, bidding_strategy='MANUAL_CPC'),
+                                      'Search campaign', 7000)
+    with pytest.raises(main.HTTPException, match='both targeted and excluded'):
+        main.google_search_operations(
+            '123', campaign,
+            main.GoogleSearchPublishBody(**common, location_ids=['2784'],
+                                         excluded_location_ids=['2784']),
+            'Search campaign', 7000)
 
 
 def test_google_post_parses_stream_error_list(monkeypatch):
