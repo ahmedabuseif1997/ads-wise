@@ -57,6 +57,9 @@ def test_health_and_static(client):
     assert 'Every signal. One clear move.' in homepage.text
     assert 'Clearer campaigns.' in homepage.text
     assert 'info@ads-wise.com' in homepage.text
+    assert 'aria-label="adswise"' in homepage.text
+    assert 'href="/terms">Terms</a>' in homepage.text
+    assert 'href="/data-deletion">Data Deletion</a>' in homepage.text
     assert 'data-theme="dark"' in homepage.text
     cinematic_js=client.get('/assets/cinematic.js')
     assert cinematic_js.status_code==200
@@ -66,7 +69,9 @@ def test_health_and_static(client):
     assert client.get('/signup').status_code==200
     assert client.get('/reset-password').status_code==200
     assert client.get('/privacy').status_code==200
-    assert client.get('/terms').status_code==200
+    terms=client.get('/terms')
+    assert terms.status_code==200
+    assert 'IMPZ, GAL Building 16, Unit 403, Dubai, United Arab Emirates' in terms.text
     assert client.get('/data-deletion').status_code==200
     assert client.get('/assets/style.css').status_code==200
     assert client.get('/assets/analytics.css').status_code==200
