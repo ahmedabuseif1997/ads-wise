@@ -3146,8 +3146,11 @@ def approve_campaign(tenant_id: str, campaign_id: str, user=Depends(tenant_write
         if c['status']!='pending': raise HTTPException(409,'Only pending campaigns can be approved')
         settings = qrow(db,'SELECT * FROM tenant_settings WHERE tenant_id=?',(tenant_id,))
         if settings['stopped']: raise HTTPException(409,'Emergency stop is active')
-        authorized = db.execute('SELECT COALESCE(SUM(budget_fils),0) FROM campaigns WHERE tenant_id=? AND status=?',
-                                (tenant_id,'approved')).fetchone()[0]
+        authorized = qrow(
+            db,
+            'SELECT COALESCE(SUM(budget_fils),0) AS total FROM campaigns WHERE tenant_id=? AND status=?',
+            (tenant_id, 'approved'),
+        )['total']
         if settings['budget_limit_fils']==0 or authorized+c['budget_fils'] > settings['budget_limit_fils']:
             raise HTTPException(409,'Proposed approved budgets exceed the configured workspace cap')
         db.execute('UPDATE campaigns SET status=?,approver_id=?,updated_at=? WHERE id=? AND tenant_id=?',
@@ -3191,8 +3194,11 @@ def update_settings(tenant_id: str, body: LimitsBody, user=Depends(tenant_writer
     cap = fils(body.budget_limit_aed)
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
-        used = db.execute('SELECT COALESCE(SUM(budget_fils),0) FROM campaigns WHERE tenant_id=? AND status=?',
-                          (tenant_id,'approved')).fetchone()[0]
+        used = qrow(
+            db,
+            'SELECT COALESCE(SUM(budget_fils),0) AS total FROM campaigns WHERE tenant_id=? AND status=?',
+            (tenant_id, 'approved'),
+        )['total']
         if cap < used:
             raise HTTPException(409, 'Archive approved internal proposals before lowering the cap below their total')
         db.execute('UPDATE tenant_settings SET mode=?,budget_limit_fils=? WHERE tenant_id=?',(body.mode,cap,tenant_id))
