@@ -13,5 +13,11 @@
 .bar-track{height:12px;background:#edf2ec;border-radius:20px;overflow:hidden}
 .bar-track i{display:block;height:100%;border-radius:20px;background:linear-gradient(90deg,#0f6b4b,#b0d84f)}
 .analytics-note{font-size:10px;color:#8b9b90;text-align:right;margin-top:14px}
+.heatmap-panel{margin-top:18px}.heatmap-canvas{position:relative;min-height:440px;border:1px solid #dce4ee;border-radius:18px;overflow:hidden;background:linear-gradient(180deg,#f9fbff,#eef3fb)}
+.heatmap-canvas:before{content:"";position:absolute;inset:0;background-image:linear-gradient(#cfd9e8 1px,transparent 1px),linear-gradient(90deg,#cfd9e8 1px,transparent 1px);background-size:5% 5%;opacity:.3}
+.heatmap-canvas i{position:absolute;display:block;transform:translate(-50%,-50%);border-radius:50%;background:radial-gradient(circle,#ffef57 0 18%,#ff8b33 42%,#ef3340 68%,transparent 72%);filter:blur(1px)}
+.heatmap-canvas>span{position:absolute;left:12px;font-size:10px;font-weight:700;color:#65758b}.heatmap-canvas>span:first-of-type{top:10px}.heatmap-canvas>span:last-of-type{bottom:10px}
+.link-button{border:0;background:none;color:#145ce6;padding:0;font:inherit;font-weight:700;cursor:pointer}.check-row{display:flex!important;align-items:center;gap:10px}.check-row input{width:auto!important}
+.heatmap-kpis{margin:0 0 18px}.heatmap-insights{margin:0 0 18px}.heatmap-insights p{margin:8px 0 0}
 @media(max-width:1160px){.analytics-kpis{grid-template-columns:repeat(2,1fr)}.analytics-grid{grid-template-columns:1fr}}
 @media(max-width:750px){.analytics-kpis{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:1fr}.bar-row>strong{text-align:left}.trend-chart{min-height:170px}}
