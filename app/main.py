@@ -43,6 +43,9 @@ AI_MODEL = os.getenv('OPENAI_MODEL', os.getenv('AI_MODEL', 'gpt-6-astra')).strip
 MINIMAX_BASE_URL = os.getenv('MINIMAX_BASE_URL', 'https://api.minimax.io/v1').strip().rstrip('/')
 MINIMAX_API_KEY = os.getenv('MINIMAX_API_KEY', '').strip()
 MINIMAX_MODEL = os.getenv('MINIMAX_MODEL', 'MiniMax-M3').strip()
+ARK_BASE_URL = os.getenv('ARK_BASE_URL', 'https://ark.cn-beijing.volces.com/api/v3').strip().rstrip('/')
+ARK_API_KEY = os.getenv('ARK_API_KEY', '').strip()
+ARK_MODEL = os.getenv('ARK_MODEL', 'doubao-seed-2-1-pro-260915').strip()
 PUBLIC_ORIGIN = os.getenv('PUBLIC_ORIGIN', '').strip().rstrip('/')
 ALLOWED_ORIGINS = {origin.strip().rstrip('/') for origin in
                    os.getenv('ALLOWED_ORIGINS', '').split(',') if origin.strip()}
@@ -273,6 +276,12 @@ def init_db():
           FOREIGN KEY(tenant_id) REFERENCES tenants(id));
         CREATE INDEX IF NOT EXISTS heatmap_events_tenant_time
           ON heatmap_events(tenant_id,created_at DESC);
+        CREATE TABLE IF NOT EXISTS performance_analyses(
+          id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, provider TEXT NOT NULL,
+          model TEXT NOT NULL, input_fingerprint TEXT NOT NULL, analysis TEXT NOT NULL,
+          created_at TEXT NOT NULL, FOREIGN KEY(tenant_id) REFERENCES tenants(id));
+        CREATE INDEX IF NOT EXISTS performance_analyses_tenant_time
+          ON performance_analyses(tenant_id,created_at DESC);
         ''')
         if db.postgres:
             db.execute('ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS tenant_paused INTEGER NOT NULL DEFAULT 0')
@@ -893,6 +902,33 @@ class CampaignRecommendationResult(BaseModel):
     assumptions: list[str] = Field(max_length=12)
     confidence: Literal['high', 'medium', 'low']
     research_summary: str = Field(min_length=1, max_length=4000)
+
+
+class PerformanceForecast(BaseModel):
+    next_30_day_clicks: float | None = Field(default=None, ge=0)
+    next_30_day_conversions: float | None = Field(default=None, ge=0)
+    predicted_cpa_aed: float | None = Field(default=None, ge=0)
+    basis: str = Field(min_length=1, max_length=1000)
+
+
+class PerformanceRecommendation(BaseModel):
+    priority: Literal['high', 'medium', 'low']
+    title: str = Field(min_length=1, max_length=160)
+    action: str = Field(min_length=1, max_length=1000)
+    rationale: str = Field(min_length=1, max_length=1000)
+    expected_impact: str = Field(min_length=1, max_length=500)
+    metric_to_watch: str = Field(min_length=1, max_length=160)
+    requires_approval: bool = True
+
+
+class PerformanceAnalysisResult(BaseModel):
+    executive_summary: str = Field(min_length=1, max_length=2000)
+    confidence: Literal['high', 'medium', 'low']
+    forecast: PerformanceForecast
+    findings: list[str] = Field(max_length=8)
+    recommendations: list[PerformanceRecommendation] = Field(max_length=8)
+    experiments: list[str] = Field(max_length=6)
+    data_quality_notes: list[str] = Field(max_length=8)
 
 
 class GoogleCampaignStatusBody(BaseModel):
@@ -1561,6 +1597,7 @@ def bootstrap(user=Depends(current_user)):
     return {'user':{'email':user['email']},'csrf':user['csrf'], 'tenants':orgs,
             'super_admin':is_super_admin(user),
             'ai_configured': ai_configured(),
+            'seed_configured': bool(ARK_BASE_URL and ARK_API_KEY and ARK_MODEL),
             'providers':{'meta':{'configured':meta_configured(),
                                  'reason':'Meta developer app configured' if meta_configured() else 'Meta App ID and secret required'},
                          'tiktok':{'configured':tiktok_configured(),
@@ -1969,6 +2006,8 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
         members = qrows(db, '''SELECT u.email,m.role FROM memberships m JOIN users u ON u.id=m.user_id
                               WHERE m.tenant_id=? ORDER BY CASE m.role WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END,
                               u.email''', (tenant_id,))
+        latest_analysis = qrow(db, '''SELECT provider,model,analysis,created_at FROM performance_analyses
+                                     WHERE tenant_id=? ORDER BY created_at DESC LIMIT 1''', (tenant_id,))
     count = {s:sum(c['status']==s for c in campaigns) for s in ['draft','pending','approved','rejected','archived']}
     total_authorized = sum(c['budget_fils'] for c in campaigns if c['status']=='approved')
     publications_by_campaign = {item['campaign_id']: item for item in publications}
@@ -1995,6 +2034,8 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
                         'allowed_domains':json.loads(tracking['allowed_domains']) if tracking else [],
                         'updated_at':tracking['updated_at'] if tracking else ''},
             'heatmap':heatmap_report(tenant_id),
+            'seed_analysis':{**latest_analysis, 'analysis':json.loads(latest_analysis['analysis'])}
+                            if latest_analysis else None,
             'live_metrics_available':bool(google_snapshot), 'current_role':user['role'], 'members':members}
 
 
@@ -3493,6 +3534,107 @@ def parse_model_json(text: str) -> dict:
 def ai_configured() -> bool:
     return bool((MINIMAX_BASE_URL and MINIMAX_API_KEY and MINIMAX_MODEL) or
                 (AI_BASE_URL and AI_API_KEY and AI_MODEL))
+
+
+def seed_configured() -> bool:
+    return bool(ARK_BASE_URL and ARK_API_KEY and ARK_MODEL)
+
+
+async def seed_analyze_performance(dataset: dict) -> dict:
+    system = (
+        'You are a cautious paid-media performance analyst. Use only the supplied aggregate tenant data. '
+        'Never invent metrics, attribution, causality, benchmarks, revenue, customer traits, or account access. '
+        'Treat forecasts as uncertain estimates, use null when evidence is insufficient, and explicitly state the '
+        'basis and data limitations. Recommend reversible tests. Every recommendation that changes targeting, '
+        'budget, bids, creative, landing pages, or a live campaign must set requires_approval to true. Never claim '
+        'that you changed a campaign. Return only one valid JSON object with keys executive_summary, confidence '
+        '(high|medium|low), forecast (next_30_day_clicks, next_30_day_conversions, predicted_cpa_aed, basis), '
+        'findings, recommendations, experiments, data_quality_notes. Each recommendation needs priority '
+        '(high|medium|low), title, action, rationale, expected_impact, metric_to_watch, requires_approval.'
+    )
+    async with httpx.AsyncClient(timeout=55) as client:
+        response = await client.post(f'{ARK_BASE_URL}/chat/completions',
+            headers={'Authorization': f'Bearer {ARK_API_KEY}', 'Content-Type': 'application/json'},
+            json={'model': ARK_MODEL, 'thinking': {'type': 'disabled'}, 'temperature': .2,
+                  'max_tokens': 3000, 'messages': [
+                      {'role': 'system', 'content': system},
+                      {'role': 'user', 'content': 'Analyze this aggregate dataset:\n' +
+                       json.dumps(dataset, ensure_ascii=False, separators=(',', ':'))}]})
+        response.raise_for_status()
+    content = response.json()['choices'][0]['message']['content']
+    parsed = parse_model_json_object(content)
+    return PerformanceAnalysisResult.model_validate(parsed).model_dump()
+
+
+def parse_model_json_object(text: str) -> dict:
+    cleaned = text.strip()
+    if cleaned.startswith('```'):
+        cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', cleaned, flags=re.IGNORECASE)
+    start, end = cleaned.find('{'), cleaned.rfind('}')
+    if start < 0 or end < start:
+        raise ValueError('Model returned no JSON object')
+    return json.loads(cleaned[start:end + 1])
+
+
+@app.post('/api/workspaces/{tenant_id}/agent/performance-analysis')
+async def performance_analysis(tenant_id: str, user=Depends(tenant_editor)):
+    with connect() as db:
+        settings = qrow(db, 'SELECT stopped,ai_paused FROM tenant_settings WHERE tenant_id=?', (tenant_id,))
+        global_ai_paused = platform_flag(db, 'global_ai_paused')
+        snapshot = qrow(db, "SELECT payload FROM provider_snapshots WHERE tenant_id=? AND provider='google'",
+                        (tenant_id,))
+        campaigns = qrows(db, '''SELECT provider,objective,service,status,budget_fils,created_at
+                                 FROM campaigns WHERE tenant_id=? ORDER BY created_at DESC LIMIT 30''', (tenant_id,))
+        latest = qrow(db, '''SELECT input_fingerprint,analysis,created_at FROM performance_analyses
+                             WHERE tenant_id=? ORDER BY created_at DESC LIMIT 1''', (tenant_id,))
+    if settings['stopped']:
+        raise HTTPException(409, 'Emergency stop active. Resume planning explicitly.')
+    if global_ai_paused or settings['ai_paused']:
+        raise HTTPException(423, 'AI is paused by the platform administrator')
+    if not seed_configured():
+        raise HTTPException(503, 'Seed performance analysis is not configured')
+    google = json.loads(snapshot['payload']) if snapshot else {}
+    heatmap = heatmap_report(tenant_id)
+    dataset = {
+        'source_synced_at': google.get('synced_at'),
+        'google_ads': {'period': google.get('period'), 'totals': google.get('totals', {}),
+                       'daily': google.get('daily', [])[-30:],
+                       'campaigns': [{k: row.get(k) for k in
+                                      ('status', 'channel', 'impressions', 'clicks', 'cost_aed', 'conversions')}
+                                     for row in google.get('campaigns', [])[:30]]},
+        'website_behavior': {'range_days': heatmap['range_days'], 'pages': heatmap['pages'],
+                             'deterministic_forecast': heatmap['forecast']},
+        'campaign_plans': [{**{k: v for k, v in item.items() if k != 'budget_fils'},
+                            'budget_aed': float(Decimal(item['budget_fils']) / 100)}
+                           for item in campaigns],
+        'constraints': {'currency': 'AED', 'ad_changes_require_owner_approval': True,
+                        'no_automatic_campaign_changes': True},
+    }
+    fingerprint = hashlib.sha256(json.dumps(dataset, sort_keys=True, default=str).encode()).hexdigest()
+    if latest and latest['input_fingerprint'] == fingerprint:
+        return {'analysis': json.loads(latest['analysis']), 'provider': 'seed',
+                'model': ARK_MODEL, 'created_at': latest['created_at'], 'cached': True}
+    try:
+        analysis = await seed_analyze_performance(dataset)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
+            raise HTTPException(503, 'Seed API credentials or model access are invalid')
+        if exc.response.status_code == 429:
+            raise HTTPException(429, 'Seed analysis is rate limited. Retry shortly.')
+        raise HTTPException(502, 'Seed analysis could not be completed')
+    except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(502, 'Seed analysis returned an invalid response')
+    created_at = utcnow()
+    with connect() as db:
+        db.execute('''INSERT INTO performance_analyses(id,tenant_id,provider,model,input_fingerprint,
+                      analysis,created_at) VALUES(?,?,?,?,?,?,?)''',
+                   (secrets.token_hex(12), tenant_id, 'seed', ARK_MODEL, fingerprint,
+                    json.dumps(analysis, ensure_ascii=False), created_at))
+        audit(db, user['user_id'], tenant_id, 'agent.performance_analyzed',
+              {'provider': 'seed', 'model': ARK_MODEL, 'confidence': analysis['confidence'],
+               'recommendation_count': len(analysis['recommendations']), 'live_changes': False})
+    return {'analysis': analysis, 'provider': 'seed', 'model': ARK_MODEL,
+            'created_at': created_at, 'cached': False}
 
 
 def safe_public_url(url: str) -> bool:
