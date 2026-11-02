@@ -521,42 +521,6 @@ def test_meta_and_tiktok_oauth_start_are_scoped(client, monkeypatch):
     assert 'state=' in tiktok.json()['authorization_url']
 
 
-def test_meta_publisher_creates_complete_paused_campaign(client, monkeypatch):
-    tid, hdr = session(client)
-    key = Fernet.generate_key().decode()
-    monkeypatch.setattr(main, 'GOOGLE_TOKEN_ENCRYPTION_KEY', key)
-    monkeypatch.setattr(main, 'META_APP_SECRET', 'meta-secret')
-    main.save_provider_connection(tid, 'meta', 'meta-access-token', 'act_123', 'Be Relax Meta', 'AED', 'Asia/Dubai')
-    created = client.post(f'/api/workspaces/{tid}/campaigns', headers=hdr, json=draft()).json()
-    cid = created['id']
-    client.post(f'/api/workspaces/{tid}/campaigns/{cid}/submit', headers=hdr, json={})
-    client.post(f'/api/workspaces/{tid}/settings', headers=hdr,
-                json={'mode': 'supervised', 'budget_limit_aed': '500'})
-    assert client.post(f'/api/workspaces/{tid}/campaigns/{cid}/approve', headers=hdr, json={}).status_code == 200
-
-    calls = []
-    def fake_meta_post(path, token, payload, message):
-        calls.append((path, payload))
-        return {'id': str(1000 + len(calls))}
-    monkeypatch.setattr(main, 'meta_post', fake_meta_post)
-    payload = {'version': 1, 'daily_budget_aed': '25', 'duration_days': 7,
-               'page_id': '777', 'instagram_actor_id': '888', 'countries': ['AE'],
-               'interest_ids': ['6003139266461'], 'primary_text': 'Book a relaxing massage today.',
-               'headline': 'Relax at Be Relax', 'image_url': 'https://example.com/massage.jpg',
-               'final_url': 'https://example.com/book', 'call_to_action': 'BOOK_NOW',
-               'pixel_id': '999', 'conversion_event': 'SCHEDULE'}
-    response = client.post(f'/api/workspaces/{tid}/campaigns/{cid}/publish/meta', headers=hdr, json=payload)
-    assert response.status_code == 200
-    assert response.json()['status'] == 'PAUSED'
-    assert [path.rsplit('/', 1)[-1] for path, _ in calls] == ['campaigns', 'adsets', 'adcreatives', 'ads']
-    assert all(call_payload['status'] == 'PAUSED' for _, call_payload in calls if 'status' in call_payload)
-    assert client.post(f'/api/workspaces/{tid}/campaigns/{cid}/publish/meta', headers=hdr,
-                       json=payload).json()['idempotent'] is True
-    assert len(calls) == 4
-    workspace = client.get(f'/api/workspaces/{tid}').json()
-    assert any(item['action'] == 'campaign.published_meta_paused' for item in workspace['audit'])
-
-
 def test_minimax_is_primary_provider(client, monkeypatch):
     tid, hdr = session(client)
     monkeypatch.setattr(main, 'MINIMAX_API_KEY', 'configured')

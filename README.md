@@ -67,4 +67,4 @@ node --check app/static/app.js
 
 ## Not built yet
 
-Meta and TikTok publishing, image generation, CRM integration, end-to-end attribution and 2FA. Google publishing supports Search campaigns only, and new Google campaigns are always created **paused**.
+TikTok publishing, Meta Conversions API (server-side events, deliberately deferred until explicit opt-in), image generation, CRM integration, end-to-end attribution and 2FA. Google publishing supports Search campaigns only, and new Google campaigns are always created **paused**. Meta launches go live as **ACTIVE** only after Seed validation passes 100% and the workspace owner approves.
