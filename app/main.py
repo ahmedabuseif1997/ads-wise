@@ -79,6 +79,7 @@ MCP_AGENT_TOKEN = os.getenv('MCP_AGENT_TOKEN', '').strip()
 COOKIE_NAME = 'spa_ads_session'
 SESSION_DAYS = 7
 _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+_HEATMAP_BATCHES: dict[str, list[float]] = {}
 _RATE_LOCK = threading.Lock()
 
 
@@ -262,17 +263,33 @@ def init_db():
         CREATE TABLE IF NOT EXISTS tracking_configs(
           tenant_id TEXT PRIMARY KEY, meta_pixel_id TEXT NOT NULL DEFAULT '',
           tiktok_pixel_id TEXT NOT NULL DEFAULT '', events TEXT NOT NULL DEFAULT '{}',
+          heatmaps_enabled INTEGER NOT NULL DEFAULT 0, allowed_domains TEXT NOT NULL DEFAULT '[]',
           updated_at TEXT NOT NULL, FOREIGN KEY(tenant_id) REFERENCES tenants(id));
+        CREATE TABLE IF NOT EXISTS heatmap_events(
+          id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, page_path TEXT NOT NULL,
+          device_class TEXT NOT NULL, event_type TEXT NOT NULL,
+          x_bucket INTEGER NOT NULL DEFAULT -1, y_bucket INTEGER NOT NULL DEFAULT -1,
+          value INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+          FOREIGN KEY(tenant_id) REFERENCES tenants(id));
+        CREATE INDEX IF NOT EXISTS heatmap_events_tenant_time
+          ON heatmap_events(tenant_id,created_at DESC);
         ''')
         if db.postgres:
             db.execute('ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS tenant_paused INTEGER NOT NULL DEFAULT 0')
             db.execute('ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS ai_paused INTEGER NOT NULL DEFAULT 0')
+            db.execute('ALTER TABLE tracking_configs ADD COLUMN IF NOT EXISTS heatmaps_enabled INTEGER NOT NULL DEFAULT 0')
+            db.execute("ALTER TABLE tracking_configs ADD COLUMN IF NOT EXISTS allowed_domains TEXT NOT NULL DEFAULT '[]'")
         else:
             columns = {row['name'] for row in qrows(db, 'PRAGMA table_info(tenant_settings)')}
             if 'tenant_paused' not in columns:
                 db.execute('ALTER TABLE tenant_settings ADD COLUMN tenant_paused INTEGER NOT NULL DEFAULT 0')
             if 'ai_paused' not in columns:
                 db.execute('ALTER TABLE tenant_settings ADD COLUMN ai_paused INTEGER NOT NULL DEFAULT 0')
+            tracking_columns = {row['name'] for row in qrows(db, 'PRAGMA table_info(tracking_configs)')}
+            if 'heatmaps_enabled' not in tracking_columns:
+                db.execute('ALTER TABLE tracking_configs ADD COLUMN heatmaps_enabled INTEGER NOT NULL DEFAULT 0')
+            if 'allowed_domains' not in tracking_columns:
+                db.execute("ALTER TABLE tracking_configs ADD COLUMN allowed_domains TEXT NOT NULL DEFAULT '[]'")
         first_user = qrow(db, 'SELECT id FROM users LIMIT 1')
         if not first_user:
             email = os.getenv('ADMIN_EMAIL', '').strip().lower()
@@ -892,6 +909,8 @@ class TrackingConfigBody(BaseModel):
     tiktok_pixel_id: str = Field(default='', max_length=80)
     lead_event: str = Field(default='Lead', max_length=80)
     booking_event: str = Field(default='Schedule', max_length=80)
+    heatmaps_enabled: bool = False
+    allowed_domains: str = Field(default='', max_length=1000)
 
     @field_validator('meta_pixel_id')
     @classmethod
@@ -908,6 +927,19 @@ class TrackingConfigBody(BaseModel):
         if value and not re.fullmatch(r'[A-Za-z0-9_-]{5,80}', value):
             raise ValueError('Enter a valid TikTok Pixel ID')
         return value
+
+
+class HeatmapEvent(BaseModel):
+    type: Literal['pageview', 'click', 'scroll', 'engagement']
+    path: str = Field(min_length=1, max_length=500)
+    device: Literal['desktop', 'tablet', 'mobile']
+    x: int = Field(default=-1, ge=-1, le=1000)
+    y: int = Field(default=-1, ge=-1, le=1000)
+    value: int = Field(default=0, ge=0, le=3600)
+
+
+class HeatmapBatch(BaseModel):
+    events: list[HeatmapEvent] = Field(min_length=1, max_length=60)
 
 
 class SitemapSubmitBody(BaseModel):
@@ -1839,6 +1871,80 @@ def accept_invitation(invite_token: str, user=Depends(mutation_user)):
     return {'ok': True, 'tenant_id': invitation['tenant_id']}
 
 
+def tracking_domains(value: str) -> list[str]:
+    domains = []
+    for item in re.split(r'[,\s]+', value.strip()):
+        if not item:
+            continue
+        parsed = urlparse(item if '://' in item else f'https://{item}')
+        host = (parsed.hostname or '').lower().rstrip('.')
+        if (parsed.scheme not in ('http', 'https') or not host or parsed.username or parsed.password
+                or host == 'localhost' or not re.fullmatch(r'[a-z0-9.-]+', host)):
+            raise HTTPException(422, f'Invalid tracking domain: {item}')
+        if host not in domains:
+            domains.append(host)
+    return domains
+
+
+def heatmap_report(tenant_id: str, page: str = '', range_days: int = 30) -> dict:
+    range_days = max(1, min(range_days, 90))
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=range_days)).isoformat(timespec='seconds')
+    prior_cutoff = (now - timedelta(days=range_days * 2)).isoformat(timespec='seconds')
+    period_start = cutoff
+    metric_sql = '''SELECT
+        SUM(CASE WHEN event_type='pageview' THEN 1 ELSE 0 END) AS views,
+        SUM(CASE WHEN event_type='click' THEN 1 ELSE 0 END) AS clicks,
+        SUM(CASE WHEN event_type='engagement' THEN value ELSE 0 END) AS active_seconds,
+        AVG(CASE WHEN event_type='scroll' THEN value END) AS avg_scroll
+      FROM heatmap_events WHERE tenant_id=? AND created_at>=? AND created_at<=?'''
+    with connect() as db:
+        pages = qrows(db, '''SELECT page_path,
+            SUM(CASE WHEN event_type='pageview' THEN 1 ELSE 0 END) AS views,
+            SUM(CASE WHEN event_type='click' THEN 1 ELSE 0 END) AS clicks,
+            SUM(CASE WHEN event_type='engagement' THEN value ELSE 0 END) AS active_seconds,
+            MAX(CASE WHEN event_type='scroll' THEN value ELSE 0 END) AS max_scroll
+          FROM heatmap_events WHERE tenant_id=? AND created_at>=?
+          GROUP BY page_path ORDER BY clicks DESC, views DESC LIMIT 25''', (tenant_id, cutoff))
+        selected = page if page and any(item['page_path'] == page for item in pages) else (
+            pages[0]['page_path'] if pages else '')
+        points = qrows(db, '''SELECT x_bucket,y_bucket,COUNT(*) AS clicks
+          FROM heatmap_events WHERE tenant_id=? AND page_path=? AND event_type='click' AND created_at>=?
+          GROUP BY x_bucket,y_bucket ORDER BY clicks DESC LIMIT 400''', (tenant_id, selected, cutoff)) if selected else []
+        devices = qrows(db, '''SELECT device_class,COUNT(*) AS views FROM heatmap_events
+          WHERE tenant_id=? AND page_path=? AND event_type='pageview' AND created_at>=?
+          GROUP BY device_class''', (tenant_id, selected, cutoff)) if selected else []
+        current = qrow(db, metric_sql, (tenant_id, period_start, now.isoformat(timespec='seconds')))
+        previous = qrow(db, metric_sql, (tenant_id, prior_cutoff, period_start))
+    current = {key: float((current or {}).get(key) or 0) for key in ('views', 'clicks', 'active_seconds', 'avg_scroll')}
+    previous = {key: float((previous or {}).get(key) or 0) for key in ('views', 'clicks', 'active_seconds', 'avg_scroll')}
+    growth = ((current['views'] - previous['views']) / previous['views']) if previous['views'] else 0
+    bounded_growth = max(-0.8, min(2.0, growth))
+    click_rate = current['clicks'] / current['views'] if current['views'] else 0
+    active_per_view = current['active_seconds'] / current['views'] if current['views'] else 0
+    confidence = 'high' if current['views'] >= 100 else 'medium' if current['views'] >= 30 else 'low'
+    recommendations = []
+    if current['views'] < 30:
+        recommendations.append('Collect at least 30 consented page views before making layout decisions.')
+    if current['views'] >= 10 and click_rate < .35:
+        recommendations.append('Clicks are low relative to page views; test a clearer primary call to action above the fold.')
+    if current['avg_scroll'] and current['avg_scroll'] < 50:
+        recommendations.append('Average scroll depth is below 50%; move the strongest offer and proof higher on the page.')
+    if active_per_view and active_per_view < 20:
+        recommendations.append('Active time is short; tighten the opening message and align it with the ad promise.')
+    if not recommendations:
+        recommendations.append('Engagement is healthy; test one layout change at a time and compare the next period.')
+    forecast = {'next_period_views': round(current['views'] * (1 + bounded_growth)),
+                'view_growth_percent': round(growth * 100, 1) if previous['views'] else None,
+                'clicks_per_view': round(click_rate, 2),
+                'active_seconds_per_view': round(active_per_view, 1),
+                'average_scroll_percent': round(current['avg_scroll'], 1),
+                'confidence': confidence, 'method': 'rolling-period trend estimate'}
+    return {'range_days': range_days, 'selected_page': selected, 'pages': pages,
+            'points': points, 'devices': devices, 'forecast': forecast,
+            'recommendations': recommendations}
+
+
 @app.get('/api/workspaces/{tenant_id}')
 def workspace(tenant_id: str, user=Depends(tenant_member)):
     with connect() as db:
@@ -1885,7 +1991,10 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
                         'tiktok_pixel_id':tracking['tiktok_pixel_id'] if tracking else '',
                         'events':json.loads(tracking['events']) if tracking else
                                  {'lead':'Lead','booking':'Schedule'},
+                        'heatmaps_enabled':bool(tracking['heatmaps_enabled']) if tracking else False,
+                        'allowed_domains':json.loads(tracking['allowed_domains']) if tracking else [],
                         'updated_at':tracking['updated_at'] if tracking else ''},
+            'heatmap':heatmap_report(tenant_id),
             'live_metrics_available':bool(google_snapshot), 'current_role':user['role'], 'members':members}
 
 
@@ -3211,44 +3320,120 @@ def update_settings(tenant_id: str, body: LimitsBody, user=Depends(tenant_writer
 def update_tracking(tenant_id: str, body: TrackingConfigBody, user=Depends(tenant_writer)):
     events = {'lead': body.lead_event.strip() or 'Lead',
               'booking': body.booking_event.strip() or 'Schedule'}
+    domains = tracking_domains(body.allowed_domains)
+    if body.heatmaps_enabled and not domains:
+        raise HTTPException(422, 'Add at least one website domain before enabling heatmaps')
     now = utcnow()
     with connect() as db:
-        db.execute('''INSERT INTO tracking_configs(tenant_id,meta_pixel_id,tiktok_pixel_id,events,updated_at)
-                      VALUES(?,?,?,?,?) ON CONFLICT(tenant_id) DO UPDATE SET
+        db.execute('''INSERT INTO tracking_configs(tenant_id,meta_pixel_id,tiktok_pixel_id,events,
+                      heatmaps_enabled,allowed_domains,updated_at) VALUES(?,?,?,?,?,?,?)
+                      ON CONFLICT(tenant_id) DO UPDATE SET
                       meta_pixel_id=excluded.meta_pixel_id,tiktok_pixel_id=excluded.tiktok_pixel_id,
-                      events=excluded.events,updated_at=excluded.updated_at''',
-                   (tenant_id, body.meta_pixel_id, body.tiktok_pixel_id, json.dumps(events), now))
+                      events=excluded.events,heatmaps_enabled=excluded.heatmaps_enabled,
+                      allowed_domains=excluded.allowed_domains,updated_at=excluded.updated_at''',
+                   (tenant_id, body.meta_pixel_id, body.tiktok_pixel_id, json.dumps(events),
+                    int(body.heatmaps_enabled), json.dumps(domains), now))
         audit(db, user['user_id'], tenant_id, 'tracking.updated',
               {'meta_pixel_configured': bool(body.meta_pixel_id),
-               'tiktok_pixel_configured': bool(body.tiktok_pixel_id), 'events': events})
+               'tiktok_pixel_configured': bool(body.tiktok_pixel_id), 'events': events,
+               'heatmaps_enabled': body.heatmaps_enabled, 'allowed_domains': domains})
     return {'ok': True, 'meta_pixel_configured': bool(body.meta_pixel_id),
-            'tiktok_pixel_configured': bool(body.tiktok_pixel_id), 'events': events}
+            'tiktok_pixel_configured': bool(body.tiktok_pixel_id), 'events': events,
+            'heatmaps_enabled': body.heatmaps_enabled, 'allowed_domains': domains}
+
+
+@app.get('/api/workspaces/{tenant_id}/heatmap')
+def workspace_heatmap(tenant_id: str, page: str = '', range_days: int = 30,
+                      user=Depends(tenant_member)):
+    return heatmap_report(tenant_id, page[:500], range_days)
+
+
+@app.delete('/api/workspaces/{tenant_id}/heatmap')
+def clear_workspace_heatmap(tenant_id: str, user=Depends(tenant_writer)):
+    with connect() as db:
+        removed = db.execute('DELETE FROM heatmap_events WHERE tenant_id=?', (tenant_id,)).rowcount
+        audit(db, user['user_id'], tenant_id, 'tracking.heatmap_cleared', {'events_removed': removed})
+    return {'ok': True, 'events_removed': removed}
+
+
+@app.post('/heatmap/{tenant_id}')
+async def ingest_heatmap(tenant_id: str, request: Request):
+    if not re.fullmatch(r'[a-f0-9]{24}', tenant_id):
+        raise HTTPException(404, 'Heatmap configuration not found')
+    origin = request.headers.get('origin', '')
+    origin_host = (urlparse(origin).hostname or '').lower().rstrip('.')
+    with connect() as db:
+        tracking = qrow(db, '''SELECT heatmaps_enabled,allowed_domains FROM tracking_configs
+                               WHERE tenant_id=?''', (tenant_id,))
+    domains = json.loads(tracking['allowed_domains']) if tracking else []
+    if not tracking or not tracking['heatmaps_enabled'] or not origin_host or origin_host not in domains:
+        raise HTTPException(403, 'Heatmap collection is not allowed for this website')
+    rate_key = f"{tenant_id}:{hashlib.sha256((request.client.host if request.client else '').encode()).hexdigest()[:16]}"
+    current = time.monotonic()
+    with _RATE_LOCK:
+        recent = [stamp for stamp in _HEATMAP_BATCHES.get(rate_key, []) if current - stamp < 60]
+        if len(recent) >= 120:
+            raise HTTPException(429, 'Heatmap collection rate exceeded')
+        _HEATMAP_BATCHES[rate_key] = [*recent, current]
+    raw = await request.body()
+    if len(raw) > 65536:
+        raise HTTPException(413, 'Heatmap batch is too large')
+    try:
+        batch = HeatmapBatch.model_validate_json(raw)
+    except Exception as exc:
+        raise HTTPException(422, 'Invalid heatmap event batch') from exc
+    now = utcnow()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat(timespec='seconds')
+    with connect() as db:
+        db.execute('DELETE FROM heatmap_events WHERE tenant_id=? AND created_at<?', (tenant_id, cutoff))
+        for event in batch.events:
+            path = event.path.split('?', 1)[0].split('#', 1)[0]
+            if not path.startswith('/') or any(ord(char) < 32 for char in path):
+                continue
+            db.execute('''INSERT INTO heatmap_events(id,tenant_id,page_path,device_class,event_type,
+                          x_bucket,y_bucket,value,created_at) VALUES(?,?,?,?,?,?,?,?,?)''',
+                       (secrets.token_hex(12), tenant_id, path, event.device, event.type,
+                        -1 if event.x < 0 else min(19, event.x // 50),
+                        -1 if event.y < 0 else min(19, event.y // 50), event.value, now))
+    return Response(status_code=204, headers={'Access-Control-Allow-Origin': origin, 'Vary': 'Origin'})
 
 
 @app.get('/tracking/{tenant_id}.js')
 def tenant_tracking_script(tenant_id: str):
-    """Public website tag containing only tenant-approved public pixel identifiers."""
+    """Public, consent-gated website tag with no secrets or visitor identifiers."""
     if not re.fullmatch(r'[a-f0-9]{24}', tenant_id):
         raise HTTPException(404, 'Tracking configuration not found')
     with connect() as db:
-        tracking = qrow(db, 'SELECT meta_pixel_id,tiktok_pixel_id,events FROM tracking_configs WHERE tenant_id=?',
-                        (tenant_id,))
-    if not tracking or not (tracking['meta_pixel_id'] or tracking['tiktok_pixel_id']):
+        tracking = qrow(db, '''SELECT meta_pixel_id,tiktok_pixel_id,events,heatmaps_enabled
+                               FROM tracking_configs WHERE tenant_id=?''', (tenant_id,))
+    if not tracking or not (tracking['meta_pixel_id'] or tracking['tiktok_pixel_id']
+                            or tracking['heatmaps_enabled']):
         raise HTTPException(404, 'Tracking configuration not found')
     events = json.loads(tracking['events']) if tracking['events'] else {}
     config = json.dumps({
         'meta': tracking['meta_pixel_id'], 'tiktok': tracking['tiktok_pixel_id'],
+        'heatmap': bool(tracking['heatmaps_enabled']), 'heatmapUrl': f'/heatmap/{tenant_id}',
         'lead': events.get('lead', 'Lead'), 'booking': events.get('booking', 'Schedule')},
         separators=(',', ':'))
     script = f'''(()=>{{
 const c={config};
-if(window.adwiseTrackingConsent===false)return;
-if(c.meta){{!function(f,b,e,v,n,t,s){{if(f.fbq)return;n=f.fbq=function(){{n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)}};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}}(window,document,'script','https://connect.facebook.net/en_US/fbevents.js');fbq('init',c.meta);fbq('track','PageView')}}
-if(c.tiktok){{!function(w,d,t){{w.TiktokAnalyticsObject=t;var q=w[t]=w[t]||[];q.methods=['page','track','identify','instances','debug','on','off','once','ready','alias','group','enableCookie','disableCookie','holdConsent','revokeConsent','grantConsent'];q.setAndDefer=function(o,m){{o[m]=function(){{o.push([m].concat([].slice.call(arguments)))}}}};for(var i=0;i<q.methods.length;i++)q.setAndDefer(q,q.methods[i]);q.load=function(id){{var s=d.createElement('script');s.async=!0;s.src='https://analytics.tiktok.com/i18n/pixel/events.js?sdkid='+encodeURIComponent(id)+'&lib='+t;var x=d.getElementsByTagName('script')[0];x.parentNode.insertBefore(s,x)}};q.load(c.tiktok);q.page()}}(window,document,'ttq')}}
+const adConsent=window.adwiseTrackingConsent!==false;
+if(c.meta&&adConsent){{!function(f,b,e,v,n,t,s){{if(f.fbq)return;n=f.fbq=function(){{n.callMethod?n.callMethod.apply(n,arguments):n.queue.push(arguments)}};if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}}(window,document,'script','https://connect.facebook.net/en_US/fbevents.js');fbq('init',c.meta);fbq('track','PageView')}}
+if(c.tiktok&&adConsent){{!function(w,d,t){{w.TiktokAnalyticsObject=t;var q=w[t]=w[t]||[];q.methods=['page','track','identify','instances','debug','on','off','once','ready','alias','group','enableCookie','disableCookie','holdConsent','revokeConsent','grantConsent'];q.setAndDefer=function(o,m){{o[m]=function(){{o.push([m].concat([].slice.call(arguments)))}}}};for(var i=0;i<q.methods.length;i++)q.setAndDefer(q,q.methods[i]);q.load=function(id){{var s=d.createElement('script');s.async=!0;s.src='https://analytics.tiktok.com/i18n/pixel/events.js?sdkid='+encodeURIComponent(id)+'&lib='+t;var x=d.getElementsByTagName('script')[0];x.parentNode.insertBefore(s,x)}};q.load(c.tiktok);q.page()}}(window,document,'ttq')}}
 const send=(kind,data={{}})=>{{const name=c[kind]||kind;if(c.meta&&window.fbq)fbq('track',name,data);if(c.tiktok&&window.ttq)ttq.track(name,data)}};
 window.adwiseTrack={{lead:data=>send('lead',data),booking:data=>send('booking',data),event:send}};
 document.addEventListener('submit',e=>{{const kind=e.target?.dataset?.adwiseTrack;if(kind)send(kind)}});
 document.addEventListener('click',e=>{{const el=e.target.closest?.('[data-adwise-track]');if(el)send(el.dataset.adwiseTrack)}});
+if(c.heatmap&&(window.adwiseAnalyticsConsent===true||window.adwiseTrackingConsent===true)){{
+ const device=innerWidth<768?'mobile':innerWidth<1100?'tablet':'desktop',queue=[],endpoint=new URL(c.heatmapUrl,document.currentScript.src);
+ const add=(type,x=-1,y=-1,value=0)=>queue.push({{type,path:location.pathname,device,x,y,value}});
+ const flush=()=>{{if(!queue.length)return;const body=JSON.stringify({{events:queue.splice(0,60)}});navigator.sendBeacon(endpoint,new Blob([body],{{type:'text/plain'}}))}};
+ add('pageview');setTimeout(flush,1000);
+ document.addEventListener('click',e=>{{if(e.target.closest?.('[data-adwise-private]'))return;add('click',Math.round(1000*e.clientX/Math.max(1,innerWidth)),Math.round(1000*(e.pageY||0)/Math.max(1,document.documentElement.scrollHeight)));if(queue.length>=20)flush()}},{{passive:true}});
+ let active=0,maxScroll=0;setInterval(()=>{{if(!document.hidden)active+=15;if(active>=30){{add('engagement',-1,-1,active);active=0}}flush()}},15000);
+ addEventListener('scroll',()=>{{maxScroll=Math.max(maxScroll,Math.round(100*scrollY/Math.max(1,document.documentElement.scrollHeight-innerHeight)))}},{{passive:true}});
+ addEventListener('pagehide',()=>{{if(active)add('engagement',-1,-1,active);add('scroll',-1,-1,maxScroll);flush()}});
+}}
 }})();'''
     return Response(content=script, media_type='application/javascript', headers={
         'Cache-Control': 'public, max-age=300', 'X-Content-Type-Options': 'nosniff',

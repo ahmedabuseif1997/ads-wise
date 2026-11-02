@@ -29,6 +29,7 @@ def client(tmp_path,monkeypatch):
     monkeypatch.setattr(main,'GOOGLE_GROWTH_CLIENT_ID','')
     monkeypatch.setattr(main,'GOOGLE_GROWTH_CLIENT_SECRET','')
     main._LOGIN_ATTEMPTS.clear()
+    main._HEATMAP_BATCHES.clear()
     main.init_db()
     with TestClient(main.app) as c:
         yield c
@@ -167,6 +168,53 @@ def test_tenant_tracking_script_is_scoped_and_contains_no_secrets(client):
     assert 'adwiseTrack' in response.text and 'PageView' in response.text
     assert 'APP_SECRET' not in response.text and 'refresh_token' not in response.text
     assert client.get('/tracking/not-a-workspace.js').status_code == 404
+
+
+def test_tenant_heatmap_is_consent_gated_domain_scoped_and_private(client):
+    tid, headers = session(client)
+    saved = client.post(f'/api/workspaces/{tid}/tracking', headers=headers, json={
+        'meta_pixel_id': '', 'tiktok_pixel_id': '', 'heatmaps_enabled': True,
+        'allowed_domains': 'tenant.example\nwww.tenant.example'})
+    assert saved.status_code == 200
+    script = client.get(f'/tracking/{tid}.js')
+    assert script.status_code == 200
+    assert 'adwiseAnalyticsConsent===true' in script.text
+    assert 'data-adwise-private' in script.text
+    assert 'visitor' not in script.text.lower()
+    batch = {'events': [
+        {'type': 'pageview', 'path': '/book?secret=removed', 'device': 'mobile'},
+        {'type': 'click', 'path': '/book', 'device': 'mobile', 'x': 525, 'y': 175},
+        {'type': 'engagement', 'path': '/book', 'device': 'mobile', 'value': 30},
+        {'type': 'scroll', 'path': '/book', 'device': 'mobile', 'value': 80},
+    ]}
+    rejected = client.post(f'/heatmap/{tid}', headers={'Origin': 'https://attacker.example'}, json=batch)
+    assert rejected.status_code == 403
+    accepted = client.post(f'/heatmap/{tid}', headers={'Origin': 'https://tenant.example'}, json=batch)
+    assert accepted.status_code == 204
+    report = client.get(f'/api/workspaces/{tid}/heatmap').json()
+    assert report['selected_page'] == '/book'
+    assert report['pages'][0] == {'page_path': '/book', 'views': 1, 'clicks': 1,
+                                  'active_seconds': 30, 'max_scroll': 80}
+    assert report['points'][0]['x_bucket'] == 10
+    assert report['points'][0]['y_bucket'] == 3
+    assert report['forecast']['next_period_views'] == 1
+    assert report['forecast']['confidence'] == 'low'
+    assert report['recommendations']
+    assert 'email' not in json.dumps(report).lower()
+
+
+def test_heatmap_reports_are_workspace_isolated_and_can_be_cleared(client):
+    tid, headers = session(client)
+    client.post(f'/api/workspaces/{tid}/tracking', headers=headers, json={
+        'heatmaps_enabled': True, 'allowed_domains': 'one.example'}).raise_for_status()
+    client.post(f'/heatmap/{tid}', headers={'Origin': 'https://one.example'}, json={
+        'events': [{'type': 'click', 'path': '/private-one', 'device': 'desktop', 'x': 1, 'y': 1}]
+    }).raise_for_status()
+    second = client.post('/api/workspaces', headers=headers, json={'name': 'Second'}).json()['id']
+    assert client.get(f'/api/workspaces/{second}/heatmap').json()['pages'] == []
+    cleared = client.delete(f'/api/workspaces/{tid}/heatmap', headers=headers)
+    assert cleared.status_code == 200 and cleared.json()['events_removed'] == 1
+    assert client.get(f'/api/workspaces/{tid}/heatmap').json()['pages'] == []
 
 
 def test_sitemap_submission_is_limited_to_connected_tenant_property(client, monkeypatch):
