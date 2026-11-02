@@ -19,5 +19,6 @@
 .heatmap-canvas>span{position:absolute;left:12px;font-size:10px;font-weight:700;color:#65758b}.heatmap-canvas>span:first-of-type{top:10px}.heatmap-canvas>span:last-of-type{bottom:10px}
 .link-button{border:0;background:none;color:#145ce6;padding:0;font:inherit;font-weight:700;cursor:pointer}.check-row{display:flex!important;align-items:center;gap:10px}.check-row input{width:auto!important}
 .heatmap-kpis{margin:0 0 18px}.heatmap-insights{margin:0 0 18px}.heatmap-insights p{margin:8px 0 0}
+.seed-analysis{margin-top:18px}.seed-forecast{grid-template-columns:repeat(3,minmax(0,1fr));margin:18px 0}.seed-recommendations{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:18px 0}.seed-recommendations article{border:1px solid #dfe5ef;border-radius:16px;padding:16px}.seed-recommendations h4{margin:10px 0 6px}.seed-recommendations p{margin:0 0 8px}.seed-recommendations .notice{margin-top:12px}
 @media(max-width:1160px){.analytics-kpis{grid-template-columns:repeat(2,1fr)}.analytics-grid{grid-template-columns:1fr}}
-@media(max-width:750px){.analytics-kpis{grid-template-columns:1fr 1fr}.bar-row{grid-template-columns:1fr}.bar-row>strong{text-align:left}.trend-chart{min-height:170px}}
+@media(max-width:750px){.analytics-kpis,.seed-forecast,.seed-recommendations{grid-template-columns:1fr}.bar-row{grid-template-columns:1fr}.bar-row>strong{text-align:left}.trend-chart{min-height:170px}}

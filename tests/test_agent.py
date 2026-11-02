@@ -20,6 +20,9 @@ def client(tmp_path,monkeypatch):
     monkeypatch.setattr(main,'AI_API_KEY','')
     monkeypatch.setattr(main,'AI_BASE_URL','')
     monkeypatch.setattr(main,'MINIMAX_API_KEY','')
+    monkeypatch.setattr(main,'ARK_API_KEY','')
+    monkeypatch.setattr(main,'ARK_BASE_URL','https://ark.cn-beijing.volces.com/api/v3')
+    monkeypatch.setattr(main,'ARK_MODEL','doubao-seed-2-1-pro-260915')
     monkeypatch.setattr(main,'META_APP_ID','')
     monkeypatch.setattr(main,'META_APP_SECRET','')
     monkeypatch.setattr(main,'META_LOGIN_CONFIG_ID','')
@@ -215,6 +218,44 @@ def test_heatmap_reports_are_workspace_isolated_and_can_be_cleared(client):
     cleared = client.delete(f'/api/workspaces/{tid}/heatmap', headers=headers)
     assert cleared.status_code == 200 and cleared.json()['events_removed'] == 1
     assert client.get(f'/api/workspaces/{tid}/heatmap').json()['pages'] == []
+
+
+def test_seed_performance_analysis_is_advisory_cached_and_tenant_isolated(client, monkeypatch):
+    tid, headers = session(client)
+    monkeypatch.setattr(main, 'ARK_API_KEY', 'test-key-never-persisted')
+    captured = []
+
+    async def fake_seed(dataset):
+        captured.append(dataset)
+        return {
+            'executive_summary': 'Traffic is stable; collect more conversion data.',
+            'confidence': 'low',
+            'forecast': {'next_30_day_clicks': 12, 'next_30_day_conversions': None,
+                         'predicted_cpa_aed': None, 'basis': 'Limited aggregate history.'},
+            'findings': ['No conversion history is available.'],
+            'recommendations': [{'priority': 'high', 'title': 'Verify conversion tracking',
+                                 'action': 'Test the booking conversion tag.',
+                                 'rationale': 'Forecasting requires reliable outcomes.',
+                                 'expected_impact': 'Better measurement confidence.',
+                                 'metric_to_watch': 'Recorded conversions',
+                                 'requires_approval': True}],
+            'experiments': ['Test one CTA variation.'],
+            'data_quality_notes': ['Sample size is small.'],
+        }
+
+    monkeypatch.setattr(main, 'seed_analyze_performance', fake_seed)
+    first = client.post(f'/api/workspaces/{tid}/agent/performance-analysis', headers=headers, json={})
+    assert first.status_code == 200
+    assert first.json()['provider'] == 'seed' and first.json()['cached'] is False
+    assert captured[0]['constraints']['no_automatic_campaign_changes'] is True
+    assert 'token' not in json.dumps(captured[0]).lower()
+    second = client.post(f'/api/workspaces/{tid}/agent/performance-analysis', headers=headers, json={})
+    assert second.status_code == 200 and second.json()['cached'] is True
+    assert len(captured) == 1
+    workspace = client.get(f'/api/workspaces/{tid}').json()
+    assert workspace['seed_analysis']['analysis']['recommendations'][0]['requires_approval'] is True
+    other = client.post('/api/workspaces', headers=headers, json={'name': 'Other tenant'}).json()['id']
+    assert client.get(f'/api/workspaces/{other}').json()['seed_analysis'] is None
 
 
 def test_sitemap_submission_is_limited_to_connected_tenant_property(client, monkeypatch):
