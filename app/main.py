@@ -1033,13 +1033,21 @@ def meta_timestamp(value) -> str:
 
 
 def meta_debug_token(access_token: str) -> dict:
+    """Token facts from Meta's debug_token (never /me/permissions).
+
+    System-user (business integration) tokens from Facebook Login for Business list business-level
+    permissions such as ads_read and ads_management only in granular_scopes, so both lists count.
+    """
     data = meta_graph('GET', 'debug_token', params={
         'input_token': access_token, 'access_token': f'{META_APP_ID}|{META_APP_SECRET}'}).get('data') or {}
+    scopes = {str(scope) for scope in data.get('scopes') or []}
+    scopes |= {str(item['scope']) for item in data.get('granular_scopes') or []
+               if isinstance(item, dict) and item.get('scope')}
     return {'valid': bool(data.get('is_valid')), 'app_id': str(data.get('app_id', '')),
             'user_id': str(data.get('user_id', '')),
             'expires_at': meta_timestamp(data.get('expires_at')),
             'data_access_expires_at': meta_timestamp(data.get('data_access_expires_at')),
-            'scopes': sorted({str(scope) for scope in data.get('scopes') or []})}
+            'scopes': sorted(scopes)}
 
 
 def meta_token_problem(summary: dict) -> str:
@@ -1049,6 +1057,36 @@ def meta_token_problem(summary: dict) -> str:
         expires = summary.get('expires_at', '')
         return 'token_expired' if expires not in ('', 'never') and expires <= utcnow() else 'token_invalid'
     return ''
+
+
+META_AD_SCOPES = ('ads_read', 'ads_management')
+
+
+def meta_confirm_ad_access(access_token: str, summary: dict, ad_account_id: str = '') -> dict:
+    """Second check for the ad permissions: a successful ad account read proves ads_read/ads_management work.
+
+    Only called when debug_token does not list them, so normal user tokens cost no extra Meta call.
+    Permission-type failures leave the summary unchanged (reported as missing); throttling, network and
+    token errors propagate so callers never turn a temporary Meta problem into a false "missing" report.
+    """
+    if all(scope in summary.get('scopes', []) for scope in META_AD_SCOPES):
+        return summary
+    try:
+        if ad_account_id:
+            meta_graph('GET', ad_account_id, access_token, {'fields': 'id,name,account_status'})
+        else:
+            meta_graph('GET', 'me/adaccounts', access_token, {'fields': 'id,name,account_status', 'limit': 1})
+    except MetaAPIError as exc:
+        if exc.kind in ('missing_permission', 'asset_unavailable', 'invalid_request'):
+            return summary
+        raise
+    return {**summary, 'scopes': sorted(set(summary.get('scopes', [])) | set(META_AD_SCOPES))}
+
+
+def meta_save_granted_scopes(tenant_id: str, scopes: list[str]) -> None:
+    with connect() as db:
+        db.execute('UPDATE meta_connection_state SET granted_scopes=?,updated_at=? WHERE tenant_id=?',
+                   (json.dumps(sorted(scopes)), utcnow(), tenant_id))
 
 
 def meta_missing_scopes(scopes) -> list[str]:
@@ -1082,8 +1120,10 @@ def meta_pages(access_token: str) -> list[dict]:
         page_id = str(row.get('id', ''))
         tasks = [str(task) for task in row.get('tasks') or []]
         if re.fullmatch(r'\d{1,30}', page_id):
+            # System-user tokens often omit `tasks`; unknown is allowed and Meta still enforces it on ad creation.
+            can_advertise = 'ADVERTISE' in tasks or 'MANAGE' in tasks or row.get('tasks') is None
             pages.append({'id': page_id, 'name': row.get('name') or f'Page {page_id}', 'tasks': tasks,
-                          'can_advertise': 'ADVERTISE' in tasks or 'MANAGE' in tasks})
+                          'can_advertise': can_advertise})
     return sorted(pages, key=lambda item: (item['name'].lower(), item['id']))
 
 
@@ -3136,10 +3176,19 @@ def meta_oauth_callback(request: Request, code: str = '', state: str = '', error
         try:
             if meta_reverify_ad_account(tenant_id, access_token, info['previous_ad_account']):
                 result = 'connected'
+                # Reading the ad account just succeeded, which already proves the ad permissions work.
+                summary = {**summary, 'scopes': sorted(set(summary['scopes']) | set(META_AD_SCOPES))}
         except MetaAPIError as exc:
             meta_record_error(tenant_id, exc)
             reason = exc.kind
-    missing = [] if summary.get('unverified') else meta_missing_scopes(summary['scopes'])
+    if not summary.get('unverified') and not reason:
+        try:
+            summary = meta_confirm_ad_access(access_token, summary)
+        except MetaAPIError as exc:
+            meta_record_error(tenant_id, exc)
+            reason = exc.kind
+        meta_save_granted_scopes(tenant_id, summary['scopes'])
+    missing = [] if summary.get('unverified') or reason else meta_missing_scopes(summary['scopes'])
     if missing:
         reason = 'permissions'
     elif summary.get('unverified') and not reason:
@@ -3494,6 +3543,8 @@ def meta_health_report(tenant_id: str, live: bool = False) -> dict:
             try:
                 access_token = meta_access_token(connection)
                 summary = meta_debug_token(access_token)
+                if not meta_token_problem(summary):
+                    summary = meta_confirm_ad_access(access_token, summary, connection.get('customer_id', ''))
                 now = utcnow()
                 with connect() as db:
                     db.execute('''UPDATE meta_connection_state SET token_expires_at=?,data_access_expires_at=?,
@@ -3761,6 +3812,8 @@ def meta_seed_validate(tenant_id: str, body: MetaChangeRequestBody, stage: str,
             problem = meta_token_problem(summary)
             check('token_valid', 'Meta token is valid for this app and not expired', not problem,
                   META_ERROR_MESSAGES.get(problem, ''))
+            if not problem:
+                summary = meta_confirm_ad_access(access_token, summary, ad_account_id)
             missing = [scope for scope in required_scopes if scope not in summary['scopes']]
             check('permissions', 'Required Meta permissions are granted', not missing,
                   'Missing permissions: ' + ', '.join(missing))

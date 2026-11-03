@@ -130,11 +130,16 @@ class FakeMeta:
             if not user:
                 return {'data': {'is_valid': False, 'app_id': main.META_APP_ID}}
             return {'data': {'is_valid': user['valid'], 'app_id': user.get('app_id', main.META_APP_ID),
-                             'user_id': user['user_id'], 'expires_at': int(time.time()) + user['expires_in'],
-                             'data_access_expires_at': int(time.time()) + 80 * 86400, 'scopes': user['scopes']}}
+                             'user_id': user['user_id'], 'expires_at': user.get('expires_at', int(time.time()) + user.get('expires_in', 0)),
+                             'data_access_expires_at': int(time.time()) + 80 * 86400, 'scopes': user['scopes'],
+                             'granular_scopes': user.get('granular', [])}}
         user = self.users.get(access_token)
         if not user:
             raise main.MetaAPIError('token_invalid', 'Invalid OAuth access token', 190)
+        granted = set(user['scopes']) | {item['scope'] for item in user.get('granular', [])}
+        ad_access = user.get('ads_access', bool(granted & {'ads_read', 'ads_management'}))
+        if (path == 'me/adaccounts' or re.match(r'act_\d+', path)) and not ad_access:
+            raise main.MetaAPIError('missing_permission', '(#200) Requires ads_read or ads_management', 200)
         if path == 'me/adaccounts':
             return {'data': [{'id': key, 'account_id': key[4:], **value} for key, value in user['ad_accounts'].items()]}
         if path == 'me/accounts':
@@ -308,7 +313,8 @@ def test_callback_flags_missing_permissions_and_rejects_other_apps(client, fake)
     response = connect_meta(client, tid, hdr, 'code-A')
     assert response.headers['location'].endswith('meta=authorized&reason=permissions')
     health = client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()
-    assert set(health['permissions']['missing_required']) == {'ads_management', 'pages_read_engagement'}
+    # Reading ad accounts works, which confirms the ad permissions; the Page permission is still missing.
+    assert health['permissions']['missing_required'] == ['pages_read_engagement']
     assert health['overall'] == 'attention'
     other = client.post('/api/workspaces', headers=hdr, json={'name': 'Other Business'}).json()['id']
     fake.users['token-B']['app_id'] = 'someone-elses-app'
@@ -683,3 +689,100 @@ def test_business_management_is_not_required_or_requested(client, fake):
     assert request['status'] == 'awaiting_owner' and failed_checks(request) == set()
     health = client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()
     assert health['permissions']['missing_required'] == []
+
+
+# ---------------------------------------------------------------- Permission detection (debug_token) ----------
+
+ARKS_ACCOUNT = 'act_2005981653917424'
+
+
+def arks_system_user(fake, granular=True, ads_access=None):
+    """Login for Business system-user token: business permissions only in granular_scopes, Pages without tasks."""
+    user = {'user_id': 'system-user-arks', 'valid': True, 'expires_at': 0,  # 0 = never expires (system user)
+            'scopes': ['pages_read_engagement', 'pages_show_list', 'public_profile'],
+            'granular': ([{'scope': 'ads_read', 'target_ids': [ARKS_ACCOUNT[4:]]},
+                          {'scope': 'ads_management', 'target_ids': [ARKS_ACCOUNT[4:]]},
+                          {'scope': 'pages_show_list', 'target_ids': ['9001', '9002']}] if granular else []),
+            'ad_accounts': {ARKS_ACCOUNT: {'name': 'ARKS investment Holding LTD', 'currency': 'AED',
+                                           'timezone_name': 'Asia/Dubai', 'account_status': 1}},
+            'pages': [{'id': '9001', 'name': 'ARKS Investment Holding Ltd'}, {'id': '9002', 'name': 'Trainsyou.com'}],
+            'instagram': {ARKS_ACCOUNT: []}, 'pixels': {ARKS_ACCOUNT: []}}
+    if ads_access is not None:
+        user['ads_access'] = ads_access
+    fake.users['token-ARKS'] = user
+    fake.codes['code-ARKS'] = 'token-ARKS'
+
+
+def live_health(client, tid):
+    with main.connect() as db:
+        db.execute("UPDATE meta_connection_state SET last_checked_at='' WHERE tenant_id=?", (tid,))
+    return client.get(f'/api/workspaces/{tid}/integrations/meta/health?live=true').json()
+
+
+def test_full_debug_token_scopes_report_nothing_missing(client, fake):
+    tid, hdr = session(client)
+    assert fake.users['token-A']['scopes'] == ['ads_read', 'ads_management', 'pages_show_list', 'pages_read_engagement']
+    assert connect_meta(client, tid, hdr, 'code-A').headers['location'].endswith('meta=authorized')
+    assert not any(call[1] == 'me/adaccounts' for call in fake.calls)  # no extra Meta call needed
+    health = live_health(client, tid)
+    assert health['permissions']['missing_required'] == []
+    assert set(health['permissions']) == {'required', 'optional', 'granted', 'missing_required'}  # shape unchanged
+    assert health['permissions']['required'] == ['ads_read', 'ads_management', 'pages_show_list', 'pages_read_engagement']
+    assert health['permissions']['optional'] == ['pages_manage_ads']
+
+
+def test_system_user_token_ad_permissions_come_from_granular_scopes(client, fake):
+    """Regression: ads_read/ads_management were reported missing for Login for Business system-user tokens."""
+    tid, hdr = session(client)
+    arks_system_user(fake)
+    response = connect_meta(client, tid, hdr, 'code-ARKS')
+    assert response.headers['location'].endswith('meta=authorized')  # no reason=permissions
+    health = live_health(client, tid)
+    assert health['permissions']['missing_required'] == []
+    assert {'ads_read', 'ads_management', 'pages_show_list', 'pages_read_engagement'} <= set(health['permissions']['granted'])
+    assert 'business_management' not in health['permissions']['required']
+    assert health['token']['never_expires'] is True
+    assert client.get(f'/api/workspaces/{tid}').json()['meta']['missing_scopes'] == []
+
+
+def test_ad_access_check_confirms_permissions_debug_token_does_not_list(client, fake):
+    tid, hdr = session(client)
+    arks_system_user(fake, granular=False, ads_access=True)
+    response = connect_meta(client, tid, hdr, 'code-ARKS')
+    assert response.headers['location'].endswith('meta=authorized')
+    check = next(call for call in fake.calls if call[1] == 'me/adaccounts')
+    assert check[3]['fields'] == 'id,name,account_status'
+    assert len([call for call in fake.calls if call[0] == 'GET']) <= 4  # callback stays within four Meta calls
+    assert live_health(client, tid)['permissions']['missing_required'] == []
+
+
+def test_token_missing_ads_read_is_reported_missing(client, fake):
+    tid, hdr = session(client)
+    arks_system_user(fake, granular=False)  # Page permissions only and no working ad account access
+    response = connect_meta(client, tid, hdr, 'code-ARKS')
+    assert response.headers['location'].endswith('meta=authorized&reason=permissions')
+    health = live_health(client, tid)
+    assert health['permissions']['missing_required'] == ['ads_read', 'ads_management']
+    assert health['overall'] == 'attention'
+
+
+def test_choose_assets_lists_arks_ad_account_and_both_pages(client, fake):
+    tid, hdr = session(client)
+    arks_system_user(fake)
+    connect_meta(client, tid, hdr, 'code-ARKS')
+    assets = client.get(f'/api/workspaces/{tid}/integrations/meta/assets').json()
+    assert [(item['id'], item['name'], item['available']) for item in assets['ad_accounts']] == [
+        (ARKS_ACCOUNT, 'ARKS investment Holding LTD', True)]
+    assert {(item['name'], item['available']) for item in assets['pages']} == {
+        ('ARKS Investment Holding Ltd', True), ('Trainsyou.com', True)}
+    saved = select(client, tid, hdr, ad_account_id=ARKS_ACCOUNT, page_id='9002')
+    assert saved.status_code == 200 and saved.json()['page']['name'] == 'Trainsyou.com'
+    serialized = json.dumps(assets) + client.get(f'/api/workspaces/{tid}').text
+    assert 'token-ARKS' not in serialized and main.META_APP_SECRET not in serialized
+
+
+def test_pages_with_tasks_but_no_advertise_role_stay_blocked(client, fake):
+    tid, hdr = session(client)
+    connect_meta(client, tid, hdr, 'code-A')
+    pages = client.get(f'/api/workspaces/{tid}/integrations/meta/assets?ad_account_id=act_111').json()['pages']
+    assert {item['id']: item['available'] for item in pages} == {'501': True, '502': False}
