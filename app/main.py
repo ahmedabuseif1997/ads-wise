@@ -1045,7 +1045,7 @@ def meta_debug_token(access_token: str) -> dict:
     granular = {str(item['scope']) for item in data.get('granular_scopes') or []
                 if isinstance(item, dict) and item.get('scope')}
     return {'valid': bool(data.get('is_valid')), 'app_id': str(data.get('app_id', '')),
-            'user_id': str(data.get('user_id', '')),
+            'user_id': str(data.get('user_id', '')), 'type': str(data.get('type', '')),
             'expires_at': meta_timestamp(data.get('expires_at')),
             'data_access_expires_at': meta_timestamp(data.get('data_access_expires_at')),
             'scopes': sorted(listed | granular),
@@ -3176,20 +3176,32 @@ def meta_oauth_callback(request: Request, code: str = '', state: str = '', error
             raise MetaAPIError('token_invalid')
     except MetaAPIError as exc:
         return integration_redirect('meta', 'error', exc.kind)
+    exchanged, exchange_expires_in, exchange_error = False, 0, ''
     try:
-        long_lived = meta_graph('GET', 'oauth/access_token', params={
+        # User-token configurations: swap the short-lived (~1-2 h) token for a long-lived (~60 day) one.
+        exchange = meta_graph('GET', 'oauth/access_token', params={
             'grant_type': 'fb_exchange_token', 'client_id': META_APP_ID,
-            'client_secret': META_APP_SECRET, 'fb_exchange_token': access_token}).get('access_token', '')
-        access_token = long_lived or access_token
-    except MetaAPIError:
-        pass  # System-user tokens from Login for Business are not exchangeable; keep the issued token.
+            'client_secret': META_APP_SECRET, 'fb_exchange_token': access_token})
+        if exchange.get('access_token'):
+            access_token, exchanged = exchange['access_token'], True
+            try:
+                exchange_expires_in = int(exchange.get('expires_in') or 0)
+            except (TypeError, ValueError):
+                exchange_expires_in = 0
+    except MetaAPIError as exc:
+        exchange_error = exc.kind  # System-user tokens are not exchangeable; they are checked below.
     try:
         summary = meta_debug_token(access_token)
     except MetaAPIError as exc:
         if exc.kind not in ('cooling_down', 'rate_limited', 'temporary', 'network'):
             return integration_redirect('meta', 'error', exc.kind)
-        summary = {'valid': True, 'app_id': META_APP_ID, 'user_id': '', 'expires_at': '',
+        fallback_expiry = ((datetime.now(timezone.utc) + timedelta(seconds=exchange_expires_in))
+                           .isoformat(timespec='seconds') if exchange_expires_in else '')
+        summary = {'valid': True, 'app_id': META_APP_ID, 'user_id': '', 'expires_at': fallback_expiry,
                    'data_access_expires_at': '', 'scopes': [], 'unverified': True}
+    short_lived = not exchanged and summary.get('type', '').upper() != 'SYSTEM_USER' and \
+        summary.get('expires_at', '') not in ('', 'never') and \
+        summary['expires_at'] < (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(timespec='seconds')
     problem = meta_token_problem(summary)
     if problem:
         return integration_redirect('meta', 'error', 'app_mismatch' if summary.get('app_id') != META_APP_ID
@@ -3232,8 +3244,19 @@ def meta_oauth_callback(request: Request, code: str = '', state: str = '', error
         reason = 'permissions'
     elif summary.get('unverified') and not reason:
         reason = 'verification_pending'
+    if short_lived:
+        # The connection would silently stop working within hours; say so instead of hiding it.
+        reason = reason or 'short_lived_token'
+        with connect() as db:
+            db.execute('''UPDATE meta_connection_state SET last_error_kind=?,last_error=?,last_error_at=?
+                          WHERE tenant_id=?''',
+                       ('short_lived_token', 'Meta did not issue a long-lived token, so this connection expires at '
+                        f"{summary['expires_at'].replace('T', ' ')[:16]} UTC. Reconnect Meta Ads; if it repeats, "
+                        'check META_APP_SECRET in Vercel.', utcnow(), tenant_id))
     diagnostics = meta_permission_diagnostics(summary, stage='oauth_callback', previous_ad_account_check=previous_check,
-                                              redirect_reason=reason)
+                                              redirect_reason=reason, token_type=summary.get('type', ''),
+                                              long_lived_exchange='ok' if exchanged else f'failed:{exchange_error or "no_token"}',
+                                              token_expires_at=summary.get('expires_at', ''))
     meta_log('meta.permission_check', tenant_id, diagnostics)
     with connect() as db:
         audit(db, user['user_id'], tenant_id, 'integration.meta_authorized', {
@@ -3672,6 +3695,86 @@ def meta_health_report(tenant_id: str, live: bool = False) -> dict:
 @app.get('/api/workspaces/{tenant_id}/integrations/meta/health')
 def meta_health(tenant_id: str, live: bool = False, user=Depends(tenant_member)):
     return meta_health_report(tenant_id, live)
+
+
+def meta_error_fields(exc: MetaAPIError) -> dict:
+    return {'kind': exc.kind, 'code': exc.code, 'subcode': exc.subcode, 'message': exc.provider_message[:300]}
+
+
+@app.get('/api/workspaces/{tenant_id}/integrations/meta/diagnostics')
+def meta_diagnostics(tenant_id: str, ad_account_id: str = '', user=Depends(tenant_member)):
+    """Owner-only, read-only permission diagnostics for this workspace's own Meta token.
+
+    Shows what Meta itself returns (debug_token fields, /me/adaccounts and ad account reads) next to the
+    stored values the health check serves. Never returns or logs the token or the app secret.
+    At most once a minute per workspace, and refused during a Meta cool-down.
+    """
+    meta_require_owner(user, 'Only workspace owners can run Meta diagnostics')
+    if ad_account_id and not re.fullmatch(r'(act_)?\d{1,30}', ad_account_id):
+        raise HTTPException(422, 'ad_account_id must look like act_123')
+    with connect() as db:
+        connection = qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='meta'", (tenant_id,))
+        recent = qrow(db, 'SELECT blocked_until FROM meta_rate_limits WHERE scope=?', (f'diagnostics:{tenant_id}',))
+    if not connection:
+        raise HTTPException(409, 'Connect Meta Ads first')
+    if recent and recent['blocked_until'] > utcnow():
+        raise HTTPException(429, f"Run Meta diagnostics at most once a minute. Retry after {recent['blocked_until'][:19]}Z.")
+    meta_guard(tenant_id)
+    meta_set_cooldown(f'diagnostics:{tenant_id}', 60, 'diagnostics run')
+    state = meta_state(tenant_id)
+    access_token = meta_access_token(connection)
+    try:
+        stored_granted = json.loads(state.get('granted_scopes') or '[]')
+    except ValueError:
+        stored_granted = []
+    report = {'checked_at': utcnow(), 'graph_version': META_GRAPH_VERSION,
+              'stored': {'source': 'meta_connection_state.granted_scopes (written by the reconnect and live health checks)',
+                         'granted': stored_granted, 'missing_required': meta_missing_scopes(stored_granted),
+                         'last_checked_at': state.get('last_checked_at', ''),
+                         'last_error': {'kind': state.get('last_error_kind', ''), 'message': state.get('last_error', ''),
+                                        'at': state.get('last_error_at', '')},
+                         'connection_status': connection['status'], 'selected_ad_account': connection['customer_id']},
+              'debug_token': {}, 'me_adaccounts': {}, 'ad_accounts': {}}
+    granular_accounts = []
+    try:
+        data = meta_graph('GET', 'debug_token', params={
+            'input_token': access_token, 'access_token': f'{META_APP_ID}|{META_APP_SECRET}'}).get('data') or {}
+        granular = [{'scope': str(item.get('scope', '')), 'target_ids': [str(x) for x in item.get('target_ids') or []]}
+                    for item in data.get('granular_scopes') or [] if isinstance(item, dict)]
+        report['debug_token'] = {
+            'is_valid': bool(data.get('is_valid')), 'app_id': str(data.get('app_id', '')),
+            'app_id_matches': str(data.get('app_id', '')) == META_APP_ID, 'type': str(data.get('type', '')),
+            'expires_at': meta_timestamp(data.get('expires_at')),
+            'scopes': sorted(str(scope) for scope in data.get('scopes') or []), 'granular_scopes': granular}
+        granular_accounts = [meta_account_id(target) for item in granular if item['scope'] in META_AD_SCOPES
+                             for target in item['target_ids']]
+    except MetaAPIError as exc:
+        report['debug_token'] = {'error': meta_error_fields(exc)}
+    try:
+        rows = meta_graph('GET', 'me/adaccounts', access_token, {'fields': 'id,name', 'limit': 25}).get('data') or []
+        report['me_adaccounts'] = {'ok': True, 'accounts': [{'id': str(row.get('id', '')), 'name': row.get('name', '')}
+                                                             for row in rows if isinstance(row, dict)]}
+    except MetaAPIError as exc:
+        report['me_adaccounts'] = {'ok': False, 'error': meta_error_fields(exc)}
+    to_check = []
+    for candidate in [meta_account_id(ad_account_id), connection['customer_id'], *granular_accounts]:
+        if candidate and candidate not in to_check:
+            to_check.append(candidate)
+    for account_id in to_check[:5]:
+        try:
+            account = meta_graph('GET', account_id, access_token, {'fields': 'id,name'})
+            report['ad_accounts'][account_id] = {'ok': True, 'id': str(account.get('id', '')), 'name': account.get('name', '')}
+        except MetaAPIError as exc:
+            report['ad_accounts'][account_id] = {'ok': False, 'error': meta_error_fields(exc)}
+    debug_scopes = set(report['debug_token'].get('scopes', [])) | {
+        item['scope'] for item in report['debug_token'].get('granular_scopes', [])}
+    ad_read_works = report['me_adaccounts'].get('ok') or any(item['ok'] for item in report['ad_accounts'].values())
+    report['conclusion'] = (
+        'debug_token lists the ad permissions' if set(META_AD_SCOPES) <= debug_scopes else
+        'debug_token omits the ad permissions, but reading ad accounts works' if ad_read_works else
+        'Meta omits ads_read/ads_management from debug_token and refuses ad account reads for this token')
+    meta_log('meta.permission_diagnostics', tenant_id, report)
+    return report
 
 
 def meta_workspace_summary(tenant_id: str, connection: dict | None, snapshot_row: dict | None) -> dict:

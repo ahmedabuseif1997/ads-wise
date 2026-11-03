@@ -103,6 +103,7 @@ class FakeMeta:
         self.daily_rows = {'act_111': [{'date_start': '2026-11-01', 'spend': '120.50', 'impressions': '10000',
                                         'clicks': '250', 'actions': [{'action_type': 'lead', 'value': '7'}]}],
                            'act_222': []}
+        self.fail_exchange = False
         self.seed_reviews = []
         self.seed_verdict = {'decision': 'pass', 'summary': 'Clear, compliant spa offer.', 'issues': []}
         self.remote = {'8001': {'account': 'act_111', 'status': 'ACTIVE'},
@@ -123,7 +124,10 @@ class FakeMeta:
                 if not token:
                     raise main.MetaAPIError('invalid_request', 'Invalid verification code', 100)
                 return {'access_token': f'short-{token}'}
-            return {'access_token': params['fb_exchange_token'].removeprefix('short-')}
+            if self.fail_exchange:
+                raise main.MetaAPIError('invalid_request', 'This token type cannot be exchanged', 100)
+            return {'access_token': params['fb_exchange_token'].removeprefix('short-'), 'token_type': 'bearer',
+                    'expires_in': 60 * 86400}
         if path == 'debug_token':
             assert params['access_token'] == f'{main.META_APP_ID}|{main.META_APP_SECRET}'
             user = self.users.get(params['input_token'])
@@ -132,7 +136,7 @@ class FakeMeta:
             return {'data': {'is_valid': user['valid'], 'app_id': user.get('app_id', main.META_APP_ID),
                              'user_id': user['user_id'], 'expires_at': user.get('expires_at', int(time.time()) + user.get('expires_in', 0)),
                              'data_access_expires_at': int(time.time()) + 80 * 86400, 'scopes': user['scopes'],
-                             'granular_scopes': user.get('granular', [])}}
+                             'granular_scopes': user.get('granular', []), 'type': user.get('type', 'USER')}}
         user = self.users.get(access_token)
         if not user:
             raise main.MetaAPIError('token_invalid', 'Invalid OAuth access token', 190)
@@ -698,7 +702,7 @@ ARKS_ACCOUNT = 'act_2005981653917424'
 
 def arks_system_user(fake, granular=True, ads_access=None):
     """Login for Business system-user token: business permissions only in granular_scopes, Pages without tasks."""
-    user = {'user_id': 'system-user-arks', 'valid': True, 'expires_at': 0,  # 0 = never expires (system user)
+    user = {'user_id': 'system-user-arks', 'valid': True, 'expires_at': 0, 'type': 'SYSTEM_USER',  # 0 = never expires
             'scopes': ['pages_read_engagement', 'pages_show_list', 'public_profile'],
             'granular': ([{'scope': 'ads_read', 'target_ids': [ARKS_ACCOUNT[4:]]},
                           {'scope': 'ads_management', 'target_ids': [ARKS_ACCOUNT[4:]]},
@@ -863,3 +867,157 @@ def test_unfinished_permission_check_is_rechecked_not_served_from_cache(client, 
     client.get(f'/api/workspaces/{tid}/integrations/meta/health?live=true')
     [skipped] = permission_logs(capsys, 'health_live_skipped')
     assert skipped['reason'] == 'checked_under_60s_ago' and 'ads_read' in skipped['stored_granted']
+
+
+# ---------------------------------------------------------------- Owner diagnostics ---------------------------
+
+def diagnostics(client, tid, ad_account=ARKS_ACCOUNT):
+    return client.get(f'/api/workspaces/{tid}/integrations/meta/diagnostics?ad_account_id={ad_account}')
+
+
+def test_diagnostics_show_what_meta_returns_when_it_omits_ad_permissions(client, fake, capsys):
+    tid, hdr = session(client)
+    arks_system_user(fake, granular=False)  # Meta withholds ad permissions entirely
+    connect_meta(client, tid, hdr, 'code-ARKS')
+    response = diagnostics(client, tid)
+    assert response.status_code == 200, response.text
+    report = response.json()
+    assert report['debug_token'] == {'is_valid': True, 'app_id': 'meta-app', 'app_id_matches': True,
+                                     'type': 'SYSTEM_USER', 'expires_at': 'never',
+                                     'scopes': ['pages_read_engagement', 'pages_show_list', 'public_profile'],
+                                     'granular_scopes': []}
+    assert report['me_adaccounts'] == {'ok': False, 'error': {
+        'kind': 'missing_permission', 'code': 200, 'subcode': 0, 'message': '(#200) Requires ads_read or ads_management'}}
+    assert report['ad_accounts'][ARKS_ACCOUNT]['ok'] is False
+    assert report['ad_accounts'][ARKS_ACCOUNT]['error']['code'] == 200
+    assert report['stored']['granted'] == ['pages_read_engagement', 'pages_show_list', 'public_profile']
+    assert report['stored']['missing_required'] == ['ads_read', 'ads_management']
+    assert report['conclusion'].startswith('Meta omits ads_read/ads_management')
+    output = response.text + capsys.readouterr().err
+    for secret in ('token-ARKS', main.META_APP_SECRET, 'meta-app|'):
+        assert secret not in output
+    again = diagnostics(client, tid)
+    assert again.status_code == 429 and 'once a minute' in again.json()['detail']
+
+
+def test_diagnostics_report_granular_targets_and_working_ad_reads(client, fake):
+    tid, hdr = session(client)
+    arks_system_user(fake)
+    connect_meta(client, tid, hdr, 'code-ARKS')
+    report = diagnostics(client, tid).json()
+    assert {'scope': 'ads_management', 'target_ids': [ARKS_ACCOUNT[4:]]} in report['debug_token']['granular_scopes']
+    assert report['me_adaccounts']['accounts'] == [{'id': ARKS_ACCOUNT, 'name': 'ARKS investment Holding LTD'}]
+    assert report['ad_accounts'] == {ARKS_ACCOUNT: {'ok': True, 'id': ARKS_ACCOUNT, 'name': 'ARKS investment Holding LTD'}}
+    assert report['conclusion'] == 'debug_token lists the ad permissions'
+    other = client.post('/api/workspaces', headers=hdr, json={'name': 'Other Business'}).json()['id']
+    arks_system_user(fake, granular=False, ads_access=True)
+    fake.codes['code-ARKS-2'] = 'token-ARKS'
+    connect_meta(client, other, hdr, 'code-ARKS-2')
+    assert diagnostics(client, other).json()['conclusion'] == \
+        'debug_token omits the ad permissions, but reading ad accounts works'
+
+
+def test_diagnostics_are_owner_only_and_workspace_scoped(client, fake):
+    tid, hdr = session(client)
+    connect_meta(client, tid, hdr, 'code-A')
+    manager, _ = member_client(tid, 'manager@example.com', 'manager')
+    assert diagnostics(manager, tid).status_code == 403
+    stranger, _ = member_client(tid, 'stranger@example.com', None)
+    assert diagnostics(stranger, tid).status_code == 404
+    assert client.get(f'/api/workspaces/{tid}/integrations/meta/diagnostics?ad_account_id=../me').status_code == 422
+    other = client.post('/api/workspaces', headers=hdr, json={'name': 'Other Business'}).json()['id']
+    assert diagnostics(client, other).status_code == 409  # never falls back to another workspace's token
+
+
+# ---------------------------------------------------------------- USER access token configuration -------------
+
+USER_CONFIG_ID = '1671511114491688'
+
+
+def user_token_config(fake, monkeypatch):
+    """Facebook Login for Business with a USER access token, no Meta-side asset selection."""
+    monkeypatch.setattr(main, 'META_LOGIN_CONFIG_ID', USER_CONFIG_ID)
+    base = {'user_id': 'meta-user-owner', 'valid': True, 'type': 'USER',
+            'scopes': ['ads_management', 'ads_read', 'pages_read_engagement', 'pages_show_list', 'public_profile'],
+            'ad_accounts': {ARKS_ACCOUNT: {'name': 'ARKS investment Holding LTD', 'currency': 'AED',
+                                           'timezone_name': 'Asia/Dubai', 'account_status': 1}},
+            'pages': [{'id': '9001', 'name': 'ARKS Investment Holding Ltd',
+                       'tasks': ['ADVERTISE', 'ANALYZE', 'CREATE_CONTENT', 'MESSAGING', 'MODERATE', 'MANAGE']},
+                      {'id': '9002', 'name': 'Trainsyou.com', 'tasks': ['ADVERTISE', 'ANALYZE']}],
+            'instagram': {ARKS_ACCOUNT: []}, 'pixels': {ARKS_ACCOUNT: []}}
+    fake.users['token-USER'] = {**base, 'expires_in': 60 * 86400}      # long-lived after the exchange
+    fake.users['short-token-USER'] = {**base, 'expires_in': 3600}     # what the login itself returns
+    fake.codes['code-USER'] = 'token-USER'
+
+
+def test_user_token_is_exchanged_long_lived_with_60_day_expiry_and_lists_assets(client, fake, monkeypatch, capsys):
+    tid, hdr = session(client)
+    user_token_config(fake, monkeypatch)
+    start = client.post(f'/api/workspaces/{tid}/integrations/meta/start', headers=hdr, json={}).json()
+    assert parse_qs(urlparse(start['authorization_url']).query)['config_id'] == [USER_CONFIG_ID]
+    capsys.readouterr()
+    response = connect_meta(client, tid, hdr, 'code-USER')
+    assert response.headers['location'].endswith('meta=authorized')  # no permission or token warnings
+    exchange = next(call for call in fake.calls if call[3].get('grant_type') == 'fb_exchange_token')
+    assert exchange[3]['fb_exchange_token'] == 'short-token-USER'
+    debug = next(call for call in fake.calls if call[1] == 'debug_token')
+    assert debug[3]['input_token'] == 'token-USER'  # the long-lived token is what gets verified and stored
+    assert not any(call[1] == 'me/adaccounts' for call in fake.calls)  # permissions listed; no extra call
+    with main.connect() as db:
+        stored = main.qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='meta'", (tid,))
+    assert main.meta_access_token(stored) == 'token-USER'
+    [log] = permission_logs(capsys, 'oauth_callback')
+    assert (log['token_type'], log['long_lived_exchange'], log['missing_required']) == ('USER', 'ok', [])
+    assert 'token-USER' not in json.dumps(log)
+    health = client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()
+    assert health['token']['expires_at'] != 'never' and health['token']['never_expires'] is False
+    assert 58 <= health['token']['days_left'] <= 60
+    assert health['permissions']['missing_required'] == []
+    assets = client.get(f'/api/workspaces/{tid}/integrations/meta/assets').json()
+    assert [(item['id'], item['available']) for item in assets['ad_accounts']] == [(ARKS_ACCOUNT, True)]
+    assert {(item['name'], item['available']) for item in assets['pages']} == {
+        ('ARKS Investment Holding Ltd', True), ('Trainsyou.com', True)}
+    assert select(client, tid, hdr, ad_account_id=ARKS_ACCOUNT, page_id='9001').status_code == 200
+    health = client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()
+    assert health['overall'] == 'healthy' and health['assets']['ad_account']['id'] == ARKS_ACCOUNT
+    report = diagnostics(client, tid).json()
+    assert report['debug_token']['type'] == 'USER' and report['debug_token']['expires_at'] != 'never'
+    assert report['me_adaccounts']['ok'] is True and report['ad_accounts'][ARKS_ACCOUNT]['ok'] is True
+
+
+def test_user_token_that_stays_short_lived_is_flagged_not_hidden(client, fake, monkeypatch):
+    tid, hdr = session(client)
+    user_token_config(fake, monkeypatch)
+    fake.fail_exchange = True
+    response = connect_meta(client, tid, hdr, 'code-USER')
+    assert response.headers['location'].endswith('meta=authorized&reason=short_lived_token')
+    health = client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()
+    assert health['last_error']['kind'] == 'short_lived_token'
+    assert 'META_APP_SECRET' in health['last_error']['message'] and 'token-USER' not in json.dumps(health)
+    assert health['token']['days_left'] == 0 and health['overall'] == 'attention'
+
+
+def test_system_user_token_is_not_treated_as_short_lived(client, fake):
+    tid, hdr = session(client)
+    arks_system_user(fake)
+    fake.users['short-token-ARKS'] = fake.users['token-ARKS']  # the login's token is the final token
+    fake.fail_exchange = True  # Meta does not exchange business integration tokens
+    response = connect_meta(client, tid, hdr, 'code-ARKS')
+    assert response.headers['location'].endswith('meta=authorized')  # connected, no short-lived warning
+    assert client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()['token']['never_expires'] is True
+
+
+def test_health_days_left_warns_then_requires_reconnect(client, fake, monkeypatch):
+    tid, hdr = session(client)
+    user_token_config(fake, monkeypatch)
+    connect_meta(client, tid, hdr, 'code-USER')
+    select(client, tid, hdr, ad_account_id=ARKS_ACCOUNT, page_id='9001')
+    soon = (main.datetime.now(main.timezone.utc) + main.timedelta(days=3, hours=1)).isoformat(timespec='seconds')
+    with main.connect() as db:
+        db.execute('UPDATE meta_connection_state SET token_expires_at=? WHERE tenant_id=?', (soon, tid))
+    health = client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()
+    assert (health['token']['days_left'], health['overall']) == (3, 'attention')
+    past = (main.datetime.now(main.timezone.utc) - main.timedelta(hours=1)).isoformat(timespec='seconds')
+    with main.connect() as db:
+        db.execute('UPDATE meta_connection_state SET token_expires_at=? WHERE tenant_id=?', (past, tid))
+    assert client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()['overall'] == 'reauth_required'
