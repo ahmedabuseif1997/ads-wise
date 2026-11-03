@@ -104,6 +104,11 @@ class FakeMeta:
                                         'clicks': '250', 'actions': [{'action_type': 'lead', 'value': '7'}]}],
                            'act_222': []}
         self.fail_exchange = False
+        self.page_posts = {'501': [{'id': f'501_{1000 + i}', 'message': f'Spa A post {i}: unwind with a 60-minute massage',
+                                    'created_time': f'2026-10-{20 - i:02d}T09:00:00+0000',
+                                    'full_picture': f'https://scontent.xx.fbcdn.net/v/post{i}.jpg',
+                                    'permalink_url': f'https://www.facebook.com/501/posts/{1000 + i}',
+                                    'is_eligible_for_promotion': i != 3} for i in range(12)]}
         self.seed_reviews = []
         self.seed_verdict = {'decision': 'pass', 'summary': 'Clear, compliant spa offer.', 'issues': []}
         self.remote = {'8001': {'account': 'act_111', 'status': 'ACTIVE'},
@@ -137,9 +142,24 @@ class FakeMeta:
                              'user_id': user['user_id'], 'expires_at': user.get('expires_at', int(time.time()) + user.get('expires_in', 0)),
                              'data_access_expires_at': int(time.time()) + 80 * 86400, 'scopes': user['scopes'],
                              'granular_scopes': user.get('granular', []), 'type': user.get('type', 'USER')}}
+        if access_token.startswith('page-token-'):  # Page token issued for one request only
+            page_id = access_token.removeprefix('page-token-')
+            if path == f'{page_id}/posts':
+                return {'data': self.page_posts.get(page_id, [])[:int(params.get('limit', 25))]}
+            post = next((item for item in self.page_posts.get(page_id, []) if item['id'] == path), None)
+            if post:
+                return post
+            raise main.MetaAPIError('asset_unavailable', 'Unsupported get request', 100, 33)
         user = self.users.get(access_token)
         if not user:
             raise main.MetaAPIError('token_invalid', 'Invalid OAuth access token', 190)
+        page = next((item for item in user['pages'] if item['id'] == path), None)
+        if page and method == 'GET':
+            data = {'id': page['id'], 'name': page['name'],
+                    'picture': {'data': {'url': f"https://scontent.xx.fbcdn.net/v/page{page['id']}.jpg"}}}
+            if 'access_token' in params.get('fields', ''):
+                data['access_token'] = f"page-token-{page['id']}"
+            return data
         granted = set(user['scopes']) | {item['scope'] for item in user.get('granular', [])}
         ad_access = user.get('ads_access', bool(granted & {'ads_read', 'ads_management'}))
         if (path == 'me/adaccounts' or re.match(r'act_\d+', path)) and not ad_access:
@@ -1021,3 +1041,92 @@ def test_health_days_left_warns_then_requires_reconnect(client, fake, monkeypatc
     with main.connect() as db:
         db.execute('UPDATE meta_connection_state SET token_expires_at=? WHERE tenant_id=?', (past, tid))
     assert client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()['overall'] == 'reauth_required'
+
+
+# ---------------------------------------------------------------- Page posts (pages_read_engagement) ------------
+
+def page_posts(client, tid):
+    return client.get(f'/api/workspaces/{tid}/integrations/meta/page-posts')
+
+
+def test_studio_page_posts_read_only_the_selected_page_and_store_nothing(client, fake):
+    tid, hdr = ready_workspace(client, fake)  # Page 501 selected for this workspace
+    with main.connect() as db:
+        stored_before = main.qrow(db, 'SELECT COUNT(*) AS n FROM provider_snapshots')['n']
+    response = page_posts(client, tid)
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data['page'] == {'id': '501', 'name': 'Spa A', 'picture': 'https://scontent.xx.fbcdn.net/v/page501.jpg'}
+    assert len(data['posts']) == 10 and all(post['id'].startswith('501_') for post in data['posts'])
+    first = data['posts'][0]
+    assert set(first) == {'id', 'message', 'created_time', 'picture', 'permalink', 'eligible_for_promotion'}
+    assert next(post for post in data['posts'] if post['id'] == '501_1003')['eligible_for_promotion'] is False
+    page_call = next(call for call in fake.calls if call[1] == '501')
+    posts_call = next(call for call in fake.calls if call[1] == '501/posts')
+    assert page_call[2] == 'token-A' and 'access_token' in page_call[3]['fields']
+    assert posts_call[2] == 'page-token-501' and posts_call[3]['limit'] == 10
+    assert 'followers' not in json.dumps([call[3] for call in fake.calls])  # no follower data requested
+    assert 'page-token' not in response.text and 'token-A' not in response.text
+    with main.connect() as db:
+        assert main.qrow(db, 'SELECT COUNT(*) AS n FROM provider_snapshots')['n'] == stored_before
+    manager, _ = member_client(tid, 'manager@example.com', 'manager')
+    assert page_posts(manager, tid).status_code == 200
+    viewer, _ = member_client(tid, 'viewer@example.com', 'viewer')
+    assert page_posts(viewer, tid).status_code == 403
+    stranger, _ = member_client(tid, 'stranger@example.com', None)
+    assert page_posts(stranger, tid).status_code == 404
+
+
+def test_page_posts_need_a_page_selected_for_this_workspace(client, fake):
+    tid, hdr = session(client)
+    connect_meta(client, tid, hdr, 'code-A')
+    select(client, tid, hdr, ad_account_id='act_111')  # ad account only, no Page
+    response = page_posts(client, tid)
+    assert response.status_code == 409 and 'Choose the Facebook Page' in response.json()['detail']
+    assert not any(call[1].endswith('/posts') for call in fake.calls)
+
+
+def test_launch_with_a_page_post_reviews_its_real_text_and_uses_object_story_id(client, fake):
+    tid, hdr = ready_workspace(client, fake)
+    cid = pending_campaign(client, tid, hdr)
+    publish = {**launch(), 'object_story_id': '501_1001', 'headline': '', 'primary_text': 'client-supplied text',
+               'image_url': ''}
+    request = request_change(client, tid, hdr, {'action': 'publish', 'campaign_id': cid, 'publish': publish})
+    assert request['status'] == 'awaiting_owner', request['seed_report']
+    assert 'page_post_live' in {item['key'] for item in request['seed_report']['checks']}
+    reviewed = fake.seed_reviews[-1]['creative']
+    assert reviewed['existing_page_post_text'] == 'Spa A post 1: unwind with a 60-minute massage'
+    assert 'client-supplied text' not in json.dumps(reviewed)  # Seed reviews what Meta holds, not the browser
+    approved = client.post(f'/api/workspaces/{tid}/integrations/meta/change-requests/{request["id"]}/approve',
+                           headers=hdr, json={})
+    assert approved.status_code == 200, approved.text
+    creative = next(item['params'] for item in fake.objects.values() if item['edge'] == 'adcreatives')
+    assert creative['object_story_id'] == '501_1001' and 'object_story_spec' not in creative
+
+
+def test_page_posts_from_other_pages_or_not_promotable_are_blocked(client, fake):
+    tid, hdr = ready_workspace(client, fake)
+    cid = pending_campaign(client, tid, hdr)
+    foreign = request_change(client, tid, hdr, {'action': 'publish', 'campaign_id': cid,
+                                                'publish': {**launch(), 'object_story_id': '503_1'}})
+    assert 'payload_complete' in failed_checks(foreign)
+    blocked = request_change(client, tid, hdr, {'action': 'publish', 'campaign_id': cid,
+                                                'publish': {**launch(), 'object_story_id': '501_1003'}})
+    assert 'page_post_live' in failed_checks(blocked)
+    assert fake.posts() == []
+
+
+def test_new_image_ads_still_need_text_and_image(client, fake):
+    tid, hdr = ready_workspace(client, fake)
+    cid = pending_campaign(client, tid, hdr)
+    response = client.post(f'/api/workspaces/{tid}/integrations/meta/change-requests', headers=hdr, json={
+        'action': 'publish', 'campaign_id': cid, 'publish': {**launch(), 'headline': '', 'image_url': ''}})
+    assert response.status_code == 422
+
+
+def test_content_security_policy_allows_only_meta_image_hosts(client):
+    policy = client.get('/app').headers['content-security-policy']
+    img_src = next(part for part in policy.split(';') if part.strip().startswith('img-src'))
+    assert 'https://*.fbcdn.net' in img_src and 'https://*.fbsbx.com' in img_src
+    script_src = next(part for part in policy.split(';') if part.strip().startswith('script-src'))
+    assert 'fbcdn' not in script_src and 'fbsbx' not in script_src

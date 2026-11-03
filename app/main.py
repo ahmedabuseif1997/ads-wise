@@ -1151,6 +1151,40 @@ def meta_pages(access_token: str) -> list[dict]:
     return sorted(pages, key=lambda item: (item['name'].lower(), item['id']))
 
 
+def meta_page_context(access_token: str, page_id: str) -> tuple[dict, str]:
+    """Name and picture of the selected Page plus a Page token for this request only (never stored)."""
+    data = meta_graph('GET', page_id, access_token, {'fields': 'id,name,picture{url},access_token'})
+    picture = ((data.get('picture') or {}).get('data') or {}).get('url', '')
+    page = {'id': str(data.get('id', page_id)), 'name': data.get('name', ''),
+            'picture': picture if meta_https(picture) else ''}
+    return page, str(data.get('access_token', ''))
+
+
+def meta_page_posts(page_token: str, page_id: str, limit: int = 10) -> list[dict]:
+    """The Page's own most recent posts (pages_read_engagement). Read-only; nothing is stored."""
+    rows = meta_graph('GET', f'{page_id}/posts', page_token, {
+        'fields': 'id,message,created_time,full_picture,permalink_url,is_eligible_for_promotion',
+        'limit': limit}).get('data') or []
+    posts = []
+    for row in rows[:limit]:
+        post_id = str(row.get('id', ''))
+        if not re.fullmatch(rf'{re.escape(page_id)}_\d{{1,30}}', post_id):
+            continue
+        picture, permalink = str(row.get('full_picture') or ''), str(row.get('permalink_url') or '')
+        posts.append({'id': post_id, 'message': str(row.get('message') or '')[:2000],
+                      'created_time': str(row.get('created_time') or ''),
+                      'picture': picture if meta_https(picture) else '',
+                      'permalink': permalink if meta_https(permalink) else '',
+                      'eligible_for_promotion': row.get('is_eligible_for_promotion') is not False})
+    return posts
+
+
+def meta_page_post(page_token: str, post_id: str) -> dict:
+    data = meta_graph('GET', post_id, page_token, {'fields': 'id,message,is_eligible_for_promotion'})
+    return {'id': str(data.get('id', '')), 'message': str(data.get('message') or '')[:2000],
+            'eligible_for_promotion': data.get('is_eligible_for_promotion') is not False}
+
+
 def meta_instagram_accounts(access_token: str, ad_account_id: str) -> list[dict]:
     rows = meta_get_all(f'{ad_account_id}/instagram_accounts', access_token, {'fields': 'id,username'}, 200)
     accounts = [{'id': str(row.get('id', '')), 'username': row.get('username', '')} for row in rows]
@@ -1685,12 +1719,22 @@ class MetaPublishBody(BaseModel):
     duration_days: int = Field(default=7, ge=1, le=90)
     countries: list[str] = Field(default_factory=lambda: ['AE'], min_length=1, max_length=25)
     interest_ids: list[str] = Field(default_factory=list, max_length=50)
-    primary_text: str = Field(min_length=1, max_length=2200)
-    headline: str = Field(min_length=1, max_length=255)
-    image_url: str = Field(min_length=8, max_length=2000)
+    primary_text: str = Field(default='', max_length=2200)
+    headline: str = Field(default='', max_length=255)
+    image_url: str = Field(default='', max_length=2000)
     final_url: str = Field(default='', max_length=2000)
     call_to_action: Literal['BOOK_NOW', 'LEARN_MORE', 'CONTACT_US'] = 'BOOK_NOW'
     conversion_event: Literal['LEAD', 'CONTACT', 'SCHEDULE', 'PURCHASE', 'COMPLETE_REGISTRATION'] = 'SCHEDULE'
+    # An existing post of the workspace's selected Page ({pageId}_{postId}) used as the ad creative.
+    object_story_id: str = Field(default='', pattern=r'^(\d{1,30}_\d{1,30})?$')
+
+    @model_validator(mode='after')
+    def creative_complete(self):
+        if not self.object_story_id and not (self.primary_text.strip() and self.headline.strip() and
+                                             len(self.image_url) >= 8):
+            raise ValueError('A new Meta ad needs primary text, a headline and an image URL, '
+                             'or choose one of your Page posts')
+        return self
 
     @field_validator('countries')
     @classmethod
@@ -1758,7 +1802,7 @@ async def headers(request: Request, call_next):
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
-    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' https://www.googletagmanager.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://www.google-analytics.com; connect-src 'self' https://www.google-analytics.com https://analytics.google.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' https://www.googletagmanager.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://www.google-analytics.com https://*.fbcdn.net https://*.fbsbx.com; connect-src 'self' https://www.google-analytics.com https://analytics.google.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
     if COOKIE_SECURE:
         response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Cache-Control'] = 'no-store' if request.url.path.startswith('/api/') else 'no-cache'
@@ -3697,6 +3741,31 @@ def meta_health(tenant_id: str, live: bool = False, user=Depends(tenant_member))
     return meta_health_report(tenant_id, live)
 
 
+@app.get('/api/workspaces/{tenant_id}/integrations/meta/page-posts')
+def meta_selected_page_posts(tenant_id: str, user=Depends(tenant_member)):
+    """Read-only: the workspace's selected Page and its 10 most recent posts, to pick one as an ad creative.
+
+    Only the Page selected and verified for this workspace is read (no Page ID is accepted from the browser).
+    The Page token is used for this request only; posts and follower data are never stored.
+    """
+    if user['role'] not in ('owner', 'manager') and not user.get('super_admin'):
+        raise HTTPException(403, 'Manager or owner access required')
+    connection = meta_ready_connection(tenant_id)
+    page_id = meta_state(tenant_id).get('page_id', '')
+    if not page_id or not meta_owned_binding(tenant_id, 'page', page_id):
+        raise HTTPException(409, 'Choose the Facebook Page for this workspace in Ad Accounts first')
+    meta_guard(tenant_id)
+    access_token = meta_access_token(connection)
+    try:
+        page, page_token = meta_page_context(access_token, page_id)
+        if not page_token:
+            raise MetaAPIError('missing_permission', 'Meta did not provide Page access for the selected Page')
+        posts = meta_page_posts(page_token, page_id)
+    except MetaAPIError as exc:
+        raise meta_failure(tenant_id, exc, 'Page posts could not be loaded') from exc
+    return {'page': page, 'posts': posts, 'fetched_at': utcnow()}
+
+
 def meta_error_fields(exc: MetaAPIError) -> dict:
     return {'kind': exc.kind, 'code': exc.code, 'subcode': exc.subcode, 'message': exc.provider_message[:300]}
 
@@ -3860,6 +3929,7 @@ def meta_seed_validate(tenant_id: str, body: MetaChangeRequestBody, stage: str,
         return bool(passed)
 
     lowers_risk = body.action == 'set_status' and body.status == 'PAUSED'
+    post_message = None  # real text of a chosen Page post, read from Meta (never trusted from the browser)
     with connect() as db:
         settings = qrow(db, 'SELECT * FROM tenant_settings WHERE tenant_id=?', (tenant_id,)) or {}
         connection = qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='meta'",
@@ -3916,10 +3986,14 @@ def meta_seed_validate(tenant_id: str, body: MetaChangeRequestBody, stage: str,
         final_url = (publish.final_url.strip() or (campaign['landing_url'] if campaign else ''))
         if not meta_https(final_url):
             payload_problems.append('an HTTPS destination URL')
-        if not meta_https(publish.image_url):
-            payload_problems.append('an HTTPS image URL')
-        if not publish.primary_text.strip() or not publish.headline.strip():
-            payload_problems.append('primary text and headline')
+        if publish.object_story_id:
+            if not state.get('page_id') or not publish.object_story_id.startswith(f"{state['page_id']}_"):
+                payload_problems.append('a post from the Facebook Page selected for this workspace')
+        else:
+            if not meta_https(publish.image_url):
+                payload_problems.append('an HTTPS image URL')
+            if not publish.primary_text.strip() or not publish.headline.strip():
+                payload_problems.append('primary text and headline')
         if not state.get('page_id'):
             payload_problems.append('a selected Facebook Page')
         if campaign and campaign['objective'] in ('bookings', 'leads') and not state.get('pixel_id'):
@@ -3998,6 +4072,16 @@ def meta_seed_validate(tenant_id: str, body: MetaChangeRequestBody, stage: str,
                         problems.append('Pixel')
                     check('assets_live', "Page, Instagram account and Pixel are accessible to this workspace's Meta user",
                           not problems, 'No longer accessible: ' + ', '.join(problems))
+                    if body.publish.object_story_id and state.get('page_id') and \
+                            body.publish.object_story_id.startswith(f"{state['page_id']}_"):
+                        _, page_token = meta_page_context(access_token, state['page_id'])
+                        post = meta_page_post(page_token, body.publish.object_story_id) if page_token else None
+                        check('page_post_live', 'The chosen Page post exists and Meta allows promoting it',
+                              bool(post and post['id'] == body.publish.object_story_id and post['eligible_for_promotion']),
+                              'Meta reports this post is not eligible for promotion' if post else
+                              'The post could not be read from the selected Page')
+                        if post:
+                            post_message = post['message']
                 else:
                     remote = meta_graph('GET', body.target_id, access_token, {'fields': 'id,account_id,effective_status'})
                     check('target_in_account', "Campaign belongs to this workspace's selected ad account",
@@ -4018,12 +4102,13 @@ def meta_seed_validate(tenant_id: str, body: MetaChangeRequestBody, stage: str,
         elif prior_ai_review and prior_ai_review.get('passed'):
             checks.append({**prior_ai_review, 'reused_from_request': True})
         else:
-            checks.append(meta_seed_ai_review(tenant_id, body, campaign))
+            checks.append(meta_seed_ai_review(tenant_id, body, campaign, post_message))
     return {'engine': META_SEED_ENGINE, 'stage': stage, 'passed': all(item['passed'] for item in checks),
             'checked_at': utcnow(), 'checks': checks}
 
 
-def meta_seed_ai_review(tenant_id: str, body: MetaChangeRequestBody, campaign: dict | None) -> dict:
+def meta_seed_ai_review(tenant_id: str, body: MetaChangeRequestBody, campaign: dict | None,
+                        post_message: str | None = None) -> dict:
     """Fail closed: if Seed is unavailable, paused or unsure, the change does not reach the owner."""
     result = {'key': 'seed_ai_review', 'label': 'Seed AI review approves the change', 'passed': False,
               'detail': '', 'model': ARK_MODEL}
@@ -4046,10 +4131,14 @@ def meta_seed_ai_review(tenant_id: str, body: MetaChangeRequestBody, campaign: d
             'budget': {'daily_aed': publish.daily_budget_aed, 'duration_days': publish.duration_days},
             'audience': {'countries': publish.countries, 'age_min': spec.get('audience_age_min'),
                          'age_max': spec.get('audience_age_max'), 'gender': spec.get('audience_gender')},
-            'creative': {'headline': publish.headline, 'primary_text': publish.primary_text,
-                         'call_to_action': publish.call_to_action,
-                         'destination_host': urlparse(publish.final_url or campaign['landing_url']).hostname,
-                         'conversion_event': publish.conversion_event}})
+            'creative': ({'existing_page_post_text': post_message or '', 'conversion_event': publish.conversion_event}
+                         if publish.object_story_id else
+                         {'headline': publish.headline, 'primary_text': publish.primary_text,
+                          'call_to_action': publish.call_to_action,
+                          'destination_host': urlparse(publish.final_url or campaign['landing_url']).hostname,
+                          'conversion_event': publish.conversion_event})})
+        if publish.object_story_id and post_message is None:
+            return {**result, 'detail': 'The chosen Page post could not be read, so Seed cannot review it'}
     else:
         target = meta_managed_campaigns(tenant_id).get(body.target_id) or {}
         with connect() as db:
@@ -4361,15 +4450,19 @@ def meta_execute_publish(tenant_id: str, campaign_id: str, publish: MetaPublishB
                                              'Meta could not create the ad set')['id']
             save_meta_publication_progress(publication_id, progress)
         if not progress.get('creative_id'):
-            link_data = {'image_url': publish.image_url, 'link': final_url, 'message': publish.primary_text,
-                         'name': publish.headline,
-                         'call_to_action': {'type': publish.call_to_action, 'value': {'link': final_url}}}
-            story_spec = {'page_id': page_id, 'link_data': link_data}
-            if instagram_id:
-                story_spec['instagram_user_id'] = instagram_id
-            progress['creative_id'] = meta_post(f'{ad_account_id}/adcreatives', access_token, {
-                'name': f'{remote_name} — creative', 'object_story_spec': json.dumps(story_spec)},
-                'Meta could not create the ad creative')['id']
+            if publish.object_story_id:
+                # The advertiser's chosen post from the workspace's selected Page, promoted as-is.
+                creative = {'name': f'{remote_name} — page post', 'object_story_id': publish.object_story_id}
+            else:
+                link_data = {'image_url': publish.image_url, 'link': final_url, 'message': publish.primary_text,
+                             'name': publish.headline,
+                             'call_to_action': {'type': publish.call_to_action, 'value': {'link': final_url}}}
+                story_spec = {'page_id': page_id, 'link_data': link_data}
+                if instagram_id:
+                    story_spec['instagram_user_id'] = instagram_id
+                creative = {'name': f'{remote_name} — creative', 'object_story_spec': json.dumps(story_spec)}
+            progress['creative_id'] = meta_post(f'{ad_account_id}/adcreatives', access_token, creative,
+                                                'Meta could not create the ad creative')['id']
             save_meta_publication_progress(publication_id, progress)
         if not progress.get('ad_id'):
             progress['ad_id'] = meta_post(f'{ad_account_id}/ads', access_token, {
