@@ -11,6 +11,7 @@ import re
 import secrets
 import socket
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -1040,14 +1041,16 @@ def meta_debug_token(access_token: str) -> dict:
     """
     data = meta_graph('GET', 'debug_token', params={
         'input_token': access_token, 'access_token': f'{META_APP_ID}|{META_APP_SECRET}'}).get('data') or {}
-    scopes = {str(scope) for scope in data.get('scopes') or []}
-    scopes |= {str(item['scope']) for item in data.get('granular_scopes') or []
-               if isinstance(item, dict) and item.get('scope')}
+    listed = {str(scope) for scope in data.get('scopes') or []}
+    granular = {str(item['scope']) for item in data.get('granular_scopes') or []
+                if isinstance(item, dict) and item.get('scope')}
     return {'valid': bool(data.get('is_valid')), 'app_id': str(data.get('app_id', '')),
             'user_id': str(data.get('user_id', '')),
             'expires_at': meta_timestamp(data.get('expires_at')),
             'data_access_expires_at': meta_timestamp(data.get('data_access_expires_at')),
-            'scopes': sorted(scopes)}
+            'scopes': sorted(listed | granular),
+            # Scope names only (never tokens), kept for permission diagnostics.
+            'debug_scopes': sorted(listed), 'debug_granular_scopes': sorted(granular)}
 
 
 def meta_token_problem(summary: dict) -> str:
@@ -1070,7 +1073,8 @@ def meta_confirm_ad_access(access_token: str, summary: dict, ad_account_id: str 
     token errors propagate so callers never turn a temporary Meta problem into a false "missing" report.
     """
     if all(scope in summary.get('scopes', []) for scope in META_AD_SCOPES):
-        return summary
+        return {**summary, 'ad_access_check': 'not_needed', 'permission_source': 'debug_token'}
+    target = 'ad_account_read' if ad_account_id else 'me_adaccounts'
     try:
         if ad_account_id:
             meta_graph('GET', ad_account_id, access_token, {'fields': 'id,name,account_status'})
@@ -1078,9 +1082,29 @@ def meta_confirm_ad_access(access_token: str, summary: dict, ad_account_id: str 
             meta_graph('GET', 'me/adaccounts', access_token, {'fields': 'id,name,account_status', 'limit': 1})
     except MetaAPIError as exc:
         if exc.kind in ('missing_permission', 'asset_unavailable', 'invalid_request'):
-            return summary
+            return {**summary, 'ad_access_check': f'{target}_failed:{exc.kind}:{exc.code}:{exc.subcode}',
+                    'ad_access_error': exc, 'permission_source': 'debug_token'}
         raise
-    return {**summary, 'scopes': sorted(set(summary.get('scopes', [])) | set(META_AD_SCOPES))}
+    return {**summary, 'scopes': sorted(set(summary.get('scopes', [])) | set(META_AD_SCOPES)),
+            'ad_access_check': f'{target}_ok', 'permission_source': f'debug_token+{target}'}
+
+
+def meta_permission_diagnostics(summary: dict, **extra) -> dict:
+    """Safe permission diagnostics: scope names, check outcomes and Meta error codes only (no tokens)."""
+    error = summary.get('ad_access_error')
+    return {'permission_source': summary.get('permission_source', 'debug_token'),
+            'debug_scopes': summary.get('debug_scopes', []),
+            'debug_granular_scopes': summary.get('debug_granular_scopes', []),
+            'ad_access_check': summary.get('ad_access_check', 'not_run'),
+            'ad_access_error': error.user_message()[:300] if isinstance(error, MetaAPIError) else '',
+            'granted': summary.get('scopes', []), 'missing_required': meta_missing_scopes(summary.get('scopes', [])),
+            'graph_version': META_GRAPH_VERSION, **extra}
+
+
+def meta_log(event: str, tenant_id: str, details: dict) -> None:
+    """One JSON line on stderr (Vercel function logs). Callers pass only non-secret fields."""
+    print(json.dumps({'event': event, 'tenant_id': tenant_id, 'at': utcnow(), **details},
+                     separators=(',', ':'), default=str), file=sys.stderr, flush=True)
 
 
 def meta_save_granted_scopes(tenant_id: str, scopes: list[str]) -> None:
@@ -1919,7 +1943,10 @@ def service_worker():
 
 @app.get('/api/health')
 def health():
-    return {'status':'ok', 'service':'spa-ads-agent'}
+    commit = (os.getenv('VERCEL_GIT_COMMIT_SHA') or os.getenv('SOURCE_VERSION') or os.getenv('GITHUB_SHA') or '').strip()
+    return {'status':'ok', 'service':'spa-ads-agent', 'commit': commit[:7] or 'unknown',
+            'branch': os.getenv('VERCEL_GIT_COMMIT_REF', '').strip(),
+            'environment': os.getenv('VERCEL_ENV', '').strip()}
 
 
 def send_registration_email(to: str, subject: str, text: str) -> bool:
@@ -3171,33 +3198,48 @@ def meta_oauth_callback(request: Request, code: str = '', state: str = '', error
         info = meta_store_authorization(tenant_id, access_token, summary)
     except HTTPException:
         return integration_redirect('meta', 'error', 'not_configured')
-    result, reason = 'authorized', ''
+    result, reason, previous_check = 'authorized', '', 'none'
     if info['previous_ad_account']:
         try:
             if meta_reverify_ad_account(tenant_id, access_token, info['previous_ad_account']):
-                result = 'connected'
+                result, previous_check = 'connected', 'ok'
                 # Reading the ad account just succeeded, which already proves the ad permissions work.
-                summary = {**summary, 'scopes': sorted(set(summary['scopes']) | set(META_AD_SCOPES))}
+                summary = {**summary, 'scopes': sorted(set(summary['scopes']) | set(META_AD_SCOPES)),
+                           'ad_access_check': 'ad_account_read_ok',
+                           'permission_source': 'debug_token+ad_account_read'}
+            else:
+                previous_check = 'cleared'
         except MetaAPIError as exc:
             meta_record_error(tenant_id, exc)
-            reason = exc.kind
+            reason, previous_check = exc.kind, f'error:{exc.kind}'
     if not summary.get('unverified') and not reason:
         try:
             summary = meta_confirm_ad_access(access_token, summary)
         except MetaAPIError as exc:
             meta_record_error(tenant_id, exc)
             reason = exc.kind
+            summary = {**summary, 'ad_access_check': f"{summary.get('ad_access_check', 'me_adaccounts')}_error:{exc.kind}"}
         meta_save_granted_scopes(tenant_id, summary['scopes'])
+    if isinstance(summary.get('ad_access_error'), MetaAPIError):
+        meta_record_error(tenant_id, summary['ad_access_error'])
+    if reason or summary.get('unverified'):
+        # The permission check could not finish; make the next live health check ask Meta again
+        # instead of serving this partial result for the 60-second throttle window.
+        with connect() as db:
+            db.execute("UPDATE meta_connection_state SET last_checked_at='' WHERE tenant_id=?", (tenant_id,))
     missing = [] if summary.get('unverified') or reason else meta_missing_scopes(summary['scopes'])
     if missing:
         reason = 'permissions'
     elif summary.get('unverified') and not reason:
         reason = 'verification_pending'
+    diagnostics = meta_permission_diagnostics(summary, stage='oauth_callback', previous_ad_account_check=previous_check,
+                                              redirect_reason=reason)
+    meta_log('meta.permission_check', tenant_id, diagnostics)
     with connect() as db:
         audit(db, user['user_id'], tenant_id, 'integration.meta_authorized', {
             'meta_user_id': summary.get('user_id', ''), 'granted_scopes': summary.get('scopes', []),
             'missing_scopes': missing, 'ad_account_kept': result == 'connected',
-            'token_expires_at': summary.get('expires_at', '')})
+            'token_expires_at': summary.get('expires_at', ''), 'permission_diagnostics': diagnostics})
     return integration_redirect('meta', result, reason)
 
 
@@ -3528,6 +3570,10 @@ def meta_health_report(tenant_id: str, live: bool = False) -> dict:
     state = meta_state(tenant_id)
     cooldown = meta_cooldown_until(tenant_id)
     asset_health = {}
+    if live and connection and (connection['status'] == 'reauth_required' or cooldown):
+        meta_log('meta.permission_check', tenant_id, {
+            'stage': 'health_live_skipped', 'reason': 'cooldown' if cooldown else 'reauth_required',
+            'cooldown_until': cooldown, 'stored_granted': json.loads(state.get('granted_scopes') or '[]')})
     if (live and connection and connection['status'] != 'reauth_required' and not cooldown and
             meta_configured()):
         last = state.get('last_checked_at', '')
@@ -3538,6 +3584,10 @@ def meta_health_report(tenant_id: str, live: bool = False) -> dict:
                     META_HEALTH_LIVE_MIN_SECONDS
             except ValueError:
                 fresh = False
+        if fresh:
+            meta_log('meta.permission_check', tenant_id, {'stage': 'health_live_skipped', 'reason': 'checked_under_60s_ago',
+                                                          'stored_granted': json.loads(state.get('granted_scopes') or '[]'),
+                                                          'last_checked_at': last})
         if not fresh:
             meta_set_scope(tenant_id)
             try:
@@ -3545,6 +3595,9 @@ def meta_health_report(tenant_id: str, live: bool = False) -> dict:
                 summary = meta_debug_token(access_token)
                 if not meta_token_problem(summary):
                     summary = meta_confirm_ad_access(access_token, summary, connection.get('customer_id', ''))
+                if isinstance(summary.get('ad_access_error'), MetaAPIError):
+                    meta_record_error(tenant_id, summary['ad_access_error'])
+                meta_log('meta.permission_check', tenant_id, meta_permission_diagnostics(summary, stage='health_live'))
                 now = utcnow()
                 with connect() as db:
                     db.execute('''UPDATE meta_connection_state SET token_expires_at=?,data_access_expires_at=?,

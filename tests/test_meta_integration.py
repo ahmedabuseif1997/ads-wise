@@ -786,3 +786,80 @@ def test_pages_with_tasks_but_no_advertise_role_stay_blocked(client, fake):
     connect_meta(client, tid, hdr, 'code-A')
     pages = client.get(f'/api/workspaces/{tid}/integrations/meta/assets?ad_account_id=act_111').json()['pages']
     assert {item['id']: item['available'] for item in pages} == {'501': True, '502': False}
+
+
+# ---------------------------------------------------------------- Deploy indicator and permission diagnostics ----
+
+def permission_logs(capsys, stage):
+    lines = [json.loads(line) for line in capsys.readouterr().err.splitlines() if line.startswith('{')]
+    return [line for line in lines if line.get('event') == 'meta.permission_check' and line.get('stage') == stage]
+
+
+def test_health_reports_deployed_commit(client, monkeypatch):
+    for name in ('VERCEL_GIT_COMMIT_SHA', 'SOURCE_VERSION', 'GITHUB_SHA', 'VERCEL_GIT_COMMIT_REF', 'VERCEL_ENV'):
+        monkeypatch.delenv(name, raising=False)
+    assert client.get('/api/health').json() == {'status': 'ok', 'service': 'spa-ads-agent', 'commit': 'unknown',
+                                                 'branch': '', 'environment': ''}
+    monkeypatch.setenv('VERCEL_GIT_COMMIT_SHA', '731b84d5e92b4981c5dee8b114bf877a2d97e6ff')
+    monkeypatch.setenv('VERCEL_GIT_COMMIT_REF', 'main')
+    monkeypatch.setenv('VERCEL_ENV', 'production')
+    assert client.get('/api/health').json() == {'status': 'ok', 'service': 'spa-ads-agent', 'commit': '731b84d',
+                                                 'branch': 'main', 'environment': 'production'}
+
+
+def test_reconnect_logs_permission_source_scopes_and_ad_check_without_secrets(client, fake, capsys):
+    tid, hdr = session(client)
+    arks_system_user(fake, granular=False, ads_access=False)
+    capsys.readouterr()
+    connect_meta(client, tid, hdr, 'code-ARKS')
+    output = capsys.readouterr().err
+    [log] = [json.loads(line) for line in output.splitlines() if '"stage":"oauth_callback"' in line]
+    assert log['permission_source'] == 'debug_token'
+    assert log['debug_scopes'] == ['pages_read_engagement', 'pages_show_list', 'public_profile']
+    assert log['debug_granular_scopes'] == []
+    assert log['ad_access_check'] == 'me_adaccounts_failed:missing_permission:200:0'
+    assert log['missing_required'] == ['ads_read', 'ads_management'] and log['redirect_reason'] == 'permissions'
+    for secret in ('token-ARKS', 'short-token-ARKS', main.META_APP_SECRET, 'code-ARKS'):
+        assert secret not in output
+    audit = next(item for item in client.get(f'/api/workspaces/{tid}').json()['audit']
+                 if item['action'] == 'integration.meta_authorized')
+    assert audit['detail']['permission_diagnostics']['ad_access_check'] == log['ad_access_check']
+    health = client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()
+    assert health['last_error']['kind'] == 'missing_permission' and 'Requires ads_read' in health['last_error']['message']
+
+
+def test_reconnect_logs_which_source_granted_the_ad_permissions(client, fake, capsys):
+    tid, hdr = session(client)
+    arks_system_user(fake)  # ad permissions listed in granular_scopes
+    capsys.readouterr()
+    connect_meta(client, tid, hdr, 'code-ARKS')
+    [log] = permission_logs(capsys, 'oauth_callback')
+    assert log['debug_granular_scopes'] == ['ads_management', 'ads_read', 'pages_show_list']
+    assert (log['permission_source'], log['ad_access_check'], log['missing_required']) == ('debug_token', 'not_needed', [])
+    other = client.post('/api/workspaces', headers=hdr, json={'name': 'Other Business'}).json()['id']
+    arks_system_user(fake, granular=False, ads_access=True)
+    fake.codes['code-ARKS-2'] = 'token-ARKS'
+    connect_meta(client, other, hdr, 'code-ARKS-2')
+    [log] = permission_logs(capsys, 'oauth_callback')
+    assert (log['permission_source'], log['ad_access_check'], log['missing_required']) == (
+        'debug_token+me_adaccounts', 'me_adaccounts_ok', [])
+
+
+def test_unfinished_permission_check_is_rechecked_not_served_from_cache(client, fake, capsys):
+    tid, hdr = session(client)
+    arks_system_user(fake, granular=False, ads_access=True)
+    fake.errors[('GET', 'me/adaccounts')] = main.MetaAPIError('rate_limited', 'User request limit reached', 17)
+    response = connect_meta(client, tid, hdr, 'code-ARKS')
+    assert response.headers['location'].endswith('meta=authorized&reason=rate_limited')
+    assert main.meta_state(tid)['last_checked_at'] == ''
+    del fake.errors[('GET', 'me/adaccounts')]
+    debug_calls = sum(call[1] == 'debug_token' for call in fake.calls)
+    capsys.readouterr()
+    health = client.get(f'/api/workspaces/{tid}/integrations/meta/health?live=true').json()
+    assert sum(call[1] == 'debug_token' for call in fake.calls) == debug_calls + 1  # asked Meta again immediately
+    assert health['permissions']['missing_required'] == []
+    [log] = permission_logs(capsys, 'health_live')
+    assert log['ad_access_check'] == 'me_adaccounts_ok'
+    client.get(f'/api/workspaces/{tid}/integrations/meta/health?live=true')
+    [skipped] = permission_logs(capsys, 'health_live_skipped')
+    assert skipped['reason'] == 'checked_under_60s_ago' and 'ads_read' in skipped['stored_granted']
