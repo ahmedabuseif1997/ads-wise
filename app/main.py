@@ -70,8 +70,8 @@ META_APP_SECRET = os.getenv('META_APP_SECRET', '').strip()
 META_LOGIN_CONFIG_ID = os.getenv('META_LOGIN_CONFIG_ID', '').strip()
 META_GRAPH_VERSION = os.getenv('META_GRAPH_VERSION', 'v26.0').strip()
 # Least-privilege permission set requested through the Facebook Login for Business configuration.
-META_REQUIRED_SCOPES = ('ads_read', 'ads_management', 'business_management',
-                        'pages_show_list', 'pages_read_engagement')
+# business_management is deliberately not requested: Adswise never manages Business Manager assets.
+META_REQUIRED_SCOPES = ('ads_read', 'ads_management', 'pages_show_list', 'pages_read_engagement')
 # Only needed if Meta rejects Page-backed creatives for a Page; never required by Seed validation.
 META_OPTIONAL_SCOPES = ('pages_manage_ads',)
 META_SEED_ENGINE = 'seed-rules-v1'
@@ -1062,23 +1062,16 @@ def meta_account_id(value: str) -> str:
 
 
 def meta_ad_accounts(access_token: str) -> list[dict]:
-    fields = 'id,account_id,name,currency,timezone_name,account_status'
-    try:
-        rows = meta_get_all('me/adaccounts', access_token, {'fields': f'{fields},business{{id,name}}'}, 500)
-    except MetaAPIError as exc:
-        if exc.kind not in ('missing_permission', 'invalid_request'):
-            raise
-        rows = meta_get_all('me/adaccounts', access_token, {'fields': fields}, 500)
+    rows = meta_get_all('me/adaccounts', access_token,
+                        {'fields': 'id,account_id,name,currency,timezone_name,account_status'}, 500)
     accounts = []
     for row in rows:
         account_id = meta_account_id(row.get('id') or row.get('account_id'))
         if not re.fullmatch(r'act_\d{1,30}', account_id):
             continue
-        business = row.get('business') or {}
         accounts.append({'id': account_id, 'name': row.get('name') or f'Meta ad account {account_id[4:]}',
                          'currency': row.get('currency', ''), 'timezone_name': row.get('timezone_name', ''),
-                         'account_status': int(row.get('account_status') or 0),
-                         'business_id': str(business.get('id', '')), 'business_name': business.get('name', '')})
+                         'account_status': int(row.get('account_status') or 0)})
     return sorted(accounts, key=lambda item: (item['name'].lower(), item['id']))
 
 

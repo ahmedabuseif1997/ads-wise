@@ -28,9 +28,12 @@
 
 ## Permissions requested (least privilege)
 
-`pages_manage_ads` is **not** requested. Instagram accounts are read through the ad account, so **no Instagram permission** is requested.
+Requested: `ads_read`, `ads_management`, `pages_show_list`, `pages_read_engagement`.
 
-> **Decision needed — `business_management`.** Ads-Wise only uses it to show which Business Manager owns each ad account in the account picker. That works without it (the code falls back), and Meta often rejects permissions whose use is this light. Options: (a) remove it from the Login for Business configuration and make it optional in Seed validation (small code change), or (b) keep it and use the text below. Recommendation: (a), unless Meta Business Support says business-owned assets require it for your configuration.
+Not requested:
+- `business_management`: Ads-Wise never manages Business Manager assets. The owner removed it from the Login for Business configuration, and Seed validation no longer requires it.
+- `pages_manage_ads`.
+- Any Instagram permission: Instagram accounts are read through the ad account.
 
 ### ads_read
 
@@ -61,12 +64,6 @@
 **How Ads-Wise uses it.** Ads-Wise reads basic information about the selected Page (name and identity) so it can show the Page in the asset picker and use it as the identity of the ads the owner approves.
 
 **Screencast:** steps 4 and 6–7.
-
-### business_management (only if option (b) above)
-
-**How Ads-Wise uses it.** In the asset picker, Ads-Wise shows which Business Manager owns each ad account the owner can access, so owners who manage several businesses select the correct business's ad account.
-
-**Graph API used:** `GET /me/adaccounts?fields=…,business{id,name}`.
 
 ## Screencast script (one recording, about 4 minutes)
 

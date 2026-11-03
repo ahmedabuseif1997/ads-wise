@@ -308,8 +308,7 @@ def test_callback_flags_missing_permissions_and_rejects_other_apps(client, fake)
     response = connect_meta(client, tid, hdr, 'code-A')
     assert response.headers['location'].endswith('meta=authorized&reason=permissions')
     health = client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()
-    assert set(health['permissions']['missing_required']) == {
-        'ads_management', 'business_management', 'pages_read_engagement'}
+    assert set(health['permissions']['missing_required']) == {'ads_management', 'pages_read_engagement'}
     assert health['overall'] == 'attention'
     other = client.post('/api/workspaces', headers=hdr, json={'name': 'Other Business'}).json()['id']
     fake.users['token-B']['app_id'] = 'someone-elses-app'
@@ -671,3 +670,16 @@ def test_seed_review_client_sends_server_side_key_and_validates_answer(monkeypat
         200, request=httpx.Request('POST', url), json={'choices': [{'message': {'content': '{"decision":"maybe"}'}}]}))
     with pytest.raises(ValueError):
         main.seed_review_meta_change({'action': 'publish'})
+
+
+def test_business_management_is_not_required_or_requested(client, fake):
+    assert 'business_management' not in main.META_REQUIRED_SCOPES
+    assert fake.users['token-A']['scopes'] == list(main.META_REQUIRED_SCOPES)  # granted without it
+    tid, hdr = ready_workspace(client, fake)
+    adaccount_fields = [call[3]['fields'] for call in fake.calls if call[1] == 'me/adaccounts']
+    assert adaccount_fields and all('business' not in fields for fields in adaccount_fields)
+    cid = pending_campaign(client, tid, hdr)
+    request = request_change(client, tid, hdr, {'action': 'publish', 'campaign_id': cid, 'publish': launch()})
+    assert request['status'] == 'awaiting_owner' and failed_checks(request) == set()
+    health = client.get(f'/api/workspaces/{tid}/integrations/meta/health').json()
+    assert health['permissions']['missing_required'] == []
