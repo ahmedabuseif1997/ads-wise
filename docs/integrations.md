@@ -45,6 +45,8 @@ Behaviour:
 
 Only a 100% pass reaches the owner (in-app under *Approvals*, plus email when Resend is configured). On approval, the rule checks run again live; the Seed AI verdict is reused because the stored payload cannot change. The change then executes: launches create the campaign, ad set, creative and ad as **ACTIVE** using only the workspace's verified assets, and every step is written to the audit log. The emergency stop pauses every campaign Adswise launched for the workspace.
 
+**Page posts as ad creatives (`pages_read_engagement`).** In AI Campaign Studio (Meta channel), owners and managers can load the 10 most recent posts of the workspace's selected Page (image, text, date, eligibility for promotion) and pick one as the ad creative. Only the selected Page is read; a Page token is fetched for that request and never stored; posts and follower data are not stored. A launch with a post (`object_story_id`) is accepted only for a post of the selected Page; Seed confirms it still exists and is eligible for promotion, and the Seed AI reviews the post's text as read from Meta.
+
 **Sync.** Campaigns, effective status, spend, impressions, clicks and conversions (Pixel lead, schedule, contact, purchase and registration; the first matching action type per event is used, so totals are not double counted), cached per workspace for 5 minutes.
 
 **Errors shown to users.** Expired or invalid token → reconnect. Missing permission → reconnect and approve all permissions (with Meta's reason). Unavailable asset → choose an asset the user can access. Throttling → cool-down with the retry time.

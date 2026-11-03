@@ -41,7 +41,7 @@ Not requested:
 
 **Graph API used:** `GET /me/adaccounts`, `GET /act_{id}`, `GET /act_{id}/campaigns`, `GET /act_{id}/insights`, `GET /act_{id}/adspixels`, `GET /act_{id}/instagram_accounts`.
 
-**Screencast:** steps 1–5 and 9.
+**Screencast:** steps 1–5 and 10.
 
 ### ads_management
 
@@ -49,7 +49,7 @@ Not requested:
 
 **Graph API used:** `POST /act_{id}/campaigns`, `POST /act_{id}/adsets`, `POST /act_{id}/adcreatives`, `POST /act_{id}/ads`, `POST /{campaign_id}` (status), `POST /{adset_id}` (daily budget), plus the reads above.
 
-**Screencast:** steps 6–8.
+**Screencast:** steps 7–9.
 
 ### pages_show_list
 
@@ -61,9 +61,11 @@ Not requested:
 
 ### pages_read_engagement
 
-**How Ads-Wise uses it.** Ads-Wise reads basic information about the selected Page (name and identity) so it can show the Page in the asset picker and use it as the identity of the ads the owner approves.
+**How Ads-Wise uses it.** In **AI Campaign Studio**, when Meta is the advertising channel, Ads-Wise shows the name and picture of the Facebook Page selected for the workspace and its 10 most recent posts (image, text and date) under **Your Facebook Page posts**. The advertiser can pick an eligible post with **Use as ad creative**. When they launch a campaign, that post is promoted as the ad (`object_story_id`), after automated validation and the business owner's approval. The data is read only when the advertiser clicks **Load 10 recent posts**, is shown only to that business's owner and managers, and is never stored. Follower and engagement data are not read.
 
-**Screencast:** steps 4 and 6–7.
+**Graph API used:** `GET /{page-id}?fields=id,name,picture,access_token` (a Page token used for that request only), `GET /{page-id}/posts?fields=id,message,created_time,full_picture,permalink_url,is_eligible_for_promotion&limit=10`, and `GET /{post-id}` to confirm the chosen post before launch.
+
+**Screencast:** step 6 (Page posts in AI Campaign Studio), then steps 7–8.
 
 ## Screencast script (one recording, about 4 minutes)
 
@@ -72,11 +74,12 @@ Not requested:
 3. Back in Ads-Wise, show the confirmation and the **Meta Ads — Assets required** state.
 4. Click **Choose Meta assets**: show the ad account, Facebook Page, Instagram account and Pixel lists, select them, and click **Verify & save for this workspace**.
 5. Click **Check with Meta** and show the connection health (token, permissions, assets).
-6. Go to **Campaigns** → **Request Meta launch** on an approved campaign. Show the creative and budget, then **Run Seed validation**.
-7. Go to **Approvals**. Show every validation check passing, click **Approve & go live**, then open Meta Ads Manager and show the new campaign, ad set and ad.
-8. In **Analytics**, click **Request pause** on that campaign, approve it in **Approvals**, and show it paused in Ads Manager.
-9. Click **Sync Meta** and show spend, impressions, clicks and conversions.
-10. Click **Disconnect** in Ad Accounts to show the connection and stored token being removed.
+6. Go to **AI Campaign Studio** with **Meta Ads** as the channel. Under **Your Facebook Page posts**, click **Load 10 recent posts**, show the Page name, picture and posts, and click **Use as ad creative** on one post.
+7. Go to **Campaigns** → **Request Meta launch** on an approved campaign. Show the selected Page post as the creative and the budget, then **Run Seed validation**.
+8. Go to **Approvals**. Show every validation check passing, click **Approve & go live**, then open Meta Ads Manager and show the new campaign, ad set and ad.
+9. In **Analytics**, click **Request pause** on that campaign, approve it in **Approvals**, and show it paused in Ads Manager.
+10. Click **Sync Meta** and show spend, impressions, clicks and conversions.
+11. Click **Disconnect** in Ad Accounts to show the connection and stored token being removed.
 
 ## Data handling answers (summary)
 
