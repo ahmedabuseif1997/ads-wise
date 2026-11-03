@@ -26,9 +26,32 @@ Behaviour:
 - A workspace can submit a sitemap only to a Search Console property returned by its own connection, and can select only a GA4 property returned by its own authorization.
 - Connections made before Search Console management and Analytics read-only scopes were added must reconnect once.
 
-## Meta
+## Meta Ads (Marketing API, Facebook Login for Business)
 
-Needs a Meta developer app with Marketing API permissions. Set `META_APP_ID`, `META_APP_SECRET`, `META_LOGIN_CONFIG_ID`, `META_GRAPH_VERSION`, and register the callback URL `<PUBLIC_ORIGIN>/api/integrations/meta/callback`. Publishing to Meta is connection-gated and not complete.
+**Setup.** Meta app `1418356733153531` (Business Manager `1401711459689233`). Set `META_APP_ID`, `META_APP_SECRET`, `META_LOGIN_CONFIG_ID` and `META_GRAPH_VERSION` (`v26.0`, the latest Graph/Marketing API version). Register exactly `https://ads-wise.com/api/integrations/meta/callback` under *Facebook Login for Business → Settings → Valid OAuth Redirect URIs*. Permissions come from the Login for Business configuration, not from code (no `scope` parameter is sent).
+
+**Least-privilege permissions.** Required: `ads_read`, `ads_management`, `pages_show_list`, `pages_read_engagement`. `business_management` is not requested (Adswise never manages Business Manager assets) and must not be in the Login for Business configuration. `pages_manage_ads` is not requested; add it only if Meta rejects Page-backed creatives for a Page. Instagram accounts are read through the ad account (`/act_…/instagram_accounts`), so no Instagram permission is needed.
+
+**Tokens.** Meta issues no refresh tokens. The callback exchanges the code once, swaps it for a long-lived user token (≈60 days) or keeps a non-expiring Login for Business system-user token, verifies it with `debug_token` (app ID, validity, expiry, granted scopes) and stores it encrypted with `GOOGLE_TOKEN_ENCRYPTION_KEY`. Every user-token call sends `appsecret_proof`. Tokens never reach the browser, logs or audit entries. Expired or revoked tokens (error 190) mark the connection `reauth_required`.
+
+**Tenant isolation.** Each workspace authorizes its own Meta user. The owner chooses the ad account, Facebook Page, Instagram account and Pixel from what that user can access; every choice is verified live with Meta and bound to one workspace only (database-enforced). Reconnecting as a different Meta user clears the Page, Instagram and Pixel choices. Metrics snapshots are stored per workspace and ignored if they belong to a different ad account. A Pixel typed in *Pixels & Tracking* cannot be one used by another workspace or differ from the verified Pixel.
+
+**Rate limits and cool-downs.** No automatic retries. The callback makes at most four Meta calls. Usage headers (`X-App-Usage`, `X-Business-Use-Case-Usage`, `X-Ad-Account-Usage`) are read on every response; at 85% or on a throttling error (4, 17, 32, 613, 80000+) Adswise pauses its own Meta calls for Meta's `estimated_time_to_regain_access` (default 7 minutes). The cool-down is stored in the database, so every server instance respects it. App-wide throttling pauses all workspaces; ad-account throttling pauses only that workspace. Login starts are limited to 5 per workspace per 15 minutes. The emergency pause still runs during a cool-down.
+
+**Live changes: Seed validation then owner approval.** A manager, owner or AI agent can only *request* a launch, enable/pause or daily-budget change. Seed validation runs immediately:
+
+1. Rule checks (deterministic): workspace active and emergency stop off; Meta connected; campaign belongs to the workspace and is awaiting launch; budget within the approved campaign budget and workspace cap; payload complete (HTTPS URLs, copy, Page, Pixel for booking/lead objectives); every asset bound to this workspace only; token valid for this app; required permissions granted; ad account active and billed in AED; Page/Instagram/Pixel still accessible; target campaign inside the workspace's ad account. Enabling and budget changes are limited to campaigns Adswise launched for the workspace; pausing works for any campaign in its ad account.
+2. Seed AI review (`seed-2-0-pro-260328` on BytePlus ModelArk) of launches, enables and budget changes: fails on misleading copy, health claims, personal-attribute wording, adult wording or budget anomalies. It fails closed: if Seed is not configured, paused or unreachable, the request is blocked. Pausing never depends on the AI.
+
+Only a 100% pass reaches the owner (in-app under *Approvals*, plus email when Resend is configured). On approval, the rule checks run again live; the Seed AI verdict is reused because the stored payload cannot change. The change then executes: launches create the campaign, ad set, creative and ad as **ACTIVE** using only the workspace's verified assets, and every step is written to the audit log. The emergency stop pauses every campaign Adswise launched for the workspace.
+
+**Sync.** Campaigns, effective status, spend, impressions, clicks and conversions (Pixel lead, schedule, contact, purchase and registration; the first matching action type per event is used, so totals are not double counted), cached per workspace for 5 minutes.
+
+**Errors shown to users.** Expired or invalid token → reconnect. Missing permission → reconnect and approve all permissions (with Meta's reason). Unavailable asset → choose an asset the user can access. Throttling → cool-down with the retry time.
+
+## Seed (BytePlus ModelArk)
+
+Set `ARK_API_KEY` (server-side only), `ARK_BASE_URL=https://ark.ap-southeast.bytepluses.com/api/v3` and `ARK_MODEL=seed-2-0-pro-260328`. The BytePlus key cannot call the Volcano Engine defaults (`ark.cn-beijing.volces.com`, `doubao-seed-2-1-pro-260915`), so all three variables must match.
 
 ## TikTok
 

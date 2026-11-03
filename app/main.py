@@ -1,6 +1,7 @@
 """Standalone Spa Ads Agent with tenant-scoped planning and supervised Google Ads controls."""
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import hmac
 import ipaddress
@@ -68,6 +69,18 @@ META_APP_ID = os.getenv('META_APP_ID', '').strip()
 META_APP_SECRET = os.getenv('META_APP_SECRET', '').strip()
 META_LOGIN_CONFIG_ID = os.getenv('META_LOGIN_CONFIG_ID', '').strip()
 META_GRAPH_VERSION = os.getenv('META_GRAPH_VERSION', 'v26.0').strip()
+# Least-privilege permission set requested through the Facebook Login for Business configuration.
+# business_management is deliberately not requested: Adswise never manages Business Manager assets.
+META_REQUIRED_SCOPES = ('ads_read', 'ads_management', 'pages_show_list', 'pages_read_engagement')
+# Only needed if Meta rejects Page-backed creatives for a Page; never required by Seed validation.
+META_OPTIONAL_SCOPES = ('pages_manage_ads',)
+META_SEED_ENGINE = 'seed-rules-v1'
+# Meta throttling safety: back off before Meta blocks the app or ad account, and honour Meta's cool-down.
+META_USAGE_CEILING_PERCENT = 85
+META_DEFAULT_COOLDOWN_SECONDS = 420
+META_OAUTH_STARTS_PER_WINDOW = 5
+META_OAUTH_WINDOW_MINUTES = 15
+META_HEALTH_LIVE_MIN_SECONDS = 60
 SUPER_ADMIN_EMAILS = {email.strip().lower() for email in
                       os.getenv('SUPER_ADMIN_EMAILS', os.getenv('ADMIN_EMAIL', '')).split(',') if email.strip()}
 REGISTRATION_INBOX = os.getenv('REGISTRATION_INBOX', 'info@ads-wise.com').strip()
@@ -282,6 +295,29 @@ def init_db():
           created_at TEXT NOT NULL, FOREIGN KEY(tenant_id) REFERENCES tenants(id));
         CREATE INDEX IF NOT EXISTS performance_analyses_tenant_time
           ON performance_analyses(tenant_id,created_at DESC);
+        CREATE TABLE IF NOT EXISTS meta_connection_state(
+          tenant_id TEXT PRIMARY KEY, meta_user_id TEXT NOT NULL DEFAULT '',
+          token_expires_at TEXT NOT NULL DEFAULT '', data_access_expires_at TEXT NOT NULL DEFAULT '',
+          granted_scopes TEXT NOT NULL DEFAULT '[]',
+          page_id TEXT NOT NULL DEFAULT '', page_name TEXT NOT NULL DEFAULT '',
+          instagram_id TEXT NOT NULL DEFAULT '', instagram_username TEXT NOT NULL DEFAULT '',
+          pixel_id TEXT NOT NULL DEFAULT '', pixel_name TEXT NOT NULL DEFAULT '',
+          last_error_kind TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '',
+          last_error_at TEXT NOT NULL DEFAULT '', last_checked_at TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL, FOREIGN KEY(tenant_id) REFERENCES tenants(id));
+        CREATE TABLE IF NOT EXISTS meta_change_requests(
+          id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, campaign_id TEXT NOT NULL DEFAULT '',
+          action TEXT NOT NULL, target_id TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL,
+          payload_hash TEXT NOT NULL, status TEXT NOT NULL, seed_report TEXT NOT NULL DEFAULT '{}',
+          requested_by TEXT NOT NULL, decided_by TEXT NOT NULL DEFAULT '', decided_at TEXT NOT NULL DEFAULT '',
+          result TEXT NOT NULL DEFAULT '{}', last_error TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          FOREIGN KEY(tenant_id) REFERENCES tenants(id));
+        CREATE INDEX IF NOT EXISTS meta_change_requests_tenant
+          ON meta_change_requests(tenant_id,created_at DESC);
+        CREATE TABLE IF NOT EXISTS meta_rate_limits(
+          scope TEXT PRIMARY KEY, blocked_until TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL);
         ''')
         if db.postgres:
             db.execute('ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS tenant_paused INTEGER NOT NULL DEFAULT 0')
@@ -450,9 +486,16 @@ def google_growth_configured() -> bool:
                 GOOGLE_TOKEN_ENCRYPTION_KEY)
 
 
+def meta_missing_configuration() -> list[str]:
+    """Names (never values) of the server settings Meta still needs."""
+    required = {'PUBLIC_ORIGIN': PUBLIC_ORIGIN, 'META_APP_ID': META_APP_ID,
+                'META_APP_SECRET': META_APP_SECRET, 'META_LOGIN_CONFIG_ID': META_LOGIN_CONFIG_ID,
+                'GOOGLE_TOKEN_ENCRYPTION_KEY': GOOGLE_TOKEN_ENCRYPTION_KEY}
+    return [name for name, value in required.items() if not value]
+
+
 def meta_configured() -> bool:
-    return bool(PUBLIC_ORIGIN and META_APP_ID and META_APP_SECRET and META_LOGIN_CONFIG_ID and
-                GOOGLE_TOKEN_ENCRYPTION_KEY)
+    return not meta_missing_configuration()
 
 
 def tiktok_configured() -> bool:
@@ -460,8 +503,9 @@ def tiktok_configured() -> bool:
                 GOOGLE_TOKEN_ENCRYPTION_KEY)
 
 
-def integration_redirect(provider: str, result: str) -> RedirectResponse:
-    return RedirectResponse(f'{PUBLIC_ORIGIN}/app?view=accounts&{provider}={result}', status_code=303)
+def integration_redirect(provider: str, result: str, reason: str = '') -> RedirectResponse:
+    suffix = f'&reason={quote(reason)}' if reason else ''
+    return RedirectResponse(f'{PUBLIC_ORIGIN}/app?view=accounts&{provider}={result}{suffix}', status_code=303)
 
 
 def consume_oauth_state(state: str, user: dict) -> dict | None:
@@ -516,6 +560,11 @@ def assert_provider_resource_available(db, tenant_id: str, provider: str,
                      (provider, resource_id, tenant_id))
         if owner:
             raise ProviderResourceConflict('This external account is already connected to another workspace')
+    if provider == 'meta' and resource_type == 'pixel':
+        owner = qrow(db, 'SELECT tenant_id FROM tracking_configs WHERE meta_pixel_id=? AND tenant_id<>?',
+                     (resource_id, tenant_id))
+        if owner:
+            raise ProviderResourceConflict('This Meta Pixel is already used by another workspace')
 
 
 def bind_provider_resource(db, tenant_id: str, provider: str,
@@ -685,12 +734,243 @@ def google_connection(tenant_id: str) -> dict:
     return connection
 
 
+# --------------------------------------------------------------------------------------------------
+# Meta Marketing API client. Every workspace uses only its own encrypted token; nothing here is shared
+# between workspaces, and tokens are never returned to the browser or written to logs/audit entries.
+# --------------------------------------------------------------------------------------------------
+
+META_ERROR_MESSAGES = {
+    'token_expired': 'Meta authorization has expired. Reconnect Meta Ads to continue.',
+    'token_invalid': ('Meta authorization is no longer valid (password change, removed app access or '
+                      'revoked consent). Reconnect Meta Ads.'),
+    'missing_permission': ('Meta denied this request because a required permission is missing. Reconnect '
+                           'Meta Ads and approve every requested permission.'),
+    'asset_unavailable': ('The selected Meta asset is no longer available to the connected Meta user. '
+                          'Choose an asset this user can access.'),
+    'rate_limited': 'Meta is rate limiting this ad account. Retry in a few minutes.',
+    'temporary': 'Meta is temporarily unavailable. Retry shortly.',
+    'network': 'Meta could not be reached. Retry shortly.',
+    'policy_blocked': 'Meta blocked this action for policy reasons. Review the account in Meta Ads Manager.',
+    'cooling_down': ('Meta asked Adswise to slow down. Meta calls for this workspace are paused until the '
+                     'cool-down ends; no retry is attempted before then.'),
+    'invalid_request': 'Meta rejected the request',
+    'meta_error': 'Meta returned an error',
+}
+META_ERROR_STATUS = {'token_expired': 409, 'token_invalid': 409, 'missing_permission': 409,
+                     'asset_unavailable': 409, 'policy_blocked': 409, 'rate_limited': 429,
+                     'cooling_down': 429, 'temporary': 503, 'network': 503}
+META_REAUTH_KINDS = ('token_expired', 'token_invalid')
+
+
+class MetaAPIError(Exception):
+    def __init__(self, kind: str, provider_message: str = '', code: int = 0, subcode: int = 0):
+        super().__init__(kind)
+        self.kind = kind if kind in META_ERROR_MESSAGES else 'meta_error'
+        self.provider_message = provider_message[:300]
+        self.code = code
+        self.subcode = subcode
+
+    def user_message(self, context: str = '') -> str:
+        base = META_ERROR_MESSAGES[self.kind]
+        if self.kind == 'cooling_down' and self.provider_message:
+            return meta_cooldown_message(self.provider_message)
+        if self.kind == 'missing_permission':
+            return f'{base} Meta said: {self.provider_message}' if self.provider_message else base
+        if self.kind in ('invalid_request', 'meta_error', 'policy_blocked'):
+            prefix = context or base
+            return f'{prefix}: {self.provider_message}' if self.provider_message else prefix
+        return base
+
+
+def meta_error_kind(code: int, subcode: int) -> str:
+    if code in (102, 190):
+        return 'token_expired' if subcode == 463 else 'token_invalid'
+    if code == 10 or 200 <= code <= 299:
+        return 'missing_permission'
+    if (code == 100 and subcode == 33) or code == 803:
+        return 'asset_unavailable'
+    if code in (4, 17, 32, 613) or 80000 <= code <= 80099:
+        return 'rate_limited'
+    if code in (1, 2):
+        return 'temporary'
+    if code == 368:
+        return 'policy_blocked'
+    if code == 100:
+        return 'invalid_request'
+    return 'meta_error'
+
+
+_META_TENANT_SCOPE: contextvars.ContextVar[str] = contextvars.ContextVar('meta_tenant_scope', default='')
+
+
+def meta_set_scope(tenant_id: str) -> None:
+    """Attribute Meta usage and cool-downs in this request to one workspace's ad account."""
+    _META_TENANT_SCOPE.set(tenant_id)
+
+
+def meta_cooldown_until(tenant_id: str = '') -> str:
+    scopes = ['app'] + ([f'tenant:{tenant_id}'] if tenant_id else [])
+    placeholders = ','.join('?' * len(scopes))
+    with connect() as db:
+        rows = qrows(db, f'SELECT blocked_until FROM meta_rate_limits WHERE scope IN ({placeholders})',
+                     tuple(scopes))
+    now = utcnow()
+    active = [row['blocked_until'] for row in rows if row['blocked_until'] > now]
+    return max(active) if active else ''
+
+
+def meta_set_cooldown(scope: str, seconds: int, reason: str) -> None:
+    seconds = max(60, min(int(seconds or META_DEFAULT_COOLDOWN_SECONDS), 24 * 3600))
+    until = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat(timespec='seconds')
+    with connect() as db:
+        current = qrow(db, 'SELECT blocked_until FROM meta_rate_limits WHERE scope=?', (scope,))
+        if current and current['blocked_until'] >= until:
+            return
+        db.execute('INSERT INTO meta_rate_limits(scope,blocked_until,reason,updated_at) VALUES(?,?,?,?) '
+                   'ON CONFLICT(scope) DO UPDATE SET blocked_until=excluded.blocked_until,'
+                   'reason=excluded.reason,updated_at=excluded.updated_at',
+                   (scope, until, reason[:200], utcnow()))
+
+
+def meta_cooldown_message(until: str) -> str:
+    return f"{META_ERROR_MESSAGES['cooling_down']} Retry after {until.replace('T', ' ')[:16]} UTC."
+
+
+def meta_guard(tenant_id: str) -> None:
+    """Refuse to call Meta while Meta's cool-down is active for the app or this workspace."""
+    meta_set_scope(tenant_id)
+    until = meta_cooldown_until(tenant_id)
+    if until:
+        raise HTTPException(429, meta_cooldown_message(until))
+
+
+def _meta_usage_percent(values: dict) -> int:
+    numbers = []
+    for key in ('call_count', 'total_cputime', 'total_time', 'acc_id_util_pct'):
+        try:
+            numbers.append(float(values.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    return int(max(numbers, default=0))
+
+
+def meta_track_usage(headers, tenant_id: str, rate_limited_code: int = 0) -> None:
+    """Read Meta's usage headers and start a cool-down before Meta blocks further calls."""
+    tenant_scope = f'tenant:{tenant_id}' if tenant_id else 'app'
+    eta_seconds = 0
+    try:
+        app_usage = json.loads(headers.get('x-app-usage') or '{}')
+        if isinstance(app_usage, dict) and _meta_usage_percent(app_usage) >= META_USAGE_CEILING_PERCENT:
+            meta_set_cooldown('app', META_DEFAULT_COOLDOWN_SECONDS, 'Meta app usage ceiling reached')
+    except (TypeError, ValueError):
+        pass
+    try:
+        business_usage = json.loads(headers.get('x-business-use-case-usage') or '{}')
+        for rows in (business_usage.values() if isinstance(business_usage, dict) else []):
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                eta_seconds = max(eta_seconds, int(float(row.get('estimated_time_to_regain_access') or 0) * 60))
+                if (_meta_usage_percent(row) >= META_USAGE_CEILING_PERCENT or
+                        row.get('estimated_time_to_regain_access')):
+                    meta_set_cooldown(tenant_scope, eta_seconds or META_DEFAULT_COOLDOWN_SECONDS,
+                                      f"Meta {row.get('type', 'business')} usage ceiling reached")
+    except (TypeError, ValueError):
+        pass
+    try:
+        account_usage = json.loads(headers.get('x-ad-account-usage') or '{}')
+        if isinstance(account_usage, dict) and _meta_usage_percent(account_usage) >= META_USAGE_CEILING_PERCENT:
+            meta_set_cooldown(tenant_scope, int(float(account_usage.get('reset_time_duration') or 0)) or
+                              META_DEFAULT_COOLDOWN_SECONDS, 'Meta ad account usage ceiling reached')
+    except (TypeError, ValueError):
+        pass
+    if rate_limited_code:
+        scope = 'app' if rate_limited_code == 4 else tenant_scope
+        meta_set_cooldown(scope, eta_seconds or META_DEFAULT_COOLDOWN_SECONDS,
+                          f'Meta rate limit error {rate_limited_code}')
+
+
+def meta_appsecret_proof(access_token: str) -> str:
+    return hmac.new(META_APP_SECRET.encode(), access_token.encode(), hashlib.sha256).hexdigest()
+
+
+def meta_graph(method: str, path: str, access_token: str = '', params: dict | None = None,
+               timeout: int = 25, allow_during_cooldown: bool = False) -> dict:
+    """Single HTTP path to the Graph API. User tokens always carry appsecret_proof.
+
+    No automatic retries: while a Meta cool-down is active the call is refused locally, so Adswise
+    never hammers Meta into blocking the app or the workspace's ad account.
+    """
+    tenant_id = _META_TENANT_SCOPE.get()
+    cooling_until = '' if allow_during_cooldown else meta_cooldown_until(tenant_id)
+    if cooling_until:
+        raise MetaAPIError('cooling_down', cooling_until)
+    params = {key: value for key, value in (params or {}).items() if value is not None}
+    if access_token:
+        params['access_token'] = access_token
+        params['appsecret_proof'] = meta_appsecret_proof(access_token)
+    url = f'https://graph.facebook.com/{META_GRAPH_VERSION}/{path.lstrip("/")}'
+    try:
+        if method == 'GET':
+            response = httpx.get(url, params=params, timeout=timeout)
+        else:
+            response = httpx.post(url, data=params, timeout=timeout)
+    except httpx.HTTPError as exc:
+        raise MetaAPIError('network') from exc
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if response.status_code >= 400 or (isinstance(data, dict) and data.get('error')):
+        error = data.get('error') if isinstance(data, dict) and isinstance(data.get('error'), dict) else {}
+        try:
+            code, subcode = int(error.get('code') or 0), int(error.get('error_subcode') or 0)
+        except (TypeError, ValueError):
+            code, subcode = 0, 0
+        kind = meta_error_kind(code, subcode)
+        meta_track_usage(response.headers, tenant_id, code if kind == 'rate_limited' else 0)
+        if not code and response.status_code >= 500:
+            raise MetaAPIError('temporary')
+        message = str(error.get('error_user_msg') or error.get('message') or '')
+        raise MetaAPIError(kind, message, code, subcode)
+    meta_track_usage(response.headers, tenant_id)
+    return data if isinstance(data, dict) else {}
+
+
+def meta_get_all(path: str, access_token: str, params: dict, max_items: int = 500) -> list[dict]:
+    items, after = [], ''
+    for _ in range(10):
+        page = {**params, 'limit': params.get('limit', 100)}
+        if after:
+            page['after'] = after
+        data = meta_graph('GET', path, access_token, page)
+        items.extend(item for item in (data.get('data') or []) if isinstance(item, dict))
+        paging = data.get('paging') or {}
+        after = (paging.get('cursors') or {}).get('after', '')
+        if not after or not paging.get('next') or len(items) >= max_items:
+            break
+    return items[:max_items]
+
+
+def meta_redirect_uri() -> str:
+    return f'{PUBLIC_ORIGIN}/api/integrations/meta/callback'
+
+
 def meta_connection(tenant_id: str) -> dict:
     with connect() as db:
         connection = qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='meta'",
                           (tenant_id,))
     if not connection:
         raise HTTPException(409, 'Connect Meta Ads first')
+    if connection['status'] == 'reauth_required':
+        raise HTTPException(409, META_ERROR_MESSAGES['token_expired'])
+    return connection
+
+
+def meta_ready_connection(tenant_id: str) -> dict:
+    connection = meta_connection(tenant_id)
+    if not connection['customer_id'] or connection['status'] != 'connected':
+        raise HTTPException(409, 'Choose the Meta ad account for this workspace first')
     return connection
 
 
@@ -701,26 +981,154 @@ def meta_access_token(connection: dict) -> str:
         raise HTTPException(502, 'Stored Meta authorization could not be decrypted; reconnect Meta Ads') from exc
 
 
+def meta_state(tenant_id: str) -> dict:
+    with connect() as db:
+        row = qrow(db, 'SELECT * FROM meta_connection_state WHERE tenant_id=?', (tenant_id,))
+    return row or {}
+
+
+def meta_record_error(tenant_id: str, exc: MetaAPIError) -> None:
+    now = utcnow()
+    with connect() as db:
+        db.execute('''INSERT INTO meta_connection_state(tenant_id,last_error_kind,last_error,last_error_at,updated_at)
+                      VALUES(?,?,?,?,?) ON CONFLICT(tenant_id) DO UPDATE SET
+                      last_error_kind=excluded.last_error_kind,last_error=excluded.last_error,
+                      last_error_at=excluded.last_error_at,updated_at=excluded.updated_at''',
+                   (tenant_id, exc.kind, exc.user_message()[:500], now, now))
+        if exc.kind in META_REAUTH_KINDS:
+            db.execute("UPDATE provider_connections SET status='reauth_required',updated_at=? "
+                       "WHERE tenant_id=? AND provider='meta'", (now, tenant_id))
+
+
+def meta_failure(tenant_id: str, exc: MetaAPIError, context: str = '') -> HTTPException:
+    """Record the failure for the health panel and convert it into a clear HTTP error."""
+    meta_record_error(tenant_id, exc)
+    return HTTPException(META_ERROR_STATUS.get(exc.kind, 502), exc.user_message(context))
+
+
 def meta_post(path: str, access_token: str, payload: dict, error_message: str) -> dict:
-    appsecret_proof = hmac.new(META_APP_SECRET.encode(), access_token.encode(), hashlib.sha256).hexdigest()
+    """Create a Graph object; raises MetaAPIError with the provider reason on failure."""
+    data = meta_graph('POST', path, access_token, payload, timeout=30)
+    if not data.get('id'):
+        raise MetaAPIError('meta_error', f'{error_message}: Meta did not return the created object ID')
+    return data
+
+
+def meta_update(object_id: str, access_token: str, payload: dict, allow_during_cooldown: bool = False) -> dict:
+    data = meta_graph('POST', object_id, access_token, payload, timeout=30,
+                      allow_during_cooldown=allow_during_cooldown)
+    if data.get('success') is False:
+        raise MetaAPIError('meta_error', 'Meta did not confirm the update')
+    return data
+
+
+def meta_timestamp(value) -> str:
     try:
-        response = httpx.post(f'https://graph.facebook.com/{META_GRAPH_VERSION}/{path}', data={
-            **payload, 'access_token': access_token, 'appsecret_proof': appsecret_proof}, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        if not data.get('id'):
-            raise ValueError('Missing resource ID')
-        return data
-    except httpx.HTTPStatusError as exc:
-        try:
-            provider_error = exc.response.json().get('error', {})
-            provider_message = provider_error.get('error_user_msg') or provider_error.get('message', '')
-        except ValueError:
-            provider_message = ''
-        detail = f'{error_message}: {provider_message[:500]}' if provider_message else error_message
-        raise HTTPException(502, detail) from exc
-    except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(502, error_message) from exc
+        seconds = int(value or 0)
+    except (TypeError, ValueError):
+        return ''
+    if seconds <= 0:
+        return 'never'
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec='seconds')
+
+
+def meta_debug_token(access_token: str) -> dict:
+    data = meta_graph('GET', 'debug_token', params={
+        'input_token': access_token, 'access_token': f'{META_APP_ID}|{META_APP_SECRET}'}).get('data') or {}
+    return {'valid': bool(data.get('is_valid')), 'app_id': str(data.get('app_id', '')),
+            'user_id': str(data.get('user_id', '')),
+            'expires_at': meta_timestamp(data.get('expires_at')),
+            'data_access_expires_at': meta_timestamp(data.get('data_access_expires_at')),
+            'scopes': sorted({str(scope) for scope in data.get('scopes') or []})}
+
+
+def meta_token_problem(summary: dict) -> str:
+    if summary.get('app_id') != META_APP_ID:
+        return 'token_invalid'
+    if not summary.get('valid'):
+        expires = summary.get('expires_at', '')
+        return 'token_expired' if expires not in ('', 'never') and expires <= utcnow() else 'token_invalid'
+    return ''
+
+
+def meta_missing_scopes(scopes) -> list[str]:
+    granted = set(scopes or [])
+    return [scope for scope in META_REQUIRED_SCOPES if scope not in granted]
+
+
+def meta_account_id(value: str) -> str:
+    value = str(value or '').strip()
+    return value if value.startswith('act_') else f'act_{value}' if value else ''
+
+
+def meta_ad_accounts(access_token: str) -> list[dict]:
+    rows = meta_get_all('me/adaccounts', access_token,
+                        {'fields': 'id,account_id,name,currency,timezone_name,account_status'}, 500)
+    accounts = []
+    for row in rows:
+        account_id = meta_account_id(row.get('id') or row.get('account_id'))
+        if not re.fullmatch(r'act_\d{1,30}', account_id):
+            continue
+        accounts.append({'id': account_id, 'name': row.get('name') or f'Meta ad account {account_id[4:]}',
+                         'currency': row.get('currency', ''), 'timezone_name': row.get('timezone_name', ''),
+                         'account_status': int(row.get('account_status') or 0)})
+    return sorted(accounts, key=lambda item: (item['name'].lower(), item['id']))
+
+
+def meta_pages(access_token: str) -> list[dict]:
+    rows = meta_get_all('me/accounts', access_token, {'fields': 'id,name,tasks'}, 300)
+    pages = []
+    for row in rows:
+        page_id = str(row.get('id', ''))
+        tasks = [str(task) for task in row.get('tasks') or []]
+        if re.fullmatch(r'\d{1,30}', page_id):
+            pages.append({'id': page_id, 'name': row.get('name') or f'Page {page_id}', 'tasks': tasks,
+                          'can_advertise': 'ADVERTISE' in tasks or 'MANAGE' in tasks})
+    return sorted(pages, key=lambda item: (item['name'].lower(), item['id']))
+
+
+def meta_instagram_accounts(access_token: str, ad_account_id: str) -> list[dict]:
+    rows = meta_get_all(f'{ad_account_id}/instagram_accounts', access_token, {'fields': 'id,username'}, 200)
+    accounts = [{'id': str(row.get('id', '')), 'username': row.get('username', '')} for row in rows]
+    return [item for item in accounts if re.fullmatch(r'\d{1,30}', item['id'])]
+
+
+def meta_pixels(access_token: str, ad_account_id: str) -> list[dict]:
+    rows = meta_get_all(f'{ad_account_id}/adspixels', access_token,
+                        {'fields': 'id,name,last_fired_time,is_unavailable'}, 200)
+    pixels = [{'id': str(row.get('id', '')), 'name': row.get('name') or f"Pixel {row.get('id', '')}",
+               'last_fired_time': row.get('last_fired_time', ''), 'available': not row.get('is_unavailable')}
+              for row in rows]
+    return [item for item in pixels if re.fullmatch(r'\d{1,30}', item['id'])]
+
+
+def meta_bound_elsewhere(tenant_id: str, resource_type: str, resource_ids: list[str]) -> set[str]:
+    if not resource_ids:
+        return set()
+    with connect() as db:
+        rows = qrows(db, '''SELECT resource_id FROM provider_resource_bindings
+                            WHERE provider='meta' AND resource_type=? AND tenant_id<>?''',
+                     (resource_type, tenant_id))
+        if resource_type == 'ad_account':
+            rows += qrows(db, "SELECT customer_id AS resource_id FROM provider_connections "
+                              "WHERE provider='meta' AND tenant_id<>? AND customer_id<>''", (tenant_id,))
+        if resource_type == 'pixel':
+            rows += qrows(db, "SELECT meta_pixel_id AS resource_id FROM tracking_configs "
+                              "WHERE tenant_id<>? AND meta_pixel_id<>''", (tenant_id,))
+    taken = {row['resource_id'] for row in rows}
+    return {resource_id for resource_id in resource_ids if resource_id in taken}
+
+
+def meta_owned_binding(tenant_id: str, resource_type: str, resource_id: str) -> bool:
+    """True only when this exact asset is bound to this workspace and to no other."""
+    if not resource_id:
+        return False
+    with connect() as db:
+        rows = qrows(db, '''SELECT tenant_id FROM provider_resource_bindings
+                            WHERE provider='meta' AND resource_type=? AND resource_id=?''',
+                     (resource_type, resource_id))
+    return bool(rows) and all(row['tenant_id'] == tenant_id for row in rows) and \
+        not meta_bound_elsewhere(tenant_id, resource_type, [resource_id])
 
 
 def save_meta_publication_progress(publication_id: str, progress: dict, status: str = 'creating') -> None:
@@ -1203,11 +1611,14 @@ class GoogleSearchPublishBody(BaseModel):
 
 
 class MetaPublishBody(BaseModel):
+    """Creative and budget for a Meta launch.
+
+    The Page, Instagram account and Pixel are never taken from the request: Seed validation and
+    execution always use the assets this workspace selected and verified in Ad Accounts.
+    """
     version: Literal[1] = 1
     daily_budget_aed: str = Field(max_length=20)
     duration_days: int = Field(default=7, ge=1, le=90)
-    page_id: str = Field(pattern=r'^\d+$', max_length=30)
-    instagram_actor_id: str = Field(default='', pattern=r'^\d*$', max_length=30)
     countries: list[str] = Field(default_factory=lambda: ['AE'], min_length=1, max_length=25)
     interest_ids: list[str] = Field(default_factory=list, max_length=50)
     primary_text: str = Field(min_length=1, max_length=2200)
@@ -1215,7 +1626,6 @@ class MetaPublishBody(BaseModel):
     image_url: str = Field(min_length=8, max_length=2000)
     final_url: str = Field(default='', max_length=2000)
     call_to_action: Literal['BOOK_NOW', 'LEARN_MORE', 'CONTACT_US'] = 'BOOK_NOW'
-    pixel_id: str = Field(default='', pattern=r'^\d*$', max_length=30)
     conversion_event: Literal['LEAD', 'CONTACT', 'SCHEDULE', 'PURCHASE', 'COMPLETE_REGISTRATION'] = 'SCHEDULE'
 
     @field_validator('countries')
@@ -1242,6 +1652,32 @@ class MetaPublishBody(BaseModel):
             if parsed.scheme != 'https' or not parsed.hostname or ' ' in value:
                 raise ValueError('Meta assets and destinations must use public HTTPS URLs')
         return value
+
+
+class MetaAssetSelectionBody(BaseModel):
+    ad_account_id: str = Field(pattern=r'^(act_)?\d{1,30}$')
+    page_id: str = Field(default='', pattern=r'^\d{0,30}$')
+    instagram_account_id: str = Field(default='', pattern=r'^\d{0,30}$')
+    pixel_id: str = Field(default='', pattern=r'^\d{0,30}$')
+
+
+class MetaChangeRequestBody(BaseModel):
+    action: Literal['publish', 'set_status', 'set_budget']
+    campaign_id: str = Field(default='', pattern=r'^[a-f0-9]{0,24}$')
+    target_id: str = Field(default='', pattern=r'^\d{0,30}$')
+    status: Literal['', 'ACTIVE', 'PAUSED'] = ''
+    daily_budget_aed: str = Field(default='', max_length=20)
+    publish: MetaPublishBody | None = None
+
+    @model_validator(mode='after')
+    def complete_for_action(self):
+        if self.action == 'publish' and not (self.campaign_id and self.publish):
+            raise ValueError('A launch request needs the campaign and its Meta creative')
+        if self.action == 'set_status' and not (self.target_id and self.status):
+            raise ValueError('A status change needs the Meta campaign ID and the new status')
+        if self.action == 'set_budget' and not (self.target_id and self.daily_budget_aed):
+            raise ValueError('A budget change needs the Meta campaign ID and the new daily budget')
+        return self
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1599,7 +2035,8 @@ def bootstrap(user=Depends(current_user)):
             'ai_configured': ai_configured(),
             'seed_configured': bool(ARK_BASE_URL and ARK_API_KEY and ARK_MODEL),
             'providers':{'meta':{'configured':meta_configured(),
-                                 'reason':'Meta developer app configured' if meta_configured() else 'Meta App ID and secret required'},
+                                 'reason':'Meta developer app configured' if meta_configured() else
+                                          'Missing server settings: ' + ', '.join(meta_missing_configuration())},
                          'tiktok':{'configured':tiktok_configured(),
                                    'reason':'TikTok developer app configured' if tiktok_configured() else 'TikTok App ID, secret and authorization URL required'},
                          'google':{'configured':google_configured(),
@@ -2008,6 +2445,9 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
                               u.email''', (tenant_id,))
         latest_analysis = qrow(db, '''SELECT provider,model,analysis,created_at FROM performance_analyses
                                      WHERE tenant_id=? ORDER BY created_at DESC LIMIT 1''', (tenant_id,))
+        meta_snapshot = qrow(db, "SELECT payload FROM provider_snapshots WHERE tenant_id=? AND provider='meta'",
+                             (tenant_id,))
+    meta_connection_row = next((item for item in connections if item['provider'] == 'meta'), None)
     count = {s:sum(c['status']==s for c in campaigns) for s in ['draft','pending','approved','rejected','archived']}
     total_authorized = sum(c['budget_fils'] for c in campaigns if c['status']=='approved')
     publications_by_campaign = {item['campaign_id']: item for item in publications}
@@ -2036,6 +2476,7 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
             'heatmap':heatmap_report(tenant_id),
             'seed_analysis':{**latest_analysis, 'analysis':json.loads(latest_analysis['analysis'])}
                             if latest_analysis else None,
+            'meta':meta_workspace_summary(tenant_id, meta_connection_row, meta_snapshot),
             'live_metrics_available':bool(google_snapshot), 'current_role':user['role'], 'members':members}
 
 
@@ -2541,55 +2982,1241 @@ def google_growth_disconnect(tenant_id: str, user=Depends(tenant_writer)):
     return {'ok': True}
 
 
+# ------------------------------- Meta: OAuth ------------------------------------------------------------
+
+def meta_store_authorization(tenant_id: str, access_token: str, summary: dict) -> dict:
+    """Persist this workspace's own token immediately after the code exchange.
+
+    Saving first means a later throttled call never forces the owner through another Meta login,
+    which is what triggers Meta's login checkpoints and temporary blocks.
+    """
+    encrypted = google_cipher().encrypt(access_token.encode()).decode()
+    now = utcnow()
+    with connect() as db:
+        existing = qrow(db, "SELECT customer_id FROM provider_connections WHERE tenant_id=? AND provider='meta'",
+                        (tenant_id,))
+        previous = qrow(db, 'SELECT meta_user_id FROM meta_connection_state WHERE tenant_id=?', (tenant_id,))
+        # Unknown user (debug_token throttled) keeps selections: Seed re-verifies every asset live anyway.
+        same_user = (not summary.get('user_id') or
+                     bool(previous and previous['meta_user_id'] == summary.get('user_id')))
+        db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='meta'", (tenant_id,))
+        db.execute('''INSERT INTO provider_connections(
+            tenant_id,provider,refresh_token_encrypted,customer_id,login_customer_id,account_name,
+            currency_code,time_zone,status,connected_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(tenant_id,provider) DO UPDATE SET
+            refresh_token_encrypted=excluded.refresh_token_encrypted, status=excluded.status,
+            connected_at=excluded.connected_at, updated_at=excluded.updated_at''',
+            (tenant_id, 'meta', encrypted, '', '', '', '', '', 'authorized', now, now))
+        db.execute('''INSERT INTO meta_connection_state(
+            tenant_id,meta_user_id,token_expires_at,data_access_expires_at,granted_scopes,
+            last_error_kind,last_error,last_error_at,last_checked_at,updated_at)
+            VALUES(?,?,?,?,?,'','','',?,?) ON CONFLICT(tenant_id) DO UPDATE SET
+            meta_user_id=excluded.meta_user_id, token_expires_at=excluded.token_expires_at,
+            data_access_expires_at=excluded.data_access_expires_at, granted_scopes=excluded.granted_scopes,
+            last_error_kind='', last_error='', last_error_at='', last_checked_at=excluded.last_checked_at,
+            updated_at=excluded.updated_at''',
+            (tenant_id, summary.get('user_id', ''), summary.get('expires_at', ''),
+             summary.get('data_access_expires_at', ''), json.dumps(summary.get('scopes', [])),
+             now if not summary.get('unverified') else '', now))
+        if not same_user:
+            # A different Meta user must re-select Page, Instagram and Pixel from its own assets.
+            db.execute("DELETE FROM provider_resource_bindings WHERE tenant_id=? AND provider='meta' "
+                       "AND resource_type IN ('page','instagram_account','pixel')", (tenant_id,))
+            db.execute("UPDATE meta_connection_state SET page_id='',page_name='',instagram_id='',"
+                       "instagram_username='',pixel_id='',pixel_name='' WHERE tenant_id=?", (tenant_id,))
+    return {'previous_ad_account': existing['customer_id'] if existing else '', 'same_user': same_user}
+
+
+def meta_clear_ad_account(tenant_id: str) -> None:
+    with connect() as db:
+        db.execute("DELETE FROM provider_resource_bindings WHERE tenant_id=? AND provider='meta' "
+                   "AND resource_type='ad_account'", (tenant_id,))
+        db.execute("UPDATE provider_connections SET customer_id='',account_name='',currency_code='',time_zone='',"
+                   "status='authorized',updated_at=? WHERE tenant_id=? AND provider='meta'", (utcnow(), tenant_id))
+
+
+def meta_reverify_ad_account(tenant_id: str, access_token: str, ad_account_id: str) -> bool:
+    """One call: keep the previously selected ad account only if the new token can still use it."""
+    try:
+        account = meta_graph('GET', ad_account_id, access_token,
+                             {'fields': 'id,name,currency,timezone_name,account_status'})
+    except MetaAPIError as exc:
+        if exc.kind in ('asset_unavailable', 'missing_permission', 'invalid_request'):
+            meta_clear_ad_account(tenant_id)
+            return False
+        raise
+    if meta_account_id(account.get('id')) != ad_account_id:
+        meta_clear_ad_account(tenant_id)
+        return False
+    with connect() as db:
+        db.execute("UPDATE provider_connections SET customer_id=?,account_name=?,currency_code=?,time_zone=?,"
+                   "status='connected',updated_at=? WHERE tenant_id=? AND provider='meta'",
+                   (ad_account_id, account.get('name') or ad_account_id, account.get('currency', ''),
+                    account.get('timezone_name', ''), utcnow(), tenant_id))
+    return True
+
+
 @app.post('/api/workspaces/{tenant_id}/integrations/meta/start')
 def meta_oauth_start(tenant_id: str, user=Depends(tenant_writer)):
     if not meta_configured():
         raise HTTPException(503, 'Meta developer app credentials are not configured yet')
+    until = meta_cooldown_until(tenant_id)
+    if until:
+        raise HTTPException(429, meta_cooldown_message(until))
+    window_start = (datetime.now(timezone.utc) -
+                    timedelta(minutes=META_OAUTH_WINDOW_MINUTES)).isoformat(timespec='seconds')
+    with connect() as db:
+        recent = qrow(db, "SELECT COUNT(*) AS n FROM audit_log WHERE tenant_id=? "
+                          "AND action='integration.meta_oauth_started' AND created_at>?",
+                      (tenant_id, window_start))['n']
+        if recent >= META_OAUTH_STARTS_PER_WINDOW:
+            raise HTTPException(429, f'Too many Meta login attempts for this workspace. Wait '
+                                     f'{META_OAUTH_WINDOW_MINUTES} minutes before trying again so Meta '
+                                     'does not temporarily block the login.')
+        audit(db, user['user_id'], tenant_id, 'integration.meta_oauth_started', {})
     state = new_oauth_state(tenant_id, user['user_id'])
-    params = {'client_id': META_APP_ID,
-              'redirect_uri': f'{PUBLIC_ORIGIN}/api/integrations/meta/callback',
-              'response_type': 'code', 'state': state,
-              'config_id': META_LOGIN_CONFIG_ID,
+    params = {'client_id': META_APP_ID, 'redirect_uri': meta_redirect_uri(),
+              'response_type': 'code', 'state': state, 'config_id': META_LOGIN_CONFIG_ID,
               'override_default_response_type': 'true'}
     return {'authorization_url': f'https://www.facebook.com/{META_GRAPH_VERSION}/dialog/oauth?{urlencode(params)}'}
 
 
 @app.get('/api/integrations/meta/callback')
-def meta_oauth_callback(code: str = '', state: str = '', error: str = '', user=Depends(current_user)):
-    if error or not code or not state or not meta_configured():
-        return integration_redirect('meta', 'error')
-    saved = consume_oauth_state(state, user)
-    if not saved:
-        return integration_redirect('meta', 'error')
-    redirect_uri = f'{PUBLIC_ORIGIN}/api/integrations/meta/callback'
+def meta_oauth_callback(request: Request, code: str = '', state: str = '', error: str = ''):
+    """At most four Meta calls, no automatic retries, and the one-time code is never reused."""
     try:
-        token_response = httpx.get(f'https://graph.facebook.com/{META_GRAPH_VERSION}/oauth/access_token', params={
+        user = current_user(request)
+    except HTTPException:
+        return integration_redirect('meta', 'error', 'session')
+    saved = consume_oauth_state(state, user) if state else None
+    if error:
+        return integration_redirect('meta', 'error', 'denied')
+    if not saved:
+        return integration_redirect('meta', 'error', 'state')
+    if not code:
+        return integration_redirect('meta', 'error', 'invalid')
+    if not meta_configured():
+        return integration_redirect('meta', 'error', 'not_configured')
+    tenant_id = saved['tenant_id']
+    meta_set_scope(tenant_id)
+    if meta_cooldown_until(tenant_id):
+        return integration_redirect('meta', 'error', 'cooling_down')
+    try:
+        access_token = meta_graph('GET', 'oauth/access_token', params={
             'client_id': META_APP_ID, 'client_secret': META_APP_SECRET,
-            'redirect_uri': redirect_uri, 'code': code}, timeout=20)
-        token_response.raise_for_status()
-        short_token = token_response.json().get('access_token', '')
-        long_response = httpx.get(f'https://graph.facebook.com/{META_GRAPH_VERSION}/oauth/access_token', params={
+            'redirect_uri': meta_redirect_uri(), 'code': code}).get('access_token', '')
+        if not access_token:
+            raise MetaAPIError('token_invalid')
+    except MetaAPIError as exc:
+        return integration_redirect('meta', 'error', exc.kind)
+    try:
+        long_lived = meta_graph('GET', 'oauth/access_token', params={
             'grant_type': 'fb_exchange_token', 'client_id': META_APP_ID,
-            'client_secret': META_APP_SECRET, 'fb_exchange_token': short_token}, timeout=20)
-        long_response.raise_for_status()
-        access_token = long_response.json().get('access_token', '')
-        accounts_response = httpx.get(f'https://graph.facebook.com/{META_GRAPH_VERSION}/me/adaccounts', params={
-            'access_token': access_token, 'fields': 'id,name,currency,timezone_name,account_status',
-            'limit': 100}, timeout=20)
-        accounts_response.raise_for_status()
-        accounts = accounts_response.json().get('data', [])
-        if not access_token or not accounts:
-            raise ValueError('No accessible Meta ad account')
-        account = accounts[0]
-        save_provider_connection(saved['tenant_id'], 'meta', access_token, str(account.get('id', '')),
-                                 account.get('name', 'Meta Ads'), account.get('currency', ''),
-                                 account.get('timezone_name', ''))
+            'client_secret': META_APP_SECRET, 'fb_exchange_token': access_token}).get('access_token', '')
+        access_token = long_lived or access_token
+    except MetaAPIError:
+        pass  # System-user tokens from Login for Business are not exchangeable; keep the issued token.
+    try:
+        summary = meta_debug_token(access_token)
+    except MetaAPIError as exc:
+        if exc.kind not in ('cooling_down', 'rate_limited', 'temporary', 'network'):
+            return integration_redirect('meta', 'error', exc.kind)
+        summary = {'valid': True, 'app_id': META_APP_ID, 'user_id': '', 'expires_at': '',
+                   'data_access_expires_at': '', 'scopes': [], 'unverified': True}
+    problem = meta_token_problem(summary)
+    if problem:
+        return integration_redirect('meta', 'error', 'app_mismatch' if summary.get('app_id') != META_APP_ID
+                                    else problem)
+    try:
+        info = meta_store_authorization(tenant_id, access_token, summary)
+    except HTTPException:
+        return integration_redirect('meta', 'error', 'not_configured')
+    result, reason = 'authorized', ''
+    if info['previous_ad_account']:
+        try:
+            if meta_reverify_ad_account(tenant_id, access_token, info['previous_ad_account']):
+                result = 'connected'
+        except MetaAPIError as exc:
+            meta_record_error(tenant_id, exc)
+            reason = exc.kind
+    missing = [] if summary.get('unverified') else meta_missing_scopes(summary['scopes'])
+    if missing:
+        reason = 'permissions'
+    elif summary.get('unverified') and not reason:
+        reason = 'verification_pending'
+    with connect() as db:
+        audit(db, user['user_id'], tenant_id, 'integration.meta_authorized', {
+            'meta_user_id': summary.get('user_id', ''), 'granted_scopes': summary.get('scopes', []),
+            'missing_scopes': missing, 'ad_account_kept': result == 'connected',
+            'token_expires_at': summary.get('expires_at', '')})
+    return integration_redirect('meta', result, reason)
+
+
+# ------------------------------- Meta: asset selection ---------------------------------------------------
+
+META_ACCOUNT_STATUS = {1: 'Active', 2: 'Disabled', 3: 'Unsettled', 7: 'Pending risk review',
+                       8: 'Pending settlement', 9: 'In grace period', 100: 'Pending closure',
+                       101: 'Closed', 201: 'Any active', 202: 'Any closed'}
+
+
+def meta_require_owner(user: dict, message: str = 'Only workspace owners can choose Meta assets') -> None:
+    if user['role'] != 'owner' and not user.get('super_admin'):
+        raise HTTPException(403, message)
+
+
+def meta_optional_list(loader, warnings: list[str], label: str) -> list[dict]:
+    try:
+        return loader()
+    except MetaAPIError as exc:
+        if exc.kind in META_REAUTH_KINDS or exc.kind in ('cooling_down', 'rate_limited'):
+            raise
+        warnings.append(f'{label}: {exc.user_message()}')
+        return []
+
+
+@app.get('/api/workspaces/{tenant_id}/integrations/meta/assets')
+def meta_assets(tenant_id: str, ad_account_id: str = '', user=Depends(tenant_member)):
+    meta_require_owner(user)
+    meta_guard(tenant_id)
+    connection = meta_connection(tenant_id)
+    access_token = meta_access_token(connection)
+    warnings: list[str] = []
+    try:
+        accounts = meta_ad_accounts(access_token)
+        requested = meta_account_id(ad_account_id) if re.fullmatch(r'(act_)?\d{1,30}', ad_account_id or '') else ''
+        chosen = requested or connection['customer_id']
+        if chosen and chosen not in {item['id'] for item in accounts}:
+            if requested:
+                raise HTTPException(403, 'That Meta ad account is not accessible to the Meta user connected '
+                                         'to this workspace')
+            chosen = ''
+        pages = meta_optional_list(lambda: meta_pages(access_token), warnings, 'Pages')
+        instagram = meta_optional_list(lambda: meta_instagram_accounts(access_token, chosen),
+                                       warnings, 'Instagram accounts') if chosen else []
+        pixels = meta_optional_list(lambda: meta_pixels(access_token, chosen), warnings, 'Pixels') if chosen else []
+    except MetaAPIError as exc:
+        raise meta_failure(tenant_id, exc, 'Meta assets could not be loaded') from exc
+    taken = {kind: meta_bound_elsewhere(tenant_id, kind, [item['id'] for item in items])
+             for kind, items in (('ad_account', accounts), ('page', pages),
+                                 ('instagram_account', instagram), ('pixel', pixels))}
+
+    def mark(kind, item, ok=True, reason=''):
+        if item['id'] in taken[kind]:
+            return {**item, 'available': False, 'unavailable_reason': 'Already connected to another workspace'}
+        return {**item, 'available': ok, 'unavailable_reason': '' if ok else reason}
+
+    state = meta_state(tenant_id)
+    return {
+        'ad_account_id': chosen,
+        'ad_accounts': [mark('ad_account', {**item, 'status_label': META_ACCOUNT_STATUS.get(item['account_status'],
+                                                                                            'Unknown')})
+                        for item in accounts],
+        'pages': [mark('page', item, item['can_advertise'], 'Your Meta user cannot advertise for this Page')
+                  for item in pages],
+        'instagram_accounts': [mark('instagram_account', item) for item in instagram],
+        'pixels': [mark('pixel', item, item['available'], 'Meta reports this Pixel as unavailable')
+                   for item in pixels],
+        'selected': {'ad_account_id': connection['customer_id'], 'page_id': state.get('page_id', ''),
+                     'instagram_account_id': state.get('instagram_id', ''), 'pixel_id': state.get('pixel_id', '')},
+        'warnings': warnings,
+    }
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/meta/assets')
+def meta_select_assets(tenant_id: str, body: MetaAssetSelectionBody, user=Depends(tenant_writer)):
+    meta_guard(tenant_id)
+    connection = meta_connection(tenant_id)
+    access_token = meta_access_token(connection)
+    ad_account_id = meta_account_id(body.ad_account_id)
+    try:
+        account = {item['id']: item for item in meta_ad_accounts(access_token)}.get(ad_account_id)
+        if not account:
+            raise HTTPException(403, 'That Meta ad account is not accessible to the Meta user connected to '
+                                     'this workspace')
+        page = None
+        if body.page_id:
+            page = {item['id']: item for item in meta_pages(access_token)}.get(body.page_id)
+            if not page or not page['can_advertise']:
+                raise HTTPException(403, 'That Facebook Page is not available for advertising to the Meta user '
+                                         'connected to this workspace')
+        instagram = None
+        if body.instagram_account_id:
+            instagram = {item['id']: item for item in
+                         meta_instagram_accounts(access_token, ad_account_id)}.get(body.instagram_account_id)
+            if not instagram:
+                raise HTTPException(403, 'That Instagram account is not connected to the selected ad account')
+        pixel = None
+        if body.pixel_id:
+            pixel = {item['id']: item for item in meta_pixels(access_token, ad_account_id)}.get(body.pixel_id)
+            if not pixel or not pixel['available']:
+                raise HTTPException(403, 'That Pixel is not available in the selected ad account')
+    except MetaAPIError as exc:
+        raise meta_failure(tenant_id, exc, 'Meta assets could not be verified') from exc
+    now = utcnow()
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        previous = qrow(db, "SELECT customer_id FROM provider_connections WHERE tenant_id=? AND provider='meta'",
+                        (tenant_id,))
+        try:
+            bind_provider_resource(db, tenant_id, 'meta', 'ad_account', ad_account_id)
+            for resource_type, resource_id in (('page', body.page_id),
+                                               ('instagram_account', body.instagram_account_id),
+                                               ('pixel', body.pixel_id)):
+                if resource_id:
+                    bind_provider_resource(db, tenant_id, 'meta', resource_type, resource_id)
+                else:
+                    db.execute("DELETE FROM provider_resource_bindings WHERE tenant_id=? AND provider='meta' "
+                               "AND resource_type=?", (tenant_id, resource_type))
+        except ProviderResourceConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not previous or previous['customer_id'] != ad_account_id:
+            db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='meta'", (tenant_id,))
+        db.execute("UPDATE provider_connections SET customer_id=?,account_name=?,currency_code=?,time_zone=?,"
+                   "status='connected',updated_at=? WHERE tenant_id=? AND provider='meta'",
+                   (ad_account_id, account['name'], account['currency'], account['timezone_name'], now, tenant_id))
+        db.execute('''INSERT INTO meta_connection_state(tenant_id,page_id,page_name,instagram_id,instagram_username,
+                      pixel_id,pixel_name,updated_at) VALUES(?,?,?,?,?,?,?,?)
+                      ON CONFLICT(tenant_id) DO UPDATE SET page_id=excluded.page_id,page_name=excluded.page_name,
+                      instagram_id=excluded.instagram_id,instagram_username=excluded.instagram_username,
+                      pixel_id=excluded.pixel_id,pixel_name=excluded.pixel_name,updated_at=excluded.updated_at''',
+                   (tenant_id, body.page_id, page['name'] if page else '', body.instagram_account_id,
+                    instagram['username'] if instagram else '', body.pixel_id, pixel['name'] if pixel else '', now))
+        if pixel:
+            db.execute('''INSERT INTO tracking_configs(tenant_id,meta_pixel_id,updated_at) VALUES(?,?,?)
+                          ON CONFLICT(tenant_id) DO UPDATE SET meta_pixel_id=excluded.meta_pixel_id,
+                          updated_at=excluded.updated_at''', (tenant_id, body.pixel_id, now))
+        audit(db, user['user_id'], tenant_id, 'integration.meta_assets_selected', {
+            'ad_account_id': ad_account_id, 'page_id': body.page_id,
+            'instagram_account_id': body.instagram_account_id, 'pixel_id': body.pixel_id})
+        db.commit()
+    return {'ok': True, 'ad_account': account, 'page': page, 'instagram_account': instagram, 'pixel': pixel}
+
+
+# ------------------------------- Meta: reporting --------------------------------------------------------
+
+# For each standard event, the first action type Meta reports is used, so totals are never double counted.
+META_CONVERSION_FAMILIES = (
+    ('lead', ('lead', 'offsite_conversion.fb_pixel_lead', 'onsite_conversion.lead_grouped')),
+    ('schedule', ('schedule_total', 'schedule_website', 'offsite_conversion.fb_pixel_schedule')),
+    ('contact', ('contact_total', 'contact_website', 'offsite_conversion.fb_pixel_contact')),
+    ('purchase', ('omni_purchase', 'purchase', 'offsite_conversion.fb_pixel_purchase')),
+    ('complete_registration', ('omni_complete_registration', 'complete_registration',
+                               'offsite_conversion.fb_pixel_complete_registration')),
+)
+
+
+def meta_number(value) -> Decimal:
+    try:
+        number = Decimal(str(value or 0))
+        return number if number.is_finite() else Decimal(0)
+    except InvalidOperation:
+        return Decimal(0)
+
+
+def meta_conversions(actions) -> tuple[float, dict]:
+    values = {}
+    for item in actions or []:
+        if isinstance(item, dict) and item.get('action_type'):
+            values[str(item['action_type'])] = meta_number(item.get('value'))
+    by_event = {}
+    for family, action_types in META_CONVERSION_FAMILIES:
+        found = next((values[name] for name in action_types if name in values), None)
+        if found is not None:
+            by_event[family] = float(found)
+    return round(sum(by_event.values()), 2), by_event
+
+
+def meta_report_ranges(zone) -> dict:
+    today = datetime.now(zone).date()
+    monday = today - timedelta(days=today.weekday())
+    return {'yesterday': (today - timedelta(days=1), today - timedelta(days=1), 'Yesterday'),
+            'this_week': (monday, today, 'This week'),
+            'last_week': (monday - timedelta(days=7), monday - timedelta(days=1), 'Last week'),
+            'last_30_days': (today - timedelta(days=29), today, 'Last 30 days')}
+
+
+def meta_managed_campaigns(tenant_id: str) -> dict[str, dict]:
+    """Meta campaign ID -> this workspace's Adswise publication (never another workspace's)."""
+    with connect() as db:
+        rows = qrows(db, "SELECT * FROM provider_publications WHERE tenant_id=? AND provider='meta'", (tenant_id,))
+    managed = {}
+    for row in rows:
+        try:
+            progress = json.loads(row['remote_resource'] or '{}')
+        except (TypeError, ValueError):
+            progress = {}
+        if progress.get('campaign_id'):
+            managed[str(progress['campaign_id'])] = {**row, 'progress': progress}
+    return managed
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/meta/sync')
+def meta_metrics_sync(tenant_id: str, range: str = 'last_30_days', force: bool = False,
+                      user=Depends(tenant_writer)):
+    connection = meta_ready_connection(tenant_id)
+    try:
+        zone = ZoneInfo(connection.get('time_zone') or 'Asia/Dubai')
+    except ZoneInfoNotFoundError:
+        zone = timezone.utc
+    ranges = meta_report_ranges(zone)
+    if range not in ranges:
+        raise HTTPException(422, 'Analytics range must be yesterday, this_week, last_week or last_30_days')
+    with connect() as db:
+        snapshot_row = qrow(db, "SELECT payload,updated_at FROM provider_snapshots WHERE tenant_id=? AND provider='meta'",
+                            (tenant_id,))
+    cached = fresh_provider_snapshot(snapshot_row, range)
+    if cached is not None and cached.get('ad_account_id') == connection['customer_id']:
+        synced_seconds_ago = (datetime.now(timezone.utc) -
+                              datetime.fromisoformat(snapshot_row['updated_at'])).total_seconds()
+        if not force or synced_seconds_ago < 60:
+            return cached
+    meta_guard(tenant_id)
+    access_token = meta_access_token(connection)
+    ad_account_id = connection['customer_id']
+    start_date, end_date, period_label = ranges[range]
+    time_range = json.dumps({'since': start_date.isoformat(), 'until': end_date.isoformat()})
+    try:
+        campaign_rows = meta_get_all(f'{ad_account_id}/campaigns', access_token, {
+            'fields': 'id,name,status,effective_status,objective,daily_budget'}, 200)
+        insight_rows = meta_get_all(f'{ad_account_id}/insights', access_token, {
+            'level': 'campaign', 'fields': 'campaign_id,campaign_name,spend,impressions,clicks,actions',
+            'time_range': time_range}, 500)
+        daily_rows = meta_get_all(f'{ad_account_id}/insights', access_token, {
+            'level': 'account', 'fields': 'spend,impressions,clicks,actions', 'time_range': time_range,
+            'time_increment': '1'}, 100)
+    except MetaAPIError as exc:
+        raise meta_failure(tenant_id, exc, 'Meta metrics could not be loaded') from exc
+    managed = meta_managed_campaigns(tenant_id)
+    campaigns = {}
+    for row in campaign_rows:
+        campaign_id = str(row.get('id', ''))
+        campaigns[campaign_id] = {'id': campaign_id, 'name': row.get('name') or 'Unnamed campaign',
+                                  'status': row.get('status', 'UNKNOWN'),
+                                  'effective_status': row.get('effective_status', 'UNKNOWN'),
+                                  'objective': row.get('objective', ''), 'impressions': 0, 'clicks': 0,
+                                  'spend': '0.00', 'conversions': 0.0, 'conversions_by_event': {},
+                                  'managed_by_adswise': campaign_id in managed}
+    for row in insight_rows:
+        campaign_id = str(row.get('campaign_id', ''))
+        item = campaigns.setdefault(campaign_id, {
+            'id': campaign_id, 'name': row.get('campaign_name') or 'Unnamed campaign', 'status': 'UNKNOWN',
+            'effective_status': 'UNKNOWN', 'objective': '', 'impressions': 0, 'clicks': 0, 'spend': '0.00',
+            'conversions': 0.0, 'conversions_by_event': {}, 'managed_by_adswise': campaign_id in managed})
+        conversions, by_event = meta_conversions(row.get('actions'))
+        item['impressions'] = int(meta_number(row.get('impressions')))
+        item['clicks'] = int(meta_number(row.get('clicks')))
+        item['spend'] = f"{meta_number(row.get('spend')):.2f}"
+        item['conversions'], item['conversions_by_event'] = conversions, by_event
+    daily = []
+    for row in daily_rows:
+        conversions, _ = meta_conversions(row.get('actions'))
+        daily.append({'date': row.get('date_start', ''), 'impressions': int(meta_number(row.get('impressions'))),
+                      'clicks': int(meta_number(row.get('clicks'))),
+                      'spend': f"{meta_number(row.get('spend')):.2f}", 'conversions': conversions})
+    rows = sorted(campaigns.values(), key=lambda item: (Decimal(item['spend']), item['impressions']), reverse=True)
+    totals = {'impressions': sum(item['impressions'] for item in rows),
+              'clicks': sum(item['clicks'] for item in rows),
+              'spend': f"{sum(Decimal(item['spend']) for item in rows):.2f}",
+              'conversions': round(sum(item['conversions'] for item in rows), 2)}
+    totals['ctr_percent'] = round(totals['clicks'] * 100 / totals['impressions'], 2) if totals['impressions'] else 0
+    snapshot = {'provider': 'meta', 'ad_account_id': ad_account_id, 'range': range, 'period': period_label,
+                'start_date': start_date.isoformat(), 'end_date': end_date.isoformat(),
+                'currency': connection['currency_code'] or 'AED', 'synced_at': utcnow(), 'totals': totals,
+                'campaigns': rows, 'daily': sorted(daily, key=lambda item: item['date'])}
+    with connect() as db:
+        db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)
+                      ON CONFLICT(tenant_id,provider) DO UPDATE SET payload=excluded.payload,
+                      updated_at=excluded.updated_at''',
+                   (tenant_id, 'meta', json.dumps(snapshot, ensure_ascii=False), snapshot['synced_at']))
+        audit(db, user['user_id'], tenant_id, 'integration.meta_metrics_synced',
+              {'campaign_count': len(rows), 'range': range, 'ad_account_id': ad_account_id})
+    return snapshot
+
+
+# ------------------------------- Meta: connection and API health ----------------------------------------
+
+def meta_live_asset_health(tenant_id: str, access_token: str, connection: dict, state: dict) -> dict:
+    assets = {}
+    ad_account_id = connection.get('customer_id', '')
+    if ad_account_id:
+        try:
+            account = meta_graph('GET', ad_account_id, access_token, {'fields': 'id,account_status,currency'})
+            status = int(account.get('account_status') or 0)
+            assets['ad_account'] = {'available': status == 1,
+                                    'detail': META_ACCOUNT_STATUS.get(status, 'Unknown status')}
+        except MetaAPIError as exc:
+            if exc.kind in META_REAUTH_KINDS or exc.kind in ('cooling_down', 'rate_limited'):
+                raise
+            assets['ad_account'] = {'available': False, 'detail': exc.user_message()}
+    checks = (('page', state.get('page_id'), lambda: meta_pages(access_token),
+               lambda item: item['can_advertise']),
+              ('instagram_account', state.get('instagram_id'),
+               lambda: meta_instagram_accounts(access_token, ad_account_id), lambda item: True),
+              ('pixel', state.get('pixel_id'), lambda: meta_pixels(access_token, ad_account_id),
+               lambda item: item['available']))
+    for kind, selected, loader, usable in checks:
+        if not selected or not ad_account_id:
+            continue
+        try:
+            match = next((item for item in loader() if item['id'] == selected), None)
+            assets[kind] = {'available': bool(match and usable(match)),
+                            'detail': '' if match and usable(match) else 'No longer available to the connected Meta user'}
+        except MetaAPIError as exc:
+            if exc.kind in META_REAUTH_KINDS or exc.kind in ('cooling_down', 'rate_limited'):
+                raise
+            assets[kind] = {'available': False, 'detail': exc.user_message()}
+    return assets
+
+
+def meta_health_report(tenant_id: str, live: bool = False) -> dict:
+    with connect() as db:
+        connection = qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='meta'",
+                          (tenant_id,))
+        snapshot = qrow(db, "SELECT updated_at FROM provider_snapshots WHERE tenant_id=? AND provider='meta'",
+                        (tenant_id,))
+        open_requests = qrow(db, "SELECT COUNT(*) AS n FROM meta_change_requests WHERE tenant_id=? "
+                                 "AND status='awaiting_owner'", (tenant_id,))['n']
+    state = meta_state(tenant_id)
+    cooldown = meta_cooldown_until(tenant_id)
+    asset_health = {}
+    if (live and connection and connection['status'] != 'reauth_required' and not cooldown and
+            meta_configured()):
+        last = state.get('last_checked_at', '')
+        fresh = False
+        if last:
+            try:
+                fresh = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() < \
+                    META_HEALTH_LIVE_MIN_SECONDS
+            except ValueError:
+                fresh = False
+        if not fresh:
+            meta_set_scope(tenant_id)
+            try:
+                access_token = meta_access_token(connection)
+                summary = meta_debug_token(access_token)
+                now = utcnow()
+                with connect() as db:
+                    db.execute('''UPDATE meta_connection_state SET token_expires_at=?,data_access_expires_at=?,
+                                  granted_scopes=?,last_checked_at=?,updated_at=? WHERE tenant_id=?''',
+                               (summary['expires_at'], summary['data_access_expires_at'],
+                                json.dumps(summary['scopes']), now, now, tenant_id))
+                problem = meta_token_problem(summary)
+                if problem:
+                    meta_record_error(tenant_id, MetaAPIError(problem))
+                else:
+                    asset_health = meta_live_asset_health(tenant_id, access_token, connection, state)
+            except MetaAPIError as exc:
+                meta_record_error(tenant_id, exc)
+            except HTTPException:
+                pass
+            with connect() as db:
+                connection = qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='meta'",
+                                  (tenant_id,))
+            state = meta_state(tenant_id)
+            cooldown = meta_cooldown_until(tenant_id)
+    try:
+        scopes = json.loads(state.get('granted_scopes') or '[]')
+    except ValueError:
+        scopes = []
+    expires = state.get('token_expires_at', '')
+    days_left = None
+    if expires and expires != 'never':
+        try:
+            days_left = (datetime.fromisoformat(expires) - datetime.now(timezone.utc)).days
+        except ValueError:
+            days_left = None
+    missing = meta_missing_scopes(scopes) if connection and scopes else []
+    selected = {'ad_account': {'id': connection['customer_id'] if connection else '',
+                               'name': connection['account_name'] if connection else ''},
+                'page': {'id': state.get('page_id', ''), 'name': state.get('page_name', '')},
+                'instagram_account': {'id': state.get('instagram_id', ''), 'name': state.get('instagram_username', '')},
+                'pixel': {'id': state.get('pixel_id', ''), 'name': state.get('pixel_name', '')}}
+    for kind, item in selected.items():
+        item.update(asset_health.get(kind, {'available': None, 'detail': ''}) if item['id'] else
+                    {'available': None, 'detail': 'Not selected'})
+    if not meta_configured():
+        overall = 'not_configured'
+    elif not connection:
+        overall = 'not_connected'
+    elif connection['status'] == 'reauth_required' or (days_left is not None and days_left < 0):
+        overall = 'reauth_required'
+    elif cooldown:
+        overall = 'cooling_down'
+    elif (missing or not connection['customer_id'] or (days_left is not None and days_left <= 7) or
+          any(item['available'] is False for item in selected.values())):
+        overall = 'attention'
+    else:
+        overall = 'healthy'
+    return {'overall': overall, 'graph_version': META_GRAPH_VERSION,
+            'app': {'configured': meta_configured(), 'missing_settings': meta_missing_configuration(),
+                    'app_id': META_APP_ID, 'redirect_uri': meta_redirect_uri() if PUBLIC_ORIGIN else '',
+                    'login_configuration_set': bool(META_LOGIN_CONFIG_ID)},
+            'connection': {'status': connection['status'] if connection else 'not_connected',
+                           'connected_at': connection['connected_at'] if connection else ''},
+            'token': {'expires_at': expires, 'days_left': days_left, 'never_expires': expires == 'never',
+                      'data_access_expires_at': state.get('data_access_expires_at', ''),
+                      'last_checked_at': state.get('last_checked_at', '')},
+            'permissions': {'required': list(META_REQUIRED_SCOPES), 'optional': list(META_OPTIONAL_SCOPES),
+                            'granted': scopes, 'missing_required': missing},
+            'assets': selected, 'cooldown_until': cooldown,
+            'last_sync_at': snapshot['updated_at'] if snapshot else '',
+            'last_error': {'kind': state.get('last_error_kind', ''), 'message': state.get('last_error', ''),
+                           'at': state.get('last_error_at', '')},
+            'awaiting_owner_requests': open_requests}
+
+
+@app.get('/api/workspaces/{tenant_id}/integrations/meta/health')
+def meta_health(tenant_id: str, live: bool = False, user=Depends(tenant_member)):
+    return meta_health_report(tenant_id, live)
+
+
+def meta_workspace_summary(tenant_id: str, connection: dict | None, snapshot_row: dict | None) -> dict:
+    state = meta_state(tenant_id)
+    with connect() as db:
+        requests = qrows(db, '''SELECT r.*,u.email AS requested_by_email,d.email AS decided_by_email
+                                FROM meta_change_requests r LEFT JOIN users u ON u.id=r.requested_by
+                                LEFT JOIN users d ON d.id=r.decided_by
+                                WHERE r.tenant_id=? ORDER BY r.created_at DESC LIMIT 30''', (tenant_id,))
+    metrics = None
+    if snapshot_row and connection and connection.get('customer_id'):
+        try:
+            payload = json.loads(snapshot_row['payload'])
+            metrics = payload if payload.get('ad_account_id') == connection['customer_id'] else None
+        except (TypeError, ValueError):
+            metrics = None
+    try:
+        scopes = json.loads(state.get('granted_scopes') or '[]')
+    except ValueError:
+        scopes = []
+    return {'configured': meta_configured(), 'graph_version': META_GRAPH_VERSION,
+            'assets': {'page_id': state.get('page_id', ''), 'page_name': state.get('page_name', ''),
+                       'instagram_account_id': state.get('instagram_id', ''),
+                       'instagram_username': state.get('instagram_username', ''),
+                       'pixel_id': state.get('pixel_id', ''), 'pixel_name': state.get('pixel_name', '')},
+            'token_expires_at': state.get('token_expires_at', ''),
+            'granted_scopes': scopes, 'missing_scopes': meta_missing_scopes(scopes) if connection and scopes else [],
+            'last_error_kind': state.get('last_error_kind', ''), 'last_error': state.get('last_error', ''),
+            'last_error_at': state.get('last_error_at', ''), 'cooldown_until': meta_cooldown_until(tenant_id),
+            'change_requests': [meta_request_public(row) for row in requests], 'metrics': metrics}
+
+
+# ------------------------------- Meta: Seed validation + owner approval ---------------------------------
+
+def meta_request_public(row: dict) -> dict:
+    def loads(value, default):
+        try:
+            return json.loads(value) if value else default
+        except (TypeError, ValueError):
+            return default
+    return {'id': row['id'], 'campaign_id': row['campaign_id'], 'action': row['action'],
+            'target_id': row['target_id'], 'status': row['status'], 'payload': loads(row['payload'], {}),
+            'seed_report': loads(row['seed_report'], {}), 'result': loads(row['result'], {}),
+            'last_error': row['last_error'], 'requested_by': row.get('requested_by_email', ''),
+            'decided_by': row.get('decided_by_email', ''), 'decided_at': row['decided_at'],
+            'created_at': row['created_at'], 'updated_at': row['updated_at']}
+
+
+def meta_safe_fils(value: str) -> int | None:
+    try:
+        return fils(value)
+    except HTTPException:
+        return None
+
+
+def meta_https(url: str) -> bool:
+    parsed = urlparse(url or '')
+    return parsed.scheme == 'https' and bool(parsed.hostname) and ' ' not in (url or '')
+
+
+def meta_publish_request_data(publish: MetaPublishBody, campaign: dict, connection: dict, state: dict) -> dict:
+    data = publish.model_dump()
+    data['final_url'] = publish.final_url.strip() or campaign['landing_url']
+    data['assets'] = {'ad_account_id': connection.get('customer_id', ''), 'page_id': state.get('page_id', ''),
+                      'instagram_account_id': state.get('instagram_id', ''), 'pixel_id': state.get('pixel_id', '')}
+    return data
+
+
+def meta_request_hash(data: dict) -> str:
+    return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def meta_seed_validate(tenant_id: str, body: MetaChangeRequestBody, stage: str,
+                       prior_ai_review: dict | None = None) -> dict:
+    """Seed validation: strict deterministic rules plus an obligatory Seed AI review.
+
+    Every check must pass (100%) before the owner is asked, and the rules run again at approval.
+    """
+    checks: list[dict] = []
+
+    def check(key: str, label: str, passed, detail: str = '') -> bool:
+        checks.append({'key': key, 'label': label, 'passed': bool(passed), 'detail': '' if passed else detail})
+        return bool(passed)
+
+    lowers_risk = body.action == 'set_status' and body.status == 'PAUSED'
+    with connect() as db:
+        settings = qrow(db, 'SELECT * FROM tenant_settings WHERE tenant_id=?', (tenant_id,)) or {}
+        connection = qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='meta'",
+                          (tenant_id,))
+        campaign = (qrow(db, 'SELECT * FROM campaigns WHERE tenant_id=? AND id=?', (tenant_id, body.campaign_id))
+                    if body.campaign_id else None)
+        approved_total = qrow(db, "SELECT COALESCE(SUM(budget_fils),0) AS total FROM campaigns "
+                                  "WHERE tenant_id=? AND status='approved'", (tenant_id,))['total']
+        publication = (qrow(db, "SELECT * FROM provider_publications WHERE tenant_id=? AND campaign_id=?",
+                            (tenant_id, body.campaign_id)) if body.campaign_id else None)
+    state = meta_state(tenant_id)
+    stopped, paused = bool(settings.get('stopped')), bool(settings.get('tenant_paused'))
+    check('workspace_controls', 'Workspace is active and the emergency stop is off',
+          not paused and (lowers_risk or not stopped),
+          'The workspace is paused by the platform administrator' if paused else
+          'Emergency stop is active; resume automation first')
+    connected = bool(connection and connection['status'] == 'connected' and connection['customer_id'])
+    check('connection', 'Meta is connected and an ad account is selected', connected,
+          'Reconnect Meta Ads' if connection and connection['status'] == 'reauth_required' else
+          'Connect Meta Ads and choose the ad account')
+    ad_account_id = connection['customer_id'] if connection else ''
+    ownership = [('ad_account', ad_account_id)]
+    managed = meta_managed_campaigns(tenant_id)
+    required_scopes = META_REQUIRED_SCOPES
+
+    if body.action == 'publish':
+        publish = body.publish
+        campaign_ok = bool(campaign and campaign['provider'] == 'meta' and campaign['status'] in ('pending', 'approved'))
+        check('campaign', 'Campaign belongs to this workspace, targets Meta and is awaiting launch', campaign_ok,
+              'Campaign not found in this workspace' if not campaign else
+              'Only Meta campaigns can launch on Meta' if campaign['provider'] != 'meta' else
+              f"Campaign status is {campaign['status']}; submit it for approval first")
+        check('not_already_live', 'Campaign is not already live on Meta',
+              not (publication and publication['status'] in ('active', 'created')),
+              'This campaign was already launched on Meta')
+        daily = meta_safe_fils(publish.daily_budget_aed)
+        budget_problem = ''
+        if daily is None or daily <= 0:
+            budget_problem = 'Daily budget must be a positive AED amount'
+        elif campaign_ok:
+            if daily > campaign['budget_fils']:
+                budget_problem = 'Daily budget exceeds the approved campaign budget'
+            elif daily * publish.duration_days > campaign['budget_fils']:
+                budget_problem = 'Daily budget multiplied by duration exceeds the approved campaign budget'
+            elif campaign['status'] == 'pending':
+                cap = int(settings.get('budget_limit_fils') or 0)
+                if cap <= 0 or approved_total + campaign['budget_fils'] > cap:
+                    budget_problem = 'Approving this campaign would exceed the workspace budget cap'
+        elif not campaign_ok:
+            budget_problem = 'Budget cannot be verified without a valid campaign'
+        check('budget_upper_bounds', 'Budget stays within the approved campaign budget and workspace cap',
+              not budget_problem, budget_problem)
+        payload_problems = []
+        final_url = (publish.final_url.strip() or (campaign['landing_url'] if campaign else ''))
+        if not meta_https(final_url):
+            payload_problems.append('an HTTPS destination URL')
+        if not meta_https(publish.image_url):
+            payload_problems.append('an HTTPS image URL')
+        if not publish.primary_text.strip() or not publish.headline.strip():
+            payload_problems.append('primary text and headline')
+        if not state.get('page_id'):
+            payload_problems.append('a selected Facebook Page')
+        if campaign and campaign['objective'] in ('bookings', 'leads') and not state.get('pixel_id'):
+            payload_problems.append('a selected Meta Pixel for conversion optimisation')
+        check('payload_complete', 'Launch payload is complete',
+              not payload_problems, 'Missing ' + ', '.join(payload_problems))
+        if publication and campaign and connection:
+            request_hash = meta_request_hash(meta_publish_request_data(publish, campaign, connection, state))
+            check('single_publication', 'No different launch already exists for this campaign',
+                  publication['request_hash'] == request_hash or publication['provider'] != 'meta',
+                  'This campaign already has a different Meta launch; create a new campaign instead')
+        ownership += [('page', state.get('page_id', '')), ('instagram_account', state.get('instagram_id', '')),
+                      ('pixel', state.get('pixel_id', ''))]
+    else:
+        required_scopes = ('ads_read', 'ads_management')
+        target = managed.get(body.target_id)
+        if body.action == 'set_budget' or body.status == 'ACTIVE':
+            check('managed_campaign', 'Campaign was launched by Adswise for this workspace', target,
+                  'Only campaigns launched by Adswise for this workspace can be enabled or re-budgeted here')
+        if body.action == 'set_budget':
+            daily = meta_safe_fils(body.daily_budget_aed)
+            budget_problem = ''
+            if daily is None or daily <= 0:
+                budget_problem = 'Daily budget must be a positive AED amount'
+            elif target:
+                with connect() as db:
+                    internal = qrow(db, 'SELECT budget_fils FROM campaigns WHERE tenant_id=? AND id=?',
+                                    (tenant_id, target['campaign_id']))
+                try:
+                    duration = int(json.loads(target['request_payload']).get('duration_days') or 1)
+                except (TypeError, ValueError):
+                    duration = 1
+                if not internal or daily * duration > internal['budget_fils']:
+                    budget_problem = 'New daily budget multiplied by duration exceeds the approved campaign budget'
+            check('budget_upper_bounds', 'New budget stays within the approved campaign budget',
+                  not budget_problem, budget_problem)
+    owned = [kind for kind, resource_id in ownership if resource_id and not meta_owned_binding(tenant_id, kind, resource_id)]
+    check('asset_ownership', 'Every Meta asset is bound to this workspace only', not owned,
+          'Not exclusively bound to this workspace: ' + ', '.join(owned))
+
+    if connected and meta_configured():
+        meta_set_scope(tenant_id)
+        try:
+            access_token = meta_access_token(connection)
+            summary = meta_debug_token(access_token)
+            problem = meta_token_problem(summary)
+            check('token_valid', 'Meta token is valid for this app and not expired', not problem,
+                  META_ERROR_MESSAGES.get(problem, ''))
+            missing = [scope for scope in required_scopes if scope not in summary['scopes']]
+            check('permissions', 'Required Meta permissions are granted', not missing,
+                  'Missing permissions: ' + ', '.join(missing))
+            if not problem:
+                account = meta_graph('GET', ad_account_id, access_token, {'fields': 'id,account_status,currency'})
+                status = int(account.get('account_status') or 0)
+                currency = account.get('currency', '')
+                needs_aed = not lowers_risk
+                check('ad_account_live', 'Ad account is accessible, active and billed in AED',
+                      status == 1 and (currency == 'AED' or not needs_aed),
+                      f"Ad account is {META_ACCOUNT_STATUS.get(status, 'unavailable')}" if status != 1 else
+                      'Connected Meta ad account currency must be AED')
+                if body.action == 'publish':
+                    problems = []
+                    if state.get('page_id'):
+                        page = next((item for item in meta_pages(access_token) if item['id'] == state['page_id']), None)
+                        if not page or not page['can_advertise']:
+                            problems.append('Facebook Page')
+                    if state.get('instagram_id') and not any(
+                            item['id'] == state['instagram_id']
+                            for item in meta_instagram_accounts(access_token, ad_account_id)):
+                        problems.append('Instagram account')
+                    if state.get('pixel_id') and not any(
+                            item['id'] == state['pixel_id'] and item['available']
+                            for item in meta_pixels(access_token, ad_account_id)):
+                        problems.append('Pixel')
+                    check('assets_live', "Page, Instagram account and Pixel are accessible to this workspace's Meta user",
+                          not problems, 'No longer accessible: ' + ', '.join(problems))
+                else:
+                    remote = meta_graph('GET', body.target_id, access_token, {'fields': 'id,account_id,effective_status'})
+                    check('target_in_account', "Campaign belongs to this workspace's selected ad account",
+                          meta_account_id(remote.get('account_id')) == ad_account_id,
+                          'This campaign is not in the ad account selected for this workspace')
+        except MetaAPIError as exc:
+            meta_record_error(tenant_id, exc)
+            check('meta_live_checks', 'Live verification with Meta completed', False, exc.user_message())
+        except HTTPException as exc:
+            check('meta_live_checks', 'Live verification with Meta completed', False, str(exc.detail))
+    else:
+        check('token_valid', 'Meta token is valid for this app and not expired', False,
+              'Meta is not connected or the Meta app is not configured')
+    if body.action in ('publish', 'set_budget') or body.status == 'ACTIVE':
+        if not all(item['passed'] for item in checks):
+            check('seed_ai_review', 'Seed AI review approves the change', False,
+                  'Not run: fix the failed rule checks first')
+        elif prior_ai_review and prior_ai_review.get('passed'):
+            checks.append({**prior_ai_review, 'reused_from_request': True})
+        else:
+            checks.append(meta_seed_ai_review(tenant_id, body, campaign))
+    return {'engine': META_SEED_ENGINE, 'stage': stage, 'passed': all(item['passed'] for item in checks),
+            'checked_at': utcnow(), 'checks': checks}
+
+
+def meta_seed_ai_review(tenant_id: str, body: MetaChangeRequestBody, campaign: dict | None) -> dict:
+    """Fail closed: if Seed is unavailable, paused or unsure, the change does not reach the owner."""
+    result = {'key': 'seed_ai_review', 'label': 'Seed AI review approves the change', 'passed': False,
+              'detail': '', 'model': ARK_MODEL}
+    with connect() as db:
+        settings = qrow(db, 'SELECT ai_paused FROM tenant_settings WHERE tenant_id=?', (tenant_id,)) or {}
+        ai_paused = platform_flag(db, 'global_ai_paused') or bool(settings.get('ai_paused'))
+        spec_row = (qrow(db, 'SELECT payload FROM campaign_specs WHERE tenant_id=? AND campaign_id=?',
+                         (tenant_id, body.campaign_id)) if body.campaign_id else None)
+    if ai_paused:
+        return {**result, 'detail': 'AI is paused by the platform administrator, so Seed cannot validate changes'}
+    if not seed_configured():
+        return {**result, 'detail': 'Seed is not configured on the server (ARK_API_KEY, ARK_BASE_URL, ARK_MODEL)'}
+    review = {'business_type': 'spa and wellness', 'action': body.action}
+    if body.action == 'publish' and campaign:
+        spec = json.loads(spec_row['payload']) if spec_row else {}
+        publish = body.publish
+        review.update({
+            'campaign': {'name': campaign['name'], 'service': campaign['service'], 'objective': campaign['objective'],
+                         'approved_budget_aed': f"{Decimal(campaign['budget_fils']) / 100:.2f}"},
+            'budget': {'daily_aed': publish.daily_budget_aed, 'duration_days': publish.duration_days},
+            'audience': {'countries': publish.countries, 'age_min': spec.get('audience_age_min'),
+                         'age_max': spec.get('audience_age_max'), 'gender': spec.get('audience_gender')},
+            'creative': {'headline': publish.headline, 'primary_text': publish.primary_text,
+                         'call_to_action': publish.call_to_action,
+                         'destination_host': urlparse(publish.final_url or campaign['landing_url']).hostname,
+                         'conversion_event': publish.conversion_event}})
+    else:
+        target = meta_managed_campaigns(tenant_id).get(body.target_id) or {}
         with connect() as db:
-            audit(db, user['user_id'], saved['tenant_id'], 'integration.meta_authorized',
-                  {'account_id': account.get('id', ''), 'account_name': account.get('name', '')})
-        return integration_redirect('meta', 'connected')
-    except (httpx.HTTPError, ValueError, KeyError, InvalidToken):
-        return integration_redirect('meta', 'error')
+            internal = (qrow(db, 'SELECT name,service,objective,budget_fils FROM campaigns WHERE tenant_id=? AND id=?',
+                             (tenant_id, target.get('campaign_id', ''))) if target else None)
+        try:
+            launched = json.loads(target.get('request_payload') or '{}')
+        except (TypeError, ValueError):
+            launched = {}
+        review.update({'new_status': body.status or None, 'new_daily_budget_aed': body.daily_budget_aed or None,
+                       'launched_daily_budget_aed': launched.get('daily_budget_aed'),
+                       'duration_days': launched.get('duration_days'),
+                       'campaign': {'name': internal['name'], 'service': internal['service'],
+                                    'objective': internal['objective'],
+                                    'approved_budget_aed': f"{Decimal(internal['budget_fils']) / 100:.2f}"}
+                       if internal else None})
+    try:
+        verdict = seed_review_meta_change(review)
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        return {**result, 'detail': 'Seed rejected the API credentials or model access' if code in (401, 403, 404)
+                else 'Seed is rate limited; retry shortly' if code == 429 else 'Seed review could not be completed'}
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
+        return {**result, 'detail': 'Seed review could not be completed or returned an invalid answer'}
+    passed = verdict['decision'] == 'pass'
+    detail = '' if passed else '; '.join(verdict['issues'])[:600] or verdict['summary'] or 'Seed did not approve'
+    return {**result, 'passed': passed, 'detail': detail, 'summary': verdict['summary'], 'issues': verdict['issues']}
+
+
+def meta_notify_owners(tenant_id: str, request_id: str, description: str) -> None:
+    if not RESEND_API_KEY:
+        return
+    with connect() as db:
+        owners = qrows(db, "SELECT u.email FROM memberships m JOIN users u ON u.id=m.user_id "
+                           "WHERE m.tenant_id=? AND m.role='owner'", (tenant_id,))
+        tenant = qrow(db, 'SELECT name FROM tenants WHERE id=?', (tenant_id,))
+    link = f"{PUBLIC_ORIGIN or 'https://ads-wise.com'}/app?view=approvals&tenant={tenant_id}"
+    for owner in owners:
+        send_registration_email(owner['email'], 'Adswise: a live Meta change needs your approval',
+                                f"{description} for {tenant['name'] if tenant else 'your workspace'} passed Seed "
+                                f"validation and is waiting for your approval.\n\nReview it: {link}\n\n"
+                                f"Request {request_id}. Nothing goes live until you approve it.")
+
+
+def meta_describe(body: MetaChangeRequestBody) -> str:
+    if body.action == 'publish':
+        return 'A Meta campaign launch (ACTIVE)'
+    if body.action == 'set_status':
+        return f'A Meta campaign status change to {body.status}'
+    return f'A Meta daily budget change to AED {body.daily_budget_aed}'
+
+
+def meta_open_change_request(tenant_id: str, body: MetaChangeRequestBody, user: dict) -> dict:
+    meta_guard(tenant_id)
+    payload = body.model_dump()
+    payload_hash = meta_request_hash(payload)
+    with connect() as db:
+        existing = qrow(db, "SELECT * FROM meta_change_requests WHERE tenant_id=? AND payload_hash=? "
+                            "AND status IN ('awaiting_owner','executing')", (tenant_id, payload_hash))
+    if existing:
+        return {**meta_request_public(existing), 'duplicate': True}
+    report = meta_seed_validate(tenant_id, body, 'request')
+    status = 'awaiting_owner' if report['passed'] else 'seed_failed'
+    request_id, now = secrets.token_hex(12), utcnow()
+    with connect() as db:
+        db.execute('''INSERT INTO meta_change_requests(id,tenant_id,campaign_id,action,target_id,payload,payload_hash,
+                      status,seed_report,requested_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                   (request_id, tenant_id, body.campaign_id, body.action, body.target_id,
+                    json.dumps(payload, ensure_ascii=False), payload_hash, status, json.dumps(report),
+                    user['user_id'], now, now))
+        audit(db, user['user_id'], tenant_id, 'meta.change_requested', {
+            'request_id': request_id, 'action': body.action, 'campaign_id': body.campaign_id,
+            'target_id': body.target_id, 'seed_passed': report['passed'],
+            'failed_checks': [item['key'] for item in report['checks'] if not item['passed']]})
+        row = qrow(db, 'SELECT * FROM meta_change_requests WHERE id=?', (request_id,))
+    if report['passed']:
+        meta_notify_owners(tenant_id, request_id, meta_describe(body))
+    return meta_request_public(row)
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/meta/change-requests')
+def meta_create_change_request(tenant_id: str, body: MetaChangeRequestBody, user=Depends(tenant_editor)):
+    return meta_open_change_request(tenant_id, body, user)
+
+
+@app.get('/api/workspaces/{tenant_id}/integrations/meta/change-requests')
+def meta_list_change_requests(tenant_id: str, user=Depends(tenant_member)):
+    with connect() as db:
+        rows = qrows(db, '''SELECT r.*,u.email AS requested_by_email,d.email AS decided_by_email
+                            FROM meta_change_requests r LEFT JOIN users u ON u.id=r.requested_by
+                            LEFT JOIN users d ON d.id=r.decided_by
+                            WHERE r.tenant_id=? ORDER BY r.created_at DESC LIMIT 50''', (tenant_id,))
+    return {'requests': [meta_request_public(row) for row in rows]}
+
+
+def meta_finish_request(tenant_id: str, request_id: str, status: str, **fields) -> dict:
+    assignments = ['status=?', 'updated_at=?']
+    values = [status, utcnow()]
+    for key in ('seed_report', 'result', 'last_error'):
+        if key in fields:
+            assignments.append(f'{key}=?')
+            value = fields[key]
+            values.append(json.dumps(value) if isinstance(value, dict) else str(value)[:500])
+    with connect() as db:
+        db.execute(f"UPDATE meta_change_requests SET {','.join(assignments)} WHERE id=? AND tenant_id=?",
+                   (*values, request_id, tenant_id))
+        row = qrow(db, '''SELECT r.*,u.email AS requested_by_email,d.email AS decided_by_email
+                          FROM meta_change_requests r LEFT JOIN users u ON u.id=r.requested_by
+                          LEFT JOIN users d ON d.id=r.decided_by WHERE r.id=? AND r.tenant_id=?''',
+                   (request_id, tenant_id))
+    return meta_request_public(row)
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/meta/change-requests/{request_id}/approve')
+def meta_approve_change_request(tenant_id: str, request_id: str, user=Depends(tenant_writer)):
+    meta_guard(tenant_id)
+    now = utcnow()
+    with connect() as db:
+        claimed = db.execute("UPDATE meta_change_requests SET status='executing',decided_by=?,decided_at=?,"
+                             "updated_at=? WHERE id=? AND tenant_id=? AND status='awaiting_owner'",
+                             (user['user_id'], now, now, request_id, tenant_id)).rowcount
+        row = qrow(db, 'SELECT * FROM meta_change_requests WHERE id=? AND tenant_id=?', (request_id, tenant_id))
+    if not row:
+        raise HTTPException(404, 'Change request not found')
+    if claimed != 1:
+        raise HTTPException(409, f"This request is {row['status'].replace('_', ' ')}; only requests awaiting "
+                                 'owner approval can be approved')
+    try:
+        body = MetaChangeRequestBody.model_validate(json.loads(row['payload']))
+        try:
+            prior_ai = next((item for item in json.loads(row['seed_report'] or '{}').get('checks', [])
+                             if item.get('key') == 'seed_ai_review'), None)
+        except (TypeError, ValueError):
+            prior_ai = None
+        # The stored payload is identical, so Seed's verdict is reused; every rule check runs again live.
+        report = meta_seed_validate(tenant_id, body, 'approval', prior_ai)
+        if not report['passed']:
+            failed = [f"{item['label']}: {item['detail']}" for item in report['checks'] if not item['passed']]
+            meta_finish_request(tenant_id, request_id, 'seed_failed', seed_report=report,
+                                last_error='Seed validation failed at approval')
+            with connect() as db:
+                audit(db, user['user_id'], tenant_id, 'meta.change_blocked_by_seed',
+                      {'request_id': request_id, 'failed_checks': [item['key'] for item in report['checks']
+                                                                   if not item['passed']]})
+            raise HTTPException(409, 'Seed validation failed at approval, nothing was sent to Meta. ' +
+                                '; '.join(failed)[:900])
+        result = meta_execute_change(tenant_id, body, user)
+    except MetaAPIError as exc:
+        meta_finish_request(tenant_id, request_id, 'failed', last_error=exc.user_message())
+        with connect() as db:
+            audit(db, user['user_id'], tenant_id, 'meta.change_failed',
+                  {'request_id': request_id, 'error_kind': exc.kind})
+        raise meta_failure(tenant_id, exc, 'Meta could not apply the approved change') from exc
+    except HTTPException as exc:
+        if meta_request_status(tenant_id, request_id) == 'executing':
+            meta_finish_request(tenant_id, request_id, 'failed', last_error=str(exc.detail))
+        raise
+    except Exception:
+        meta_finish_request(tenant_id, request_id, 'failed', last_error='Unexpected error while applying the change')
+        raise
+    finished = meta_finish_request(tenant_id, request_id, 'executed', seed_report=report, result=result)
+    with connect() as db:
+        db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='meta'", (tenant_id,))
+        audit(db, user['user_id'], tenant_id, 'meta.change_executed_live', {
+            'request_id': request_id, 'action': body.action, 'campaign_id': body.campaign_id,
+            'target_id': body.target_id or result.get('campaign_id', ''), 'live_status': result.get('status', ''),
+            'approved_by_owner': True, 'seed_engine': META_SEED_ENGINE})
+    return finished
+
+
+def meta_request_status(tenant_id: str, request_id: str) -> str:
+    with connect() as db:
+        row = qrow(db, 'SELECT status FROM meta_change_requests WHERE id=? AND tenant_id=?', (request_id, tenant_id))
+    return row['status'] if row else ''
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/meta/change-requests/{request_id}/reject')
+def meta_reject_change_request(tenant_id: str, request_id: str, user=Depends(tenant_writer)):
+    now = utcnow()
+    with connect() as db:
+        changed = db.execute("UPDATE meta_change_requests SET status='rejected',decided_by=?,decided_at=?,"
+                             "updated_at=? WHERE id=? AND tenant_id=? AND status IN ('awaiting_owner','seed_failed')",
+                             (user['user_id'], now, now, request_id, tenant_id)).rowcount
+        row = qrow(db, 'SELECT status FROM meta_change_requests WHERE id=? AND tenant_id=?', (request_id, tenant_id))
+        if not row:
+            raise HTTPException(404, 'Change request not found')
+        if changed != 1:
+            raise HTTPException(409, f"This request is already {row['status'].replace('_', ' ')}")
+        audit(db, user['user_id'], tenant_id, 'meta.change_rejected', {'request_id': request_id})
+    return {'ok': True, 'status': 'rejected'}
+
+
+def meta_execute_change(tenant_id: str, body: MetaChangeRequestBody, user: dict) -> dict:
+    connection = meta_ready_connection(tenant_id)
+    access_token = meta_access_token(connection)
+    meta_set_scope(tenant_id)
+    if body.action == 'publish':
+        return meta_execute_publish(tenant_id, body.campaign_id, body.publish, user, access_token, connection)
+    managed = meta_managed_campaigns(tenant_id)
+    target = managed.get(body.target_id)
+    if body.action == 'set_status':
+        meta_update(body.target_id, access_token, {'status': body.status})
+        if target:
+            with connect() as db:
+                db.execute('UPDATE provider_publications SET status=?,updated_at=? WHERE id=? AND tenant_id=?',
+                           ('active' if body.status == 'ACTIVE' else 'paused', utcnow(), target['id'], tenant_id))
+        return {'campaign_id': body.target_id, 'status': body.status}
+    progress = dict(target['progress'])
+    daily_budget_fils = fils(body.daily_budget_aed)
+    meta_update(progress['adset_id'], access_token, {'daily_budget': str(daily_budget_fils)})
+    progress['daily_budget_fils'] = daily_budget_fils
+    save_meta_publication_progress(target['id'], progress, target['status'])
+    return {'campaign_id': body.target_id, 'adset_id': progress['adset_id'],
+            'daily_budget_aed': f'{Decimal(daily_budget_fils) / 100:.2f}', 'status': 'UPDATED'}
+
+
+def meta_execute_publish(tenant_id: str, campaign_id: str, publish: MetaPublishBody, user: dict,
+                         access_token: str, connection: dict) -> dict:
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        campaign = qrow(db, 'SELECT * FROM campaigns WHERE tenant_id=? AND id=?', (tenant_id, campaign_id))
+        if not campaign:
+            raise HTTPException(404, 'Campaign not found')
+        if campaign['status'] == 'pending':
+            # The owner's launch approval is also the internal approval; the workspace cap is re-checked here.
+            settings = qrow(db, 'SELECT * FROM tenant_settings WHERE tenant_id=?', (tenant_id,))
+            authorized = qrow(db, "SELECT COALESCE(SUM(budget_fils),0) AS total FROM campaigns "
+                                  "WHERE tenant_id=? AND status='approved'", (tenant_id,))['total']
+            if settings['budget_limit_fils'] == 0 or authorized + campaign['budget_fils'] > settings['budget_limit_fils']:
+                raise HTTPException(409, 'Proposed approved budgets exceed the configured workspace cap')
+            db.execute('UPDATE campaigns SET status=?,approver_id=?,updated_at=? WHERE id=? AND tenant_id=?',
+                       ('approved', user['user_id'], utcnow(), campaign_id, tenant_id))
+            audit(db, user['user_id'], tenant_id, 'campaign.approved_for_meta_launch', {'campaign_id': campaign_id})
+            campaign['status'] = 'approved'
+        db.commit()
+    if campaign['status'] != 'approved':
+        raise HTTPException(409, 'Approve the campaign before launching it on Meta')
+    with connect() as db:
+        spec_row = qrow(db, 'SELECT payload FROM campaign_specs WHERE tenant_id=? AND campaign_id=?',
+                        (tenant_id, campaign_id))
+        existing = qrow(db, 'SELECT * FROM provider_publications WHERE tenant_id=? AND campaign_id=?',
+                        (tenant_id, campaign_id))
+    state = meta_state(tenant_id)
+    request_data = meta_publish_request_data(publish, campaign, connection, state)
+    request_hash = meta_request_hash(request_data)
+    if existing and existing['request_hash'] != request_hash:
+        raise HTTPException(409, 'This campaign already has a different Meta publication request')
+    progress = {}
+    if existing and existing.get('remote_resource'):
+        try:
+            progress = json.loads(existing['remote_resource'])
+        except (json.JSONDecodeError, TypeError):
+            progress = {}
+    if existing and existing['status'] == 'active':
+        return {'published': True, 'idempotent': True, 'status': 'ACTIVE', **progress}
+    daily_budget_fils = fils(publish.daily_budget_aed)
+    final_url = request_data['final_url']
+    ad_account_id = connection['customer_id']
+    page_id, instagram_id, pixel_id = state.get('page_id', ''), state.get('instagram_id', ''), state.get('pixel_id', '')
+    remote_name = f"{campaign['name'][:190]} [Adswise {campaign_id[:8]}]"
+    publication_id = existing['id'] if existing else secrets.token_hex(12)
+    with connect() as db:
+        db.execute('''INSERT INTO provider_publications(
+                      id,tenant_id,campaign_id,provider,version,request_hash,request_payload,remote_name,status,
+                      created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                      ON CONFLICT(campaign_id) DO UPDATE SET status=excluded.status,last_error='',updated_at=excluded.updated_at''',
+                   (publication_id, tenant_id, campaign_id, 'meta', publish.version, request_hash,
+                    json.dumps(request_data, ensure_ascii=False), remote_name, 'creating', utcnow(), utcnow()))
+    spec = json.loads(spec_row['payload']) if spec_row else {}
+    targeting = {'geo_locations': {'countries': publish.countries},
+                 'age_min': int(spec.get('audience_age_min', 18)),
+                 'age_max': int(spec.get('audience_age_max', 65))}
+    if spec.get('audience_gender') == 'men':
+        targeting['genders'] = [1]
+    elif spec.get('audience_gender') == 'women':
+        targeting['genders'] = [2]
+    if publish.interest_ids:
+        targeting['flexible_spec'] = [{'interests': [{'id': value} for value in publish.interest_ids]}]
+    has_conversion = bool(pixel_id and campaign['objective'] in ('bookings', 'leads'))
+    if has_conversion:
+        objective = 'OUTCOME_SALES' if campaign['objective'] == 'bookings' else 'OUTCOME_LEADS'
+        optimization_goal = 'OFFSITE_CONVERSIONS'
+    elif campaign['objective'] == 'awareness':
+        objective, optimization_goal = 'OUTCOME_AWARENESS', 'REACH'
+    else:
+        objective, optimization_goal = 'OUTCOME_TRAFFIC', 'LINK_CLICKS'
+    try:
+        # Approved by the owner after Seed validation: objects are created live (ACTIVE). Delivery can only
+        # start once the ad exists, so a failure part-way never leaves a spending, half-built campaign.
+        if not progress.get('campaign_id'):
+            progress['campaign_id'] = meta_post(f'{ad_account_id}/campaigns', access_token, {
+                'name': remote_name, 'objective': objective, 'status': 'ACTIVE',
+                'special_ad_categories': '[]', 'is_adset_budget_sharing_enabled': 'false'},
+                'Meta rejected the campaign configuration')['id']
+            save_meta_publication_progress(publication_id, progress)
+        if not progress.get('adset_id'):
+            adset_payload = {
+                'name': f'{remote_name} — audience', 'campaign_id': progress['campaign_id'],
+                'daily_budget': str(daily_budget_fils), 'billing_event': 'IMPRESSIONS',
+                'optimization_goal': optimization_goal, 'bid_strategy': 'LOWEST_COST_WITHOUT_CAP',
+                'targeting': json.dumps(targeting),
+                'start_time': (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(timespec='seconds'),
+                'end_time': (datetime.now(timezone.utc) + timedelta(days=publish.duration_days)).isoformat(timespec='seconds'),
+                'status': 'ACTIVE'}
+            if has_conversion:
+                adset_payload['promoted_object'] = json.dumps({
+                    'pixel_id': pixel_id, 'custom_event_type': publish.conversion_event})
+            progress['adset_id'] = meta_post(f'{ad_account_id}/adsets', access_token, adset_payload,
+                                             'Meta could not create the ad set')['id']
+            save_meta_publication_progress(publication_id, progress)
+        if not progress.get('creative_id'):
+            link_data = {'image_url': publish.image_url, 'link': final_url, 'message': publish.primary_text,
+                         'name': publish.headline,
+                         'call_to_action': {'type': publish.call_to_action, 'value': {'link': final_url}}}
+            story_spec = {'page_id': page_id, 'link_data': link_data}
+            if instagram_id:
+                story_spec['instagram_user_id'] = instagram_id
+            progress['creative_id'] = meta_post(f'{ad_account_id}/adcreatives', access_token, {
+                'name': f'{remote_name} — creative', 'object_story_spec': json.dumps(story_spec)},
+                'Meta could not create the ad creative')['id']
+            save_meta_publication_progress(publication_id, progress)
+        if not progress.get('ad_id'):
+            progress['ad_id'] = meta_post(f'{ad_account_id}/ads', access_token, {
+                'name': f'{remote_name} — ad', 'adset_id': progress['adset_id'],
+                'creative': json.dumps({'creative_id': progress['creative_id']}), 'status': 'ACTIVE'},
+                'Meta could not create the ad')['id']
+            save_meta_publication_progress(publication_id, progress)
+    except MetaAPIError as exc:
+        with connect() as db:
+            db.execute('UPDATE provider_publications SET status=?,last_error=?,remote_resource=?,updated_at=? WHERE id=?',
+                       ('failed', exc.user_message()[:500], json.dumps(progress, separators=(',', ':')),
+                        utcnow(), publication_id))
+        raise
+    progress['daily_budget_fils'] = daily_budget_fils
+    with connect() as db:
+        db.execute("UPDATE provider_publications SET status='active',remote_resource=?,last_error='',updated_at=? WHERE id=?",
+                   (json.dumps(progress, separators=(',', ':')), utcnow(), publication_id))
+        audit(db, user['user_id'], tenant_id, 'campaign.published_meta_active', {
+            'campaign_id': campaign_id, 'meta_campaign_id': progress['campaign_id'],
+            'adset_id': progress['adset_id'], 'creative_id': progress['creative_id'], 'ad_id': progress['ad_id'],
+            'daily_budget_aed': publish.daily_budget_aed, 'duration_days': publish.duration_days,
+            'status': 'ACTIVE', 'version': publish.version})
+    return {'published': True, 'idempotent': False, 'status': 'ACTIVE', **progress}
+
+
+def meta_emergency_pause(tenant_id: str) -> dict:
+    """Emergency stop: pause every live campaign Adswise launched for this workspace (and only those)."""
+    with connect() as db:
+        live = qrows(db, "SELECT * FROM provider_publications WHERE tenant_id=? AND provider='meta' AND status='active'",
+                     (tenant_id,))
+    if not live:
+        return {'paused': 0, 'failed': 0}
+    try:
+        connection = meta_ready_connection(tenant_id)
+        access_token = meta_access_token(connection)
+    except HTTPException as exc:
+        return {'paused': 0, 'failed': len(live), 'error': str(exc.detail)}
+    meta_set_scope(tenant_id)
+    paused, failed = 0, 0
+    for publication in live:
+        try:
+            campaign_id = json.loads(publication['remote_resource'] or '{}').get('campaign_id', '')
+            if not campaign_id:
+                continue
+            meta_update(campaign_id, access_token, {'status': 'PAUSED'}, allow_during_cooldown=True)
+            with connect() as db:
+                db.execute("UPDATE provider_publications SET status='paused',updated_at=? WHERE id=?",
+                           (utcnow(), publication['id']))
+            paused += 1
+        except (MetaAPIError, TypeError, ValueError) as exc:
+            failed += 1
+            if isinstance(exc, MetaAPIError):
+                meta_record_error(tenant_id, exc)
+    with connect() as db:
+        db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='meta'", (tenant_id,))
+    return {'paused': paused, 'failed': failed}
 
 
 @app.post('/api/workspaces/{tenant_id}/integrations/tiktok/start')
@@ -2641,6 +4268,11 @@ def disconnect_provider(tenant_id: str, provider: Literal['meta', 'tiktok'], use
         db.execute('DELETE FROM provider_snapshots WHERE tenant_id=? AND provider=?', (tenant_id, provider))
         db.execute('DELETE FROM provider_resource_bindings WHERE tenant_id=? AND provider=?',
                    (tenant_id, provider))
+        if provider == 'meta':
+            # The encrypted token and verified asset selections are removed; nothing is reused later.
+            db.execute('DELETE FROM meta_connection_state WHERE tenant_id=?', (tenant_id,))
+            db.execute("UPDATE meta_change_requests SET status='cancelled',updated_at=? "
+                       "WHERE tenant_id=? AND status IN ('awaiting_owner','seed_failed')", (utcnow(), tenant_id))
         audit(db, user['user_id'], tenant_id, f'integration.{provider}_disconnected', {})
     return {'ok': True}
 
@@ -3100,140 +4732,12 @@ def publish_google_search_campaign(tenant_id: str, campaign_id: str, body: Googl
 
 
 @app.post('/api/workspaces/{tenant_id}/campaigns/{campaign_id}/publish/meta')
-def publish_meta_campaign(tenant_id: str, campaign_id: str, body: MetaPublishBody,
-                          user=Depends(tenant_writer)):
-    daily_budget_fils = fils(body.daily_budget_aed)
-    if daily_budget_fils <= 0:
-        raise HTTPException(422, 'Daily budget must be greater than zero')
-    with connect() as db:
-        campaign = qrow(db, 'SELECT * FROM campaigns WHERE tenant_id=? AND id=?', (tenant_id, campaign_id))
-        spec_row = qrow(db, 'SELECT payload FROM campaign_specs WHERE tenant_id=? AND campaign_id=?',
-                        (tenant_id, campaign_id))
-        settings = qrow(db, 'SELECT stopped FROM tenant_settings WHERE tenant_id=?', (tenant_id,))
-        existing = qrow(db, 'SELECT * FROM provider_publications WHERE tenant_id=? AND campaign_id=?',
-                        (tenant_id, campaign_id))
-    if not campaign:
+def publish_meta_campaign(tenant_id: str, campaign_id: str, body: MetaPublishBody, user=Depends(tenant_editor)):
+    """Compatibility route. A Meta launch is a Seed-validated request that only the owner can approve."""
+    if not re.fullmatch(r'[a-f0-9]{24}', campaign_id):
         raise HTTPException(404, 'Campaign not found')
-    if campaign['provider'] != 'meta':
-        raise HTTPException(409, 'Only Meta Ads drafts can use Meta publishing')
-    if campaign['status'] != 'approved':
-        raise HTTPException(409, 'Approve the campaign before publishing')
-    if settings and settings['stopped']:
-        raise HTTPException(409, 'Emergency stop is active')
-    if daily_budget_fils * body.duration_days > campaign['budget_fils']:
-        raise HTTPException(409, 'Daily budget multiplied by campaign duration exceeds the approved budget')
-    final_url = body.final_url.strip() or campaign['landing_url']
-    if not final_url:
-        raise HTTPException(422, 'An HTTPS destination URL is required')
-
-    connection = meta_connection(tenant_id)
-    if connection.get('currency_code') and connection['currency_code'] != 'AED':
-        raise HTTPException(409, 'Connected Meta ad account currency must be AED')
-    access_token = meta_access_token(connection)
-    ad_account_id = connection['customer_id']
-    if not ad_account_id.startswith('act_'):
-        ad_account_id = f'act_{ad_account_id}'
-
-    request_data = body.model_dump()
-    request_data['final_url'] = final_url
-    request_hash = hashlib.sha256(json.dumps(request_data, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    if existing and existing['request_hash'] != request_hash:
-        raise HTTPException(409, 'This campaign already has a different Meta publication request')
-    progress = {}
-    if existing and existing.get('remote_resource'):
-        try:
-            progress = json.loads(existing['remote_resource'])
-        except (json.JSONDecodeError, TypeError):
-            progress = {}
-    if existing and existing['status'] == 'created':
-        return {'published': True, 'idempotent': True, 'status': 'PAUSED', **progress}
-
-    remote_name = f"{campaign['name'][:190]} [SpaAds {campaign_id[:8]}]"
-    publication_id = existing['id'] if existing else secrets.token_hex(12)
-    with connect() as db:
-        db.execute('''INSERT INTO provider_publications(
-                      id,tenant_id,campaign_id,provider,version,request_hash,request_payload,remote_name,status,
-                      created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                      ON CONFLICT(campaign_id) DO UPDATE SET status=excluded.status,last_error='',updated_at=excluded.updated_at''',
-                   (publication_id, tenant_id, campaign_id, 'meta', body.version, request_hash,
-                    json.dumps(request_data, ensure_ascii=False), remote_name, 'creating', utcnow(), utcnow()))
-
-    spec = json.loads(spec_row['payload']) if spec_row else {}
-    targeting = {'geo_locations': {'countries': body.countries},
-                 'age_min': int(spec.get('audience_age_min', 18)),
-                 'age_max': int(spec.get('audience_age_max', 65))}
-    if spec.get('audience_gender') == 'men':
-        targeting['genders'] = [1]
-    elif spec.get('audience_gender') == 'women':
-        targeting['genders'] = [2]
-    if body.interest_ids:
-        targeting['flexible_spec'] = [{'interests': [{'id': value} for value in body.interest_ids]}]
-
-    has_conversion = bool(body.pixel_id and campaign['objective'] in ('bookings', 'leads'))
-    if has_conversion:
-        objective = 'OUTCOME_SALES' if campaign['objective'] == 'bookings' else 'OUTCOME_LEADS'
-        optimization_goal = 'OFFSITE_CONVERSIONS'
-    elif campaign['objective'] == 'awareness':
-        objective, optimization_goal = 'OUTCOME_AWARENESS', 'REACH'
-    else:
-        objective, optimization_goal = 'OUTCOME_TRAFFIC', 'LINK_CLICKS'
-
-    try:
-        if not progress.get('campaign_id'):
-            progress['campaign_id'] = meta_post(f'{ad_account_id}/campaigns', access_token, {
-                'name': remote_name, 'objective': objective, 'status': 'PAUSED',
-                'special_ad_categories': '[]'}, 'Meta rejected the campaign configuration')['id']
-            save_meta_publication_progress(publication_id, progress)
-
-        if not progress.get('adset_id'):
-            adset_payload = {
-                'name': f'{remote_name} — audience', 'campaign_id': progress['campaign_id'],
-                'daily_budget': str(daily_budget_fils), 'billing_event': 'IMPRESSIONS',
-                'optimization_goal': optimization_goal, 'targeting': json.dumps(targeting),
-                'start_time': (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(timespec='seconds'),
-                'end_time': (datetime.now(timezone.utc) + timedelta(days=body.duration_days)).isoformat(timespec='seconds'),
-                'status': 'PAUSED'}
-            if has_conversion:
-                adset_payload['promoted_object'] = json.dumps({
-                    'pixel_id': body.pixel_id, 'custom_event_type': body.conversion_event})
-            progress['adset_id'] = meta_post(f'{ad_account_id}/adsets', access_token, adset_payload,
-                                             'Meta could not create the ad set')['id']
-            save_meta_publication_progress(publication_id, progress)
-
-        if not progress.get('creative_id'):
-            link_data = {'image_url': body.image_url, 'link': final_url, 'message': body.primary_text,
-                         'name': body.headline,
-                         'call_to_action': {'type': body.call_to_action, 'value': {'link': final_url}}}
-            story_spec = {'page_id': body.page_id, 'link_data': link_data}
-            if body.instagram_actor_id:
-                story_spec['instagram_actor_id'] = body.instagram_actor_id
-            progress['creative_id'] = meta_post(f'{ad_account_id}/adcreatives', access_token, {
-                'name': f'{remote_name} — creative', 'object_story_spec': json.dumps(story_spec)},
-                'Meta could not create the ad creative')['id']
-            save_meta_publication_progress(publication_id, progress)
-
-        if not progress.get('ad_id'):
-            progress['ad_id'] = meta_post(f'{ad_account_id}/ads', access_token, {
-                'name': f'{remote_name} — ad', 'adset_id': progress['adset_id'],
-                'creative': json.dumps({'creative_id': progress['creative_id']}), 'status': 'PAUSED'},
-                'Meta could not create the ad')['id']
-            save_meta_publication_progress(publication_id, progress)
-    except HTTPException as exc:
-        with connect() as db:
-            db.execute('UPDATE provider_publications SET status=?,last_error=?,remote_resource=?,updated_at=? WHERE id=?',
-                       ('failed', str(exc.detail)[:500], json.dumps(progress, separators=(',', ':')),
-                        utcnow(), publication_id))
-        raise
-
-    with connect() as db:
-        db.execute("UPDATE provider_publications SET status='created',remote_resource=?,last_error='',updated_at=? WHERE id=?",
-                   (json.dumps(progress, separators=(',', ':')), utcnow(), publication_id))
-        audit(db, user['user_id'], tenant_id, 'campaign.published_meta_paused', {
-            'campaign_id': campaign_id, 'meta_campaign_id': progress['campaign_id'],
-            'adset_id': progress['adset_id'], 'creative_id': progress['creative_id'],
-            'ad_id': progress['ad_id'], 'daily_budget_aed': body.daily_budget_aed,
-            'duration_days': body.duration_days, 'status': 'PAUSED', 'version': body.version})
-    return {'published': True, 'idempotent': False, 'status': 'PAUSED', **progress}
+    return meta_open_change_request(tenant_id, MetaChangeRequestBody(
+        action='publish', campaign_id=campaign_id, publish=body), user)
 
 
 @app.post('/api/workspaces/{tenant_id}/campaigns')
@@ -3364,6 +4868,13 @@ def update_tracking(tenant_id: str, body: TrackingConfigBody, user=Depends(tenan
     domains = tracking_domains(body.allowed_domains)
     if body.heatmaps_enabled and not domains:
         raise HTTPException(422, 'Add at least one website domain before enabling heatmaps')
+    if body.meta_pixel_id:
+        if meta_bound_elsewhere(tenant_id, 'pixel', [body.meta_pixel_id]):
+            raise HTTPException(409, 'This Meta Pixel is already used by another workspace')
+        verified_pixel = meta_state(tenant_id).get('pixel_id', '')
+        if verified_pixel and verified_pixel != body.meta_pixel_id:
+            raise HTTPException(409, 'This workspace uses the Meta Pixel verified in Ad Accounts. '
+                                     'Change the Pixel there so it stays verified.')
     now = utcnow()
     with connect() as db:
         db.execute('''INSERT INTO tracking_configs(tenant_id,meta_pixel_id,tiktok_pixel_id,events,
@@ -3486,9 +4997,13 @@ def emergency_stop(tenant_id: str, user=Depends(tenant_writer)):
     with connect() as db:
         db.execute('BEGIN IMMEDIATE')
         db.execute('UPDATE tenant_settings SET stopped=1,mode=? WHERE tenant_id=?',('manual',tenant_id))
-        audit(db,user['user_id'],tenant_id,'automation.stopped',{'note':'Internal automated actions only. No external accounts connected.'})
+        audit(db,user['user_id'],tenant_id,'automation.stopped',{'note':'Planning, approvals and live Meta changes blocked.'})
         db.commit()
-    return {'stopped':True,'external_accounts_paused':False}
+    meta = meta_emergency_pause(tenant_id)
+    if meta['paused'] or meta['failed']:
+        with connect() as db:
+            audit(db, user['user_id'], tenant_id, 'meta.emergency_paused', meta)
+    return {'stopped':True,'external_accounts_paused':bool(meta['paused']),'meta':meta}
 
 
 @app.post('/api/workspaces/{tenant_id}/resume-automation')
@@ -3564,6 +5079,35 @@ async def seed_analyze_performance(dataset: dict) -> dict:
     content = response.json()['choices'][0]['message']['content']
     parsed = parse_model_json_object(content)
     return PerformanceAnalysisResult.model_validate(parsed).model_dump()
+
+
+class SeedMetaReview(BaseModel):
+    decision: Literal['pass', 'fail']
+    summary: str = Field(default='', max_length=800)
+    issues: list[str] = Field(default_factory=list, max_length=12)
+
+
+def seed_review_meta_change(review: dict) -> dict:
+    """Seed's pre-launch review of one already rule-checked Meta change (server-side key only)."""
+    system = (
+        'You are Seed, the strict pre-launch reviewer of an advertising control system for spa and wellness '
+        'businesses. Review only the supplied Meta change, which has already passed deterministic budget, '
+        'ownership, token and permission checks. Decide "fail" if the ad text is misleading, makes medical or '
+        'health claims or guarantees, asserts or implies personal attributes of the viewer, uses sexual or '
+        'adult wording, conflicts with the service or destination, if the budget looks like a data-entry error '
+        'relative to the approved budget, or if anything is missing, contradictory or unclear. Otherwise decide '
+        '"pass". Never invent facts or assume information that is not supplied. Return only one JSON object: '
+        '{"decision":"pass"|"fail","summary":"one or two sentences","issues":["specific issue", ...]}.')
+    response = httpx.post(f'{ARK_BASE_URL}/chat/completions', timeout=40,
+                          headers={'Authorization': f'Bearer {ARK_API_KEY}', 'Content-Type': 'application/json'},
+                          json={'model': ARK_MODEL, 'thinking': {'type': 'disabled'}, 'temperature': 0,
+                                'max_tokens': 700, 'messages': [
+                                    {'role': 'system', 'content': system},
+                                    {'role': 'user', 'content': 'Review this Meta change:\n' +
+                                     json.dumps(review, ensure_ascii=False, separators=(',', ':'))}]})
+    response.raise_for_status()
+    content = response.json()['choices'][0]['message']['content']
+    return SeedMetaReview.model_validate(parse_model_json_object(content)).model_dump()
 
 
 def parse_model_json_object(text: str) -> dict:

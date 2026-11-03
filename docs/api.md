@@ -50,7 +50,7 @@ All routes are defined in `app/main.py`. `{tenant_id}` is a workspace ID. Every 
 | POST | `/api/invitations/{invite_token}/accept` | Accept an invitation |
 | POST | `/api/workspaces/{tenant_id}/settings` | Update mode / approval cap |
 | POST | `/api/workspaces/{tenant_id}/tracking` | Save pixel IDs and tracking events |
-| POST | `/api/workspaces/{tenant_id}/emergency-stop` | Stop new approvals and planning |
+| POST | `/api/workspaces/{tenant_id}/emergency-stop` | Stop new approvals and planning, and pause every Meta campaign Adswise launched for this workspace |
 | POST | `/api/workspaces/{tenant_id}/resume-automation` | Lift the emergency stop |
 
 ## Campaigns
@@ -63,7 +63,7 @@ All routes are defined in `app/main.py`. `{tenant_id}` is a workspace ID. Every 
 | POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/reject` | Reject |
 | POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/archive` | Archive |
 | POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/publish/google-search` | Publish an approved campaign to Google Ads (created paused) |
-| POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/publish/meta` | Meta publishing (connection-gated) |
+| POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/publish/meta` | Compatibility route: creates a Seed-validated Meta launch request (same as `change-requests` with `action=publish`) |
 
 ## AI planner
 
@@ -97,12 +97,25 @@ All routes are defined in `app/main.py`. `{tenant_id}` is a workspace ID. Every 
 | POST | `/api/workspaces/{tenant_id}/integrations/google-growth/sitemaps` | Submit a sitemap to Search Console |
 | POST | `/api/workspaces/{tenant_id}/integrations/google-growth/disconnect` | Disconnect |
 
-## Meta and TikTok
+## Meta Ads
+
+| Method | Path | Who | Purpose |
+|---|---|---|---|
+| POST | `/api/workspaces/{tenant_id}/integrations/meta/start` | Owner | Begin Facebook Login for Business (max 5 per workspace per 15 min; refused during a Meta cool-down) |
+| GET | `/api/integrations/meta/callback` | Signed-in owner | Exchange the one-time code, verify the token with `debug_token`, store it encrypted; redirects with `meta=connected\|authorized\|error&reason=…` |
+| GET | `/api/workspaces/{tenant_id}/integrations/meta/assets` | Owner | Ad accounts, Pages, Instagram accounts and Pixels accessible to this workspace's Meta user (`?ad_account_id=act_…`) |
+| POST | `/api/workspaces/{tenant_id}/integrations/meta/assets` | Owner | Verify live and bind the ad account, Page, Instagram account and Pixel to this workspace only |
+| POST | `/api/workspaces/{tenant_id}/integrations/meta/sync` | Owner | Campaigns, spend, clicks, impressions and conversions (`range=yesterday\|this_week\|last_week\|last_30_days`, `force=true`) |
+| GET | `/api/workspaces/{tenant_id}/integrations/meta/health` | Member | Token expiry, permissions, asset availability, cool-down, last sync and last error (`live=true` re-checks with Meta, at most once a minute) |
+| POST | `/api/workspaces/{tenant_id}/integrations/meta/change-requests` | Manager/owner | Request a launch, status change or budget change. Seed validation runs immediately; only a 100% pass becomes `awaiting_owner` |
+| GET | `/api/workspaces/{tenant_id}/integrations/meta/change-requests` | Member | Recent requests with their Seed reports |
+| POST | `/api/workspaces/{tenant_id}/integrations/meta/change-requests/{request_id}/approve` | Owner | Re-run Seed rule checks, then execute live (launches are created ACTIVE) and audit |
+| POST | `/api/workspaces/{tenant_id}/integrations/meta/change-requests/{request_id}/reject` | Owner | Reject; nothing changes on Meta |
+
+## TikTok
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/workspaces/{tenant_id}/integrations/meta/start` | Begin Meta OAuth |
-| GET | `/api/integrations/meta/callback` | Meta OAuth callback |
 | POST | `/api/workspaces/{tenant_id}/integrations/tiktok/start` | Begin TikTok authorization |
 | GET | `/api/integrations/tiktok/callback` | TikTok callback |
 | POST | `/api/workspaces/{tenant_id}/integrations/{provider}/disconnect` | Disconnect Meta or TikTok |

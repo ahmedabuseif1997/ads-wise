@@ -63,7 +63,15 @@ If no provider is configured, the UI labels results "Template only (AI not confi
 |---|---|---|
 | `META_APP_ID`, `META_APP_SECRET` | Meta app credentials | Yes |
 | `META_LOGIN_CONFIG_ID` | Facebook Login for Business configuration | Yes |
-| `META_GRAPH_VERSION` | Graph API version, e.g. `v26.0` | Yes |
+| `META_GRAPH_VERSION` | Graph API version, e.g. `v26.0` (latest; released 29 Jul 2026) | Yes |
+
+## Seed (BytePlus ModelArk)
+
+| Variable | Purpose | On Vercel |
+|---|---|---|
+| `ARK_API_KEY` | Seed API key. Server-side only, never in code or the browser. Powers the Seed performance analyst and the obligatory Seed AI review of live Meta changes | Must be set |
+| `ARK_BASE_URL` | `https://ark.ap-southeast.bytepluses.com/api/v3` for a BytePlus ModelArk key | Must be set |
+| `ARK_MODEL` | `seed-2-0-pro-260328` (verified callable with the BytePlus key) | Must be set |
 
 ## TikTok
 
