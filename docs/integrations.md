@@ -11,8 +11,18 @@ MiniMax is preferred when `MINIMAX_API_KEY`, `MINIMAX_BASE_URL` and `MINIMAX_MOD
 - OAuth with `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`; refresh tokens stored encrypted.
 - Live metrics for Yesterday, This week, Last week and Last 30 days, using the Ads account's time zone.
 - Conversion-action setup and supervised pause/enable of live campaigns.
-- **Search campaign publishing** (approval-gated): daily budget, UAE/location and language targeting, phrase keywords, optional audience segments, responsive search ads, callouts and phone assets, created atomically and **paused**. Enabling is a separate confirmed action.
+- **Search campaign launches**: daily budget, UAE/location and language targeting, keywords, optional audience segments, responsive search ads, callouts, sitelinks and phone assets, created atomically.
+- **Live changes follow the same workflow as Meta.** A manager, owner or agent *requests* a launch, enable/pause or daily-budget change. Seed validation runs first: workspace controls; Google Ads connected and the account bound to this workspace only; `GOOGLE_ADS_DEVELOPER_TOKEN` configured; campaign ownership and status; budget within the approved campaign budget and workspace cap; payload complete; Google authorization valid; account enabled and billed in AED; target campaign in this workspace's account. The obligatory, fail-closed Seed AI review also runs. Only a 100% pass reaches the owner. Approval re-runs the rules, then executes the change **ENABLED**, after a validate-only dry run so a rejected configuration leaves nothing behind. Everything is audited, and the emergency stop pauses every Google or YouTube campaign Adswise launched. Enabling or re-budgeting is limited to campaigns Adswise launched; pausing works for any campaign in the workspace's account.
 - Duplicate protection: versioned payload, deterministic remote name, local publication record and remote reconciliation before retries.
+
+## YouTube (through Google Ads)
+
+YouTube ads use the workspace's Google Ads connection; there is no separate YouTube login. Google's API cannot create or change classic YouTube *Video* campaigns, so Adswise launches **Demand Gen campaigns limited to YouTube**: in-stream, in-feed and Shorts, with Gmail, Discover and Display turned off.
+
+- **Campaign channel:** "YouTube (Google Ads)". A campaign needs the link of a public or unlisted video on the business's YouTube channel; Adswise does not upload videos.
+- **Launch:** one atomic request creates the budget, the campaign (Maximize conversions, or Target CPA), an ad group with YouTube-only channel controls and location/language targeting, a YouTube video asset, a logo image asset and a video responsive ad (headlines, long headline, descriptions, business name).
+- **Extra Seed checks:** the video is public or unlisted (YouTube oEmbed) and the logo downloads as a PNG, JPEG or GIF under 5 MB. The logo is fetched only from public HTTPS addresses, without following redirects.
+- **Classic Video campaigns** created in the Google Ads UI still appear in Analytics, but Seed refuses API changes to them because Google does not allow them.
 
 ## Google Growth — Business Profile, Search Console, GA4 (the "SEO Console")
 
