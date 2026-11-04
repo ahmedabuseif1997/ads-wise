@@ -470,6 +470,18 @@ def fils(value) -> int:
         raise HTTPException(422, 'Enter valid AED amount (up to two decimal places)')
 
 
+def budget_cap_problem(cap_fils: int, approved_fils: int, campaign_fils: int) -> str:
+    """Why approving a campaign would break the workspace's Maximum approved budget, in words owners can act on."""
+    if cap_fils <= 0:
+        return ('Set a Maximum approved budget in Controls & Budgets first. It is AED 0.00, '
+                'so no campaign can be approved yet.')
+    if approved_fils + campaign_fils > cap_fils:
+        return (f'Approving this AED {Decimal(campaign_fils) / 100:.2f} campaign would exceed the Maximum approved '
+                f'budget (AED {Decimal(approved_fils) / 100:.2f} of AED {Decimal(cap_fils) / 100:.2f} already '
+                'approved). Raise it in Controls & Budgets.')
+    return ''
+
+
 def campaign_public(row: dict, publication: dict | None = None, spec: dict | None = None) -> dict:
     row = dict(row)
     row['budget_aed'] = f"{Decimal(row.pop('budget_fils')) / 100:.2f}"
@@ -3975,9 +3987,8 @@ def meta_seed_validate(tenant_id: str, body: MetaChangeRequestBody, stage: str,
             elif daily * publish.duration_days > campaign['budget_fils']:
                 budget_problem = 'Daily budget multiplied by duration exceeds the approved campaign budget'
             elif campaign['status'] == 'pending':
-                cap = int(settings.get('budget_limit_fils') or 0)
-                if cap <= 0 or approved_total + campaign['budget_fils'] > cap:
-                    budget_problem = 'Approving this campaign would exceed the workspace budget cap'
+                budget_problem = budget_cap_problem(int(settings.get('budget_limit_fils') or 0), approved_total,
+                                                    campaign['budget_fils'])
         elif not campaign_ok:
             budget_problem = 'Budget cannot be verified without a valid campaign'
         check('budget_upper_bounds', 'Budget stays within the approved campaign budget and workspace cap',
@@ -3995,9 +4006,10 @@ def meta_seed_validate(tenant_id: str, body: MetaChangeRequestBody, stage: str,
             if not publish.primary_text.strip() or not publish.headline.strip():
                 payload_problems.append('primary text and headline')
         if not state.get('page_id'):
-            payload_problems.append('a selected Facebook Page')
+            payload_problems.append('a selected Facebook Page (Ad Accounts → Choose Meta assets)')
         if campaign and campaign['objective'] in ('bookings', 'leads') and not state.get('pixel_id'):
-            payload_problems.append('a selected Meta Pixel for conversion optimisation')
+            payload_problems.append('a Meta Pixel, which bookings and leads campaigns need (choose one in Ad Accounts '
+                                    '→ Choose Meta assets, or use the "Website traffic" objective)')
         check('payload_complete', 'Launch payload is complete',
               not payload_problems, 'Missing ' + ', '.join(payload_problems))
         if publication and campaign and connection:
@@ -4367,8 +4379,9 @@ def meta_execute_publish(tenant_id: str, campaign_id: str, publish: MetaPublishB
             settings = qrow(db, 'SELECT * FROM tenant_settings WHERE tenant_id=?', (tenant_id,))
             authorized = qrow(db, "SELECT COALESCE(SUM(budget_fils),0) AS total FROM campaigns "
                                   "WHERE tenant_id=? AND status='approved'", (tenant_id,))['total']
-            if settings['budget_limit_fils'] == 0 or authorized + campaign['budget_fils'] > settings['budget_limit_fils']:
-                raise HTTPException(409, 'Proposed approved budgets exceed the configured workspace cap')
+            cap_problem = budget_cap_problem(settings['budget_limit_fils'], authorized, campaign['budget_fils'])
+            if cap_problem:
+                raise HTTPException(409, cap_problem)
             db.execute('UPDATE campaigns SET status=?,approver_id=?,updated_at=? WHERE id=? AND tenant_id=?',
                        ('approved', user['user_id'], utcnow(), campaign_id, tenant_id))
             audit(db, user['user_id'], tenant_id, 'campaign.approved_for_meta_launch', {'campaign_id': campaign_id})
@@ -5107,8 +5120,9 @@ def approve_campaign(tenant_id: str, campaign_id: str, user=Depends(tenant_write
             'SELECT COALESCE(SUM(budget_fils),0) AS total FROM campaigns WHERE tenant_id=? AND status=?',
             (tenant_id, 'approved'),
         )['total']
-        if settings['budget_limit_fils']==0 or authorized+c['budget_fils'] > settings['budget_limit_fils']:
-            raise HTTPException(409,'Proposed approved budgets exceed the configured workspace cap')
+        cap_problem = budget_cap_problem(settings['budget_limit_fils'], authorized, c['budget_fils'])
+        if cap_problem:
+            raise HTTPException(409, cap_problem)
         db.execute('UPDATE campaigns SET status=?,approver_id=?,updated_at=? WHERE id=? AND tenant_id=?',
                    ('approved',user['user_id'],utcnow(),campaign_id,tenant_id))
         audit(db,user['user_id'],tenant_id,'campaign.approved_internal_only',{'campaign_id':campaign_id,
