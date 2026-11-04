@@ -1130,3 +1130,38 @@ def test_content_security_policy_allows_only_meta_image_hosts(client):
     assert 'https://*.fbcdn.net' in img_src and 'https://*.fbsbx.com' in img_src
     script_src = next(part for part in policy.split(';') if part.strip().startswith('script-src'))
     assert 'fbcdn' not in script_src and 'fbsbx' not in script_src
+
+
+# ---------------------------------------------------------------- Launch blockers explain the fix ---------------
+
+def test_budget_cap_messages_tell_the_owner_what_to_change(client, fake):
+    tid, hdr = session(client)
+    cid = pending_campaign(client, tid, hdr)  # AED 200 campaign, workspace cap still AED 0.00
+    zero = client.post(f'/api/workspaces/{tid}/campaigns/{cid}/approve', headers=hdr, json={})
+    assert zero.status_code == 409 and 'Set a Maximum approved budget in Controls & Budgets' in zero.json()['detail']
+    client.post(f'/api/workspaces/{tid}/settings', headers=hdr,
+                json={'mode': 'supervised', 'budget_limit_aed': '150'}).raise_for_status()
+    low = client.post(f'/api/workspaces/{tid}/campaigns/{cid}/approve', headers=hdr, json={})
+    assert low.status_code == 409
+    assert low.json()['detail'] == ('Approving this AED 200.00 campaign would exceed the Maximum approved budget '
+                                    '(AED 0.00 of AED 150.00 already approved). Raise it in Controls & Budgets.')
+    connect_meta(client, tid, hdr, 'code-A')
+    select(client, tid, hdr, ad_account_id='act_111', page_id='501', pixel_id='70100001')
+    blocked = request_change(client, tid, hdr, {'action': 'publish', 'campaign_id': cid, 'publish': launch()})
+    detail = next(item['detail'] for item in blocked['seed_report']['checks'] if item['key'] == 'budget_upper_bounds')
+    assert 'Raise it in Controls & Budgets' in detail
+
+
+def test_missing_pixel_message_explains_how_to_fix_it(client, fake):
+    tid, hdr = session(client)
+    connect_meta(client, tid, hdr, 'code-A')
+    select(client, tid, hdr, ad_account_id='act_111', page_id='501')  # no Pixel
+    client.post(f'/api/workspaces/{tid}/settings', headers=hdr,
+                json={'mode': 'supervised', 'budget_limit_aed': '500'}).raise_for_status()
+    cid = pending_campaign(client, tid, hdr)  # bookings objective
+    blocked = request_change(client, tid, hdr, {'action': 'publish', 'campaign_id': cid, 'publish': launch()})
+    detail = next(item['detail'] for item in blocked['seed_report']['checks'] if item['key'] == 'payload_complete')
+    assert 'Choose Meta assets' in detail and 'Website traffic' in detail
+    traffic = pending_campaign(client, tid, hdr, objective='traffic')
+    allowed = request_change(client, tid, hdr, {'action': 'publish', 'campaign_id': traffic, 'publish': launch()})
+    assert allowed['status'] == 'awaiting_owner'
