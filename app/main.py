@@ -1875,6 +1875,11 @@ def data_deletion():
     return FileResponse(ROOT / 'static' / 'data-deletion.html')
 
 
+@app.get('/public-authority-data-requests')
+def public_authority_data_requests():
+    return FileResponse(ROOT / 'static' / 'public-authority-data-requests.html')
+
+
 @app.get('/assets/style.css')
 def css():
     return FileResponse(ROOT / 'static' / 'style.css', media_type='text/css')

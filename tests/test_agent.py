@@ -65,6 +65,7 @@ def test_health_and_static(client):
     assert 'aria-label="adswise"' in homepage.text
     assert 'href="/terms">Terms</a>' in homepage.text
     assert 'href="/data-deletion">Data Deletion</a>' in homepage.text
+    assert 'href="/public-authority-data-requests">Authority Requests</a>' in homepage.text
     assert 'data-theme="dark"' in homepage.text
     cinematic_js=client.get('/assets/cinematic.js')
     assert cinematic_js.status_code==200
@@ -78,6 +79,10 @@ def test_health_and_static(client):
     assert terms.status_code==200
     assert 'IMPZ, GAL Building 16, Unit 403, Dubai, United Arab Emirates' in terms.text
     assert client.get('/data-deletion').status_code==200
+    authority=client.get('/public-authority-data-requests')
+    assert authority.status_code==200
+    assert 'Public Authority Data Request Policy' in authority.text
+    assert 'info@ads-wise.com' in authority.text
     assert client.get('/assets/style.css').status_code==200
     assert client.get('/assets/analytics.css').status_code==200
     assert client.get('/assets/app.js').status_code==200
