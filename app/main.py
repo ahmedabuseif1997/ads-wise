@@ -1,6 +1,7 @@
 """Standalone Spa Ads Agent with tenant-scoped planning and supervised Google Ads controls."""
 from __future__ import annotations
 
+import base64
 import contextvars
 import hashlib
 import hmac
@@ -19,7 +20,7 @@ from contextlib import asynccontextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -316,6 +317,16 @@ def init_db():
           FOREIGN KEY(tenant_id) REFERENCES tenants(id));
         CREATE INDEX IF NOT EXISTS meta_change_requests_tenant
           ON meta_change_requests(tenant_id,created_at DESC);
+        CREATE TABLE IF NOT EXISTS google_change_requests(
+          id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, campaign_id TEXT NOT NULL DEFAULT '',
+          action TEXT NOT NULL, target_id TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL,
+          payload_hash TEXT NOT NULL, status TEXT NOT NULL, seed_report TEXT NOT NULL DEFAULT '{}',
+          requested_by TEXT NOT NULL, decided_by TEXT NOT NULL DEFAULT '', decided_at TEXT NOT NULL DEFAULT '',
+          result TEXT NOT NULL DEFAULT '{}', last_error TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          FOREIGN KEY(tenant_id) REFERENCES tenants(id));
+        CREATE INDEX IF NOT EXISTS google_change_requests_tenant
+          ON google_change_requests(tenant_id,created_at DESC);
         CREATE TABLE IF NOT EXISTS meta_rate_limits(
           scope TEXT PRIMARY KEY, blocked_until TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
           updated_at TEXT NOT NULL);
@@ -1316,7 +1327,7 @@ class DeveloperAgentRequestBody(BaseModel):
 
 class CampaignBody(BaseModel):
     name: str = Field(min_length=3, max_length=120)
-    provider: str = Field(pattern='^(meta|google|tiktok)$')
+    provider: str = Field(pattern='^(meta|google|youtube|tiktok)$')
     objective: str = Field(pattern='^(bookings|leads|traffic|awareness)$')
     service: str = Field(default='', max_length=120)
     brief: str = Field(default='', max_length=6000)
@@ -1374,11 +1385,11 @@ class AgentBody(BaseModel):
     service: str = Field(min_length=2, max_length=120)
     budget_aed: str = Field(max_length=20)
     objective: str = Field(pattern='^(bookings|leads|traffic|awareness)$')
-    provider: str = Field(pattern='^(meta|google|tiktok)$')
+    provider: str = Field(pattern='^(meta|google|youtube|tiktok)$')
 
 
 class CampaignRecommendationBody(BaseModel):
-    provider: str = Field(pattern='^(meta|google|tiktok)$')
+    provider: str = Field(pattern='^(meta|google|youtube|tiktok)$')
     objective: str = Field(pattern='^(bookings|leads|traffic|awareness)$')
     service: str = Field(min_length=2, max_length=120)
     budget_aed: str = Field(default='0', max_length=20)
@@ -1646,7 +1657,7 @@ class GoogleSearchPublishBody(BaseModel):
         cleaned = [value if isinstance(value, dict) else {'text': str(value).strip()} for value in values]
         if any(not value.get('text') or len(value['text']) > 30 for value in cleaned):
             raise ValueError('Each headline must be 1–30 characters')
-        if any(value.get('pinned_field', '').startswith('DESCRIPTION_') for value in cleaned):
+        if any((value.get('pinned_field') or '').startswith('DESCRIPTION_') for value in cleaned):
             raise ValueError('Headlines can only be pinned to headline positions')
         return cleaned
 
@@ -1656,7 +1667,7 @@ class GoogleSearchPublishBody(BaseModel):
         cleaned = [value if isinstance(value, dict) else {'text': str(value).strip()} for value in values]
         if any(not value.get('text') or len(value['text']) > 90 for value in cleaned):
             raise ValueError('Each description must be 1–90 characters')
-        if any(value.get('pinned_field', '').startswith('HEADLINE_') for value in cleaned):
+        if any((value.get('pinned_field') or '').startswith('HEADLINE_') for value in cleaned):
             raise ValueError('Descriptions can only be pinned to description positions')
         return cleaned
 
@@ -1706,6 +1717,122 @@ class GoogleSearchPublishBody(BaseModel):
         if '#' in value or any(char.isspace() for char in value):
             raise ValueError('Final URL suffix cannot contain spaces or fragments')
         return value
+
+
+YOUTUBE_VIDEO_ID = re.compile(r'[A-Za-z0-9_-]{11}')
+
+
+def youtube_video_id(value: str) -> str:
+    """The 11-character ID from a YouTube link (watch, youtu.be, shorts, embed, live) or a bare ID."""
+    value = (value or '').strip()
+    if YOUTUBE_VIDEO_ID.fullmatch(value):
+        return value
+    parsed = urlparse(value)
+    host, parts = (parsed.hostname or '').lower(), [part for part in parsed.path.split('/') if part]
+    candidate = ''
+    if parsed.scheme in ('https', 'http') and host == 'youtu.be' and parts:
+        candidate = parts[0]
+    elif parsed.scheme in ('https', 'http') and host in ('youtube.com', 'www.youtube.com', 'm.youtube.com'):
+        if parts == ['watch']:
+            candidate = parse_qs(parsed.query).get('v', [''])[0]
+        elif len(parts) >= 2 and parts[0] in ('shorts', 'embed', 'live'):
+            candidate = parts[1]
+    return candidate if YOUTUBE_VIDEO_ID.fullmatch(candidate) else ''
+
+
+class GoogleYouTubePublishBody(BaseModel):
+    """A YouTube launch, run as a Google Ads Demand Gen campaign limited to YouTube placements."""
+    version: Literal[1] = 1
+    daily_budget_aed: str = Field(max_length=20)
+    duration_days: int = Field(default=14, ge=1, le=90)
+    youtube_video_url: str = Field(min_length=11, max_length=300)
+    headlines: list[str] = Field(min_length=1, max_length=5)
+    long_headline: str = Field(min_length=1, max_length=90)
+    descriptions: list[str] = Field(min_length=1, max_length=5)
+    business_name: str = Field(min_length=1, max_length=25)
+    logo_image_url: str = Field(min_length=8, max_length=2000)
+    final_url: str = Field(default='', max_length=2000)
+    target_cpa_aed: str = Field(default='', max_length=20)
+    location_ids: list[str] = Field(default_factory=lambda: ['2784'], min_length=1, max_length=20)
+    language_ids: list[str] = Field(default_factory=lambda: ['1000', '1019'], min_length=1, max_length=10)
+    youtube_in_stream: bool = True
+    youtube_in_feed: bool = True
+    youtube_shorts: bool = True
+
+    @field_validator('headlines')
+    @classmethod
+    def youtube_headlines(cls, values):
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        if not cleaned or any(len(value) > 40 for value in cleaned):
+            raise ValueError('YouTube headlines must be 1 to 40 characters')
+        return cleaned
+
+    @field_validator('descriptions')
+    @classmethod
+    def youtube_descriptions(cls, values):
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        if not cleaned or any(len(value) > 90 for value in cleaned):
+            raise ValueError('YouTube descriptions must be 1 to 90 characters')
+        return cleaned
+
+    @field_validator('long_headline', 'business_name')
+    @classmethod
+    def youtube_text(cls, value):
+        if not value.strip():
+            raise ValueError('Text is required')
+        return value.strip()
+
+    @field_validator('youtube_video_url')
+    @classmethod
+    def youtube_video(cls, value):
+        if not youtube_video_id(value):
+            raise ValueError('Enter the link of a video on YouTube (youtube.com/watch?v=..., youtu.be/... or Shorts)')
+        return value.strip()
+
+    @field_validator('logo_image_url', 'final_url')
+    @classmethod
+    def youtube_urls(cls, value):
+        if value:
+            parsed = urlparse(value)
+            if parsed.scheme != 'https' or not parsed.hostname or ' ' in value:
+                raise ValueError('Logo and destination must be public HTTPS URLs')
+        return value
+
+    @field_validator('location_ids', 'language_ids')
+    @classmethod
+    def youtube_targets(cls, values):
+        cleaned = [str(value).strip() for value in values]
+        if any(not re.fullmatch(r'\d{1,12}', value) for value in cleaned) or len(set(cleaned)) != len(cleaned):
+            raise ValueError('Location and language IDs must be unique numbers')
+        return cleaned
+
+    @model_validator(mode='after')
+    def youtube_channels(self):
+        if not (self.youtube_in_stream or self.youtube_in_feed or self.youtube_shorts):
+            raise ValueError('Choose at least one YouTube placement')
+        return self
+
+
+class GoogleChangeRequestBody(BaseModel):
+    action: Literal['publish_search', 'publish_youtube', 'set_status', 'set_budget']
+    campaign_id: str = Field(default='', pattern=r'^[a-f0-9]{0,24}$')
+    target_id: str = Field(default='', pattern=r'^\d{0,20}$')
+    status: Literal['', 'ENABLED', 'PAUSED'] = ''
+    daily_budget_aed: str = Field(default='', max_length=20)
+    search: GoogleSearchPublishBody | None = None
+    youtube: GoogleYouTubePublishBody | None = None
+
+    @model_validator(mode='after')
+    def complete_for_action(self):
+        if self.action == 'publish_search' and not (self.campaign_id and self.search):
+            raise ValueError('A Google Search launch needs the campaign and its ads')
+        if self.action == 'publish_youtube' and not (self.campaign_id and self.youtube):
+            raise ValueError('A YouTube launch needs the campaign and its video ad')
+        if self.action == 'set_status' and not (self.target_id and self.status):
+            raise ValueError('A status change needs the Google Ads campaign ID and the new status')
+        if self.action == 'set_budget' and not (self.target_id and self.daily_budget_aed):
+            raise ValueError('A budget change needs the Google Ads campaign ID and the new daily budget')
+        return self
 
 
 class MetaPublishBody(BaseModel):
@@ -2217,6 +2344,7 @@ def super_admin_overview(user=Depends(super_admin_user)):
         provider_counts[connection['provider']] = provider_counts.get(connection['provider'], 0) + 1
     services = [
         {'key':'google','name':'Google Ads API','configured':google_configured(),
+         'developer_token_configured':bool(GOOGLE_ADS_DEVELOPER_TOKEN),
          'connected_tenants':provider_counts.get('google',0)},
         {'key':'meta','name':'Meta Marketing API','configured':meta_configured(),
          'connected_tenants':provider_counts.get('meta',0)},
@@ -2588,6 +2716,8 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
             'seed_analysis':{**latest_analysis, 'analysis':json.loads(latest_analysis['analysis'])}
                             if latest_analysis else None,
             'meta':meta_workspace_summary(tenant_id, meta_connection_row, meta_snapshot),
+            'google':{'change_requests':google_workspace_requests(tenant_id),
+                      'developer_token_configured':bool(GOOGLE_ADS_DEVELOPER_TOKEN)},
             'live_metrics_available':bool(google_snapshot), 'current_role':user['role'], 'members':members}
 
 
@@ -2714,6 +2844,8 @@ def google_disconnect(tenant_id: str, user=Depends(tenant_writer)):
         db.execute("DELETE FROM provider_connections WHERE tenant_id=? AND provider='google'", (tenant_id,))
         db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='google'", (tenant_id,))
         db.execute("DELETE FROM provider_resource_bindings WHERE tenant_id=? AND provider='google'", (tenant_id,))
+        db.execute("UPDATE google_change_requests SET status='cancelled',updated_at=? "
+                   "WHERE tenant_id=? AND status IN ('awaiting_owner','seed_failed')", (utcnow(), tenant_id))
         audit(db,user['user_id'],tenant_id,'integration.google_disconnected',{})
     return {'ok':True}
 
@@ -4234,7 +4366,8 @@ def meta_list_change_requests(tenant_id: str, user=Depends(tenant_member)):
     return {'requests': [meta_request_public(row) for row in rows]}
 
 
-def meta_finish_request(tenant_id: str, request_id: str, status: str, **fields) -> dict:
+def meta_finish_request(tenant_id: str, request_id: str, status: str, table: str = 'meta_change_requests',
+                        **fields) -> dict:
     assignments = ['status=?', 'updated_at=?']
     values = [status, utcnow()]
     for key in ('seed_report', 'result', 'last_error'):
@@ -4243,10 +4376,10 @@ def meta_finish_request(tenant_id: str, request_id: str, status: str, **fields) 
             value = fields[key]
             values.append(json.dumps(value) if isinstance(value, dict) else str(value)[:500])
     with connect() as db:
-        db.execute(f"UPDATE meta_change_requests SET {','.join(assignments)} WHERE id=? AND tenant_id=?",
+        db.execute(f"UPDATE {table} SET {','.join(assignments)} WHERE id=? AND tenant_id=?",
                    (*values, request_id, tenant_id))
-        row = qrow(db, '''SELECT r.*,u.email AS requested_by_email,d.email AS decided_by_email
-                          FROM meta_change_requests r LEFT JOIN users u ON u.id=r.requested_by
+        row = qrow(db, f'''SELECT r.*,u.email AS requested_by_email,d.email AS decided_by_email
+                          FROM {table} r LEFT JOIN users u ON u.id=r.requested_by
                           LEFT JOIN users d ON d.id=r.decided_by WHERE r.id=? AND r.tenant_id=?''',
                    (request_id, tenant_id))
     return meta_request_public(row)
@@ -4309,9 +4442,9 @@ def meta_approve_change_request(tenant_id: str, request_id: str, user=Depends(te
     return finished
 
 
-def meta_request_status(tenant_id: str, request_id: str) -> str:
+def meta_request_status(tenant_id: str, request_id: str, table: str = 'meta_change_requests') -> str:
     with connect() as db:
-        row = qrow(db, 'SELECT status FROM meta_change_requests WHERE id=? AND tenant_id=?', (request_id, tenant_id))
+        row = qrow(db, f'SELECT status FROM {table} WHERE id=? AND tenant_id=?', (request_id, tenant_id))
     return row['status'] if row else ''
 
 
@@ -4721,23 +4854,601 @@ def google_conversions_setup(tenant_id: str, user=Depends(tenant_writer)):
 
 @app.post('/api/workspaces/{tenant_id}/integrations/google/campaigns/{campaign_id}/status')
 def google_campaign_status(tenant_id: str, campaign_id: str, body: GoogleCampaignStatusBody,
-                           user=Depends(tenant_writer)):
+                           user=Depends(tenant_editor)):
+    """Compatibility route. A live status change is a Seed-validated request that only the owner can approve."""
     if not campaign_id.isdigit():
         raise HTTPException(422, 'Invalid Google Ads campaign ID')
+    return google_open_change_request(tenant_id, GoogleChangeRequestBody(
+        action='set_status', target_id=campaign_id, status=body.status), user)
+
+
+# ------------------------------- Google Ads + YouTube: Seed validation + owner approval -------------------------
+# Same workflow as Meta: a manager, owner or agent requests a launch or live change; Seed validation (strict rules
+# plus a fail-closed Seed AI review) must pass 100% before the owner is asked; the owner's approval re-runs the rules
+# live and executes ENABLED; everything is audited; the emergency stop pauses every campaign Adswise launched.
+
+GOOGLE_REQUESTS = 'google_change_requests'
+
+
+def google_publications(tenant_id: str) -> dict[str, dict]:
+    """Google Ads campaign ID -> this workspace's Adswise publication (never another workspace's)."""
     with connect() as db:
-        settings = qrow(db, 'SELECT stopped FROM tenant_settings WHERE tenant_id=?', (tenant_id,))
-    if body.status == 'ENABLED' and settings and settings['stopped']:
-        raise HTTPException(409, 'Emergency stop is active; resume automation before enabling campaigns')
+        rows = qrows(db, "SELECT * FROM provider_publications WHERE tenant_id=? AND provider='google'", (tenant_id,))
+    return {row['remote_resource'].rsplit('/', 1)[-1]: row for row in rows
+            if re.fullmatch(r'customers/\d+/campaigns/\d+', row['remote_resource'] or '')}
+
+
+def google_owned_account(tenant_id: str, customer_id: str) -> bool:
+    if not customer_id:
+        return False
+    with connect() as db:
+        rows = qrows(db, "SELECT tenant_id FROM provider_resource_bindings WHERE provider='google' "
+                         "AND resource_type='ad_account' AND resource_id=?", (customer_id,))
+        others = qrow(db, "SELECT COUNT(*) AS n FROM provider_connections WHERE provider='google' "
+                          "AND customer_id=? AND tenant_id<>?", (customer_id, tenant_id))['n']
+    return bool(rows) and all(row['tenant_id'] == tenant_id for row in rows) and not others
+
+
+def youtube_video_details(video_id: str) -> dict | None:
+    """Public or unlisted check through YouTube oEmbed (no credentials). None means private, removed or not embeddable."""
+    try:
+        response = httpx.get('https://www.youtube.com/oembed', timeout=10, params={
+            'url': f'https://www.youtube.com/watch?v={video_id}', 'format': 'json'})
+    except httpx.HTTPError as exc:
+        raise HTTPException(503, 'YouTube could not be reached to check the video') from exc
+    if response.status_code in (400, 401, 403, 404):
+        return None
+    if response.status_code != 200:
+        raise HTTPException(503, 'YouTube could not be reached to check the video')
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    return {'title': str(data.get('title', ''))[:300], 'channel': str(data.get('author_name', ''))[:200]}
+
+
+def fetch_logo_image(url: str) -> dict:
+    """Download the advertiser's logo for a Google image asset: public HTTPS only, no redirects, image, max 5 MB."""
+    if not safe_public_url(url):
+        raise HTTPException(422, 'The logo must be a public HTTPS image URL')
+    try:
+        response = httpx.get(url, timeout=12, follow_redirects=False)
+    except httpx.HTTPError as exc:
+        raise HTTPException(422, 'The logo image could not be downloaded') from exc
+    mime = response.headers.get('content-type', '').split(';')[0].strip().lower()
+    if response.status_code != 200 or mime not in ('image/png', 'image/jpeg', 'image/gif'):
+        raise HTTPException(422, 'The logo URL must return a PNG, JPEG or GIF image')
+    if not response.content or len(response.content) > 5_120_000:
+        raise HTTPException(422, 'The logo image must be smaller than 5 MB')
+    return {'data': base64.b64encode(response.content).decode(), 'mime_type': mime}
+
+
+def google_publish_body(body: GoogleChangeRequestBody):
+    return body.search if body.action == 'publish_search' else body.youtube
+
+
+def google_publish_request_data(body: GoogleChangeRequestBody, campaign: dict) -> dict:
+    publish = google_publish_body(body)
+    data = publish.model_dump()
+    data['final_url'] = publish.final_url.strip() or campaign['landing_url']
+    data['kind'] = body.action
+    return data
+
+
+def google_campaign_query(connection: dict, access_token: str, campaign_id: str, fields: str) -> dict:
+    batches = google_post(connection, access_token, 'googleAds:searchStream', {
+        'query': f'SELECT {fields} FROM campaign WHERE campaign.id = {int(campaign_id)} LIMIT 1'},
+        'Google Ads campaign could not be read')
+    return next((row.get('campaign', {}) for batch in batches for row in batch.get('results', [])), {})
+
+
+def google_seed_validate(tenant_id: str, body: GoogleChangeRequestBody, stage: str,
+                         prior_ai_review: dict | None = None) -> dict:
+    """Seed validation for Google Search and YouTube: strict rules plus the obligatory, fail-closed Seed AI review."""
+    checks: list[dict] = []
+
+    def check(key: str, label: str, passed, detail: str = '') -> bool:
+        checks.append({'key': key, 'label': label, 'passed': bool(passed), 'detail': '' if passed else detail})
+        return bool(passed)
+
+    lowers_risk = body.action == 'set_status' and body.status == 'PAUSED'
+    with connect() as db:
+        settings = qrow(db, 'SELECT * FROM tenant_settings WHERE tenant_id=?', (tenant_id,)) or {}
+        connection = qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='google'",
+                          (tenant_id,))
+        campaign = (qrow(db, 'SELECT * FROM campaigns WHERE tenant_id=? AND id=?', (tenant_id, body.campaign_id))
+                    if body.campaign_id else None)
+        approved_total = qrow(db, "SELECT COALESCE(SUM(budget_fils),0) AS total FROM campaigns "
+                                  "WHERE tenant_id=? AND status='approved'", (tenant_id,))['total']
+        publication = (qrow(db, 'SELECT * FROM provider_publications WHERE tenant_id=? AND campaign_id=?',
+                            (tenant_id, body.campaign_id)) if body.campaign_id else None)
+    stopped, paused = bool(settings.get('stopped')), bool(settings.get('tenant_paused'))
+    check('workspace_controls', 'Workspace is active and the emergency stop is off',
+          not paused and (lowers_risk or not stopped),
+          'The workspace is paused by the platform administrator' if paused else
+          'Emergency stop is active; resume automation first')
+    connected = bool(connection and connection['status'] == 'connected' and connection['customer_id'])
+    check('connection', 'Google Ads is connected and an account is selected', connected,
+          'Connect Google Ads and choose the account for this workspace')
+    check('developer_token', 'Google Ads developer token is configured on the server', GOOGLE_ADS_DEVELOPER_TOKEN,
+          'Set GOOGLE_ADS_DEVELOPER_TOKEN in Vercel (Basic or Standard access in Google Ads API Center)')
+    customer_id = connection['customer_id'] if connection else ''
+    video = None
+    if body.action in ('publish_search', 'publish_youtube'):
+        publish = google_publish_body(body)
+        expected, label = ('google', 'Google Search') if body.action == 'publish_search' else ('youtube', 'YouTube')
+        campaign_ok = bool(campaign and campaign['provider'] == expected and campaign['status'] in ('pending', 'approved'))
+        check('campaign', f'Campaign belongs to this workspace, targets {label} and is awaiting launch', campaign_ok,
+              'Campaign not found in this workspace' if not campaign else
+              f'This campaign is not a {label} campaign' if campaign['provider'] != expected else
+              f"Campaign status is {campaign['status']}; submit it for approval first")
+        check('not_already_live', 'Campaign is not already live on Google Ads',
+              not (publication and publication['status'] in ('active', 'created')),
+              'This campaign was already launched on Google Ads')
+        daily = meta_safe_fils(publish.daily_budget_aed)
+        budget_problem = ''
+        if daily is None or daily <= 0:
+            budget_problem = 'Daily budget must be a positive AED amount'
+        elif not campaign_ok:
+            budget_problem = 'Budget cannot be verified without a valid campaign'
+        elif daily > campaign['budget_fils']:
+            budget_problem = 'Daily budget exceeds the approved campaign budget'
+        elif daily * publish.duration_days > campaign['budget_fils']:
+            budget_problem = 'Daily budget multiplied by duration exceeds the approved campaign budget'
+        elif campaign['status'] == 'pending':
+            cap = int(settings.get('budget_limit_fils') or 0)
+            if cap <= 0 or approved_total + campaign['budget_fils'] > cap:
+                budget_problem = 'Approving this campaign would exceed the workspace budget cap'
+        check('budget_upper_bounds', 'Budget stays within the approved campaign budget and workspace cap',
+              not budget_problem, budget_problem)
+        final_url = publish.final_url.strip() or (campaign['landing_url'] if campaign else '')
+        check('payload_complete', 'Launch payload is complete', meta_https(final_url),
+              'Missing an HTTPS destination URL')
+        if publication and campaign:
+            check('single_publication', 'No different launch already exists for this campaign',
+                  publication['request_hash'] == meta_request_hash(google_publish_request_data(body, campaign)),
+                  'This campaign already has a different Google Ads launch; create a new campaign instead')
+    else:
+        target = google_publications(tenant_id).get(body.target_id)
+        if body.action == 'set_budget' or body.status == 'ENABLED':
+            check('managed_campaign', 'Campaign was launched by Adswise for this workspace', target,
+                  'Only campaigns launched by Adswise for this workspace can be enabled or re-budgeted here')
+        if body.action == 'set_budget':
+            daily = meta_safe_fils(body.daily_budget_aed)
+            budget_problem = ''
+            if daily is None or daily <= 0:
+                budget_problem = 'Daily budget must be a positive AED amount'
+            elif target:
+                with connect() as db:
+                    internal = qrow(db, 'SELECT budget_fils FROM campaigns WHERE tenant_id=? AND id=?',
+                                    (tenant_id, target['campaign_id']))
+                try:
+                    duration = int(json.loads(target['request_payload']).get('duration_days') or 1)
+                except (TypeError, ValueError):
+                    duration = 1
+                if not internal or daily * duration > internal['budget_fils']:
+                    budget_problem = 'New daily budget multiplied by duration exceeds the approved campaign budget'
+            check('budget_upper_bounds', 'New budget stays within the approved campaign budget',
+                  not budget_problem, budget_problem)
+    check('asset_ownership', 'The Google Ads account is bound to this workspace only',
+          google_owned_account(tenant_id, customer_id), 'This Google Ads account is not bound to this workspace only')
+    if connected and GOOGLE_ADS_DEVELOPER_TOKEN:
+        try:
+            access_token = google_access_token(connection)
+            check('token_valid', 'Google authorization is valid', True)
+            batches = google_post(connection, access_token, 'googleAds:searchStream', {
+                'query': 'SELECT customer.id, customer.currency_code, customer.status FROM customer LIMIT 1'},
+                'Google Ads account could not be read')
+            customer = next((row.get('customer', {}) for batch in batches for row in batch.get('results', [])), {})
+            status, currency = customer.get('status', ''), customer.get('currencyCode', '')
+            check('account_live', 'Google Ads account is enabled and billed in AED',
+                  status == 'ENABLED' and (currency == 'AED' or lowers_risk),
+                  f'Google Ads account status is {status or "unknown"}' if status != 'ENABLED' else
+                  'Connected Google Ads account currency must be AED')
+            if body.action == 'publish_youtube':
+                video = youtube_video_details(youtube_video_id(body.youtube.youtube_video_url))
+                check('youtube_video_live', 'The YouTube video is public or unlisted and can be embedded', video,
+                      'YouTube reports this video as private, removed or not embeddable')
+                try:
+                    fetch_logo_image(body.youtube.logo_image_url)
+                    check('logo_image', 'The logo downloads as a PNG, JPEG or GIF under 5 MB', True)
+                except HTTPException as exc:
+                    check('logo_image', 'The logo downloads as a PNG, JPEG or GIF under 5 MB', False, str(exc.detail))
+            if body.action in ('set_status', 'set_budget'):
+                remote = google_campaign_query(connection, access_token, body.target_id,
+                                               'campaign.id, campaign.advertising_channel_type, campaign.status')
+                check('target_in_account', "Campaign belongs to this workspace's Google Ads account", remote,
+                      'This campaign is not in the Google Ads account selected for this workspace')
+                if remote:
+                    check('target_mutable', 'Google allows changing this campaign through the API',
+                          remote.get('advertisingChannelType') != 'VIDEO',
+                          'Google does not allow API changes to classic YouTube Video campaigns; use Google Ads')
+        except HTTPException as exc:
+            check('google_live_checks', 'Live verification with Google Ads completed', False, str(exc.detail))
+    else:
+        check('token_valid', 'Google authorization is valid', False,
+              'Google Ads is not connected or the developer token is missing')
+    if body.action in ('publish_search', 'publish_youtube', 'set_budget') or body.status == 'ENABLED':
+        if not all(item['passed'] for item in checks):
+            check('seed_ai_review', 'Seed AI review approves the change', False,
+                  'Not run: fix the failed rule checks first')
+        elif prior_ai_review and prior_ai_review.get('passed'):
+            checks.append({**prior_ai_review, 'reused_from_request': True})
+        else:
+            checks.append(google_seed_ai_review(tenant_id, body, campaign, video))
+    return {'engine': META_SEED_ENGINE, 'stage': stage, 'passed': all(item['passed'] for item in checks),
+            'checked_at': utcnow(), 'checks': checks}
+
+
+def seed_ai_check(review: dict) -> dict:
+    """Run the Seed AI reviewer on a prepared review; fails closed if Seed is paused, missing or unsure."""
+    result = {'key': 'seed_ai_review', 'label': 'Seed AI review approves the change', 'passed': False,
+              'detail': '', 'model': ARK_MODEL}
+    try:
+        verdict = seed_review_meta_change(review)
+    except httpx.HTTPStatusError as exc:
+        code = exc.response.status_code
+        return {**result, 'detail': 'Seed rejected the API credentials or model access' if code in (401, 403, 404)
+                else 'Seed is rate limited; retry shortly' if code == 429 else 'Seed review could not be completed'}
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
+        return {**result, 'detail': 'Seed review could not be completed or returned an invalid answer'}
+    passed = verdict['decision'] == 'pass'
+    detail = '' if passed else '; '.join(verdict['issues'])[:600] or verdict['summary'] or 'Seed did not approve'
+    return {**result, 'passed': passed, 'detail': detail, 'summary': verdict['summary'], 'issues': verdict['issues']}
+
+
+def google_seed_ai_review(tenant_id: str, body: GoogleChangeRequestBody, campaign: dict | None,
+                          video: dict | None) -> dict:
+    blocked = {'key': 'seed_ai_review', 'label': 'Seed AI review approves the change', 'passed': False,
+               'detail': '', 'model': ARK_MODEL}
+    with connect() as db:
+        settings = qrow(db, 'SELECT ai_paused FROM tenant_settings WHERE tenant_id=?', (tenant_id,)) or {}
+        ai_paused = platform_flag(db, 'global_ai_paused') or bool(settings.get('ai_paused'))
+    if ai_paused:
+        return {**blocked, 'detail': 'AI is paused by the platform administrator, so Seed cannot validate changes'}
+    if not seed_configured():
+        return {**blocked, 'detail': 'Seed is not configured on the server (ARK_API_KEY, ARK_BASE_URL, ARK_MODEL)'}
+    review = {'business_type': 'spa and wellness', 'action': body.action,
+              'platform': 'youtube' if body.action == 'publish_youtube' else 'google_search'}
+    if campaign and body.action in ('publish_search', 'publish_youtube'):
+        publish = google_publish_body(body)
+        review['campaign'] = {'name': campaign['name'], 'service': campaign['service'], 'objective': campaign['objective'],
+                              'approved_budget_aed': f"{Decimal(campaign['budget_fils']) / 100:.2f}"}
+        review['budget'] = {'daily_aed': publish.daily_budget_aed, 'duration_days': publish.duration_days}
+        destination = urlparse(publish.final_url or campaign['landing_url']).hostname
+        if body.action == 'publish_search':
+            review['creative'] = {'headlines': [getattr(item, 'text', str(item)) for item in publish.headlines],
+                                  'descriptions': [getattr(item, 'text', str(item)) for item in publish.descriptions],
+                                  'keywords': publish.keywords[:30], 'destination_host': destination}
+        else:
+            review['creative'] = {'headlines': publish.headlines, 'long_headline': publish.long_headline,
+                                  'descriptions': publish.descriptions, 'business_name': publish.business_name,
+                                  'youtube_video_title': (video or {}).get('title', ''),
+                                  'youtube_channel': (video or {}).get('channel', ''), 'destination_host': destination}
+    else:
+        target = google_publications(tenant_id).get(body.target_id) or {}
+        with connect() as db:
+            internal = (qrow(db, 'SELECT name,service,objective,budget_fils FROM campaigns WHERE tenant_id=? AND id=?',
+                             (tenant_id, target.get('campaign_id', ''))) if target else None)
+        review.update({'new_status': body.status or None, 'new_daily_budget_aed': body.daily_budget_aed or None,
+                       'campaign': {'name': internal['name'], 'service': internal['service'],
+                                    'objective': internal['objective'],
+                                    'approved_budget_aed': f"{Decimal(internal['budget_fils']) / 100:.2f}"}
+                       if internal else None})
+    return seed_ai_check(review)
+
+
+def google_describe(body: GoogleChangeRequestBody) -> str:
+    if body.action == 'publish_search':
+        return 'A Google Search campaign launch (ACTIVE)'
+    if body.action == 'publish_youtube':
+        return 'A YouTube campaign launch (ACTIVE)'
+    if body.action == 'set_status':
+        return f'A Google Ads campaign status change to {body.status}'
+    return f'A Google Ads daily budget change to AED {body.daily_budget_aed}'
+
+
+def google_open_change_request(tenant_id: str, body: GoogleChangeRequestBody, user: dict) -> dict:
+    payload = body.model_dump()
+    payload_hash = meta_request_hash(payload)
+    with connect() as db:
+        existing = qrow(db, f"SELECT * FROM {GOOGLE_REQUESTS} WHERE tenant_id=? AND payload_hash=? "
+                            "AND status IN ('awaiting_owner','executing')", (tenant_id, payload_hash))
+    if existing:
+        return {**meta_request_public(existing), 'duplicate': True}
+    report = google_seed_validate(tenant_id, body, 'request')
+    status = 'awaiting_owner' if report['passed'] else 'seed_failed'
+    request_id, now = secrets.token_hex(12), utcnow()
+    with connect() as db:
+        db.execute(f'''INSERT INTO {GOOGLE_REQUESTS}(id,tenant_id,campaign_id,action,target_id,payload,payload_hash,
+                       status,seed_report,requested_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                   (request_id, tenant_id, body.campaign_id, body.action, body.target_id,
+                    json.dumps(payload, ensure_ascii=False), payload_hash, status, json.dumps(report),
+                    user['user_id'], now, now))
+        audit(db, user['user_id'], tenant_id, 'google.change_requested', {
+            'request_id': request_id, 'action': body.action, 'campaign_id': body.campaign_id,
+            'target_id': body.target_id, 'seed_passed': report['passed'],
+            'failed_checks': [item['key'] for item in report['checks'] if not item['passed']]})
+        row = qrow(db, f'SELECT * FROM {GOOGLE_REQUESTS} WHERE id=?', (request_id,))
+    if report['passed']:
+        meta_notify_owners(tenant_id, request_id, google_describe(body))
+    return meta_request_public(row)
+
+
+def google_workspace_requests(tenant_id: str, limit: int = 30) -> list[dict]:
+    with connect() as db:
+        rows = qrows(db, f'''SELECT r.*,u.email AS requested_by_email,d.email AS decided_by_email
+                             FROM {GOOGLE_REQUESTS} r LEFT JOIN users u ON u.id=r.requested_by
+                             LEFT JOIN users d ON d.id=r.decided_by
+                             WHERE r.tenant_id=? ORDER BY r.created_at DESC LIMIT {int(limit)}''', (tenant_id,))
+    return [meta_request_public(row) for row in rows]
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/google/change-requests')
+def google_create_change_request(tenant_id: str, body: GoogleChangeRequestBody, user=Depends(tenant_editor)):
+    return google_open_change_request(tenant_id, body, user)
+
+
+@app.get('/api/workspaces/{tenant_id}/integrations/google/change-requests')
+def google_list_change_requests(tenant_id: str, user=Depends(tenant_member)):
+    return {'requests': google_workspace_requests(tenant_id, 50)}
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/google/change-requests/{request_id}/approve')
+def google_approve_change_request(tenant_id: str, request_id: str, user=Depends(tenant_writer)):
+    now = utcnow()
+    with connect() as db:
+        claimed = db.execute(f"UPDATE {GOOGLE_REQUESTS} SET status='executing',decided_by=?,decided_at=?,"
+                             "updated_at=? WHERE id=? AND tenant_id=? AND status='awaiting_owner'",
+                             (user['user_id'], now, now, request_id, tenant_id)).rowcount
+        row = qrow(db, f'SELECT * FROM {GOOGLE_REQUESTS} WHERE id=? AND tenant_id=?', (request_id, tenant_id))
+    if not row:
+        raise HTTPException(404, 'Change request not found')
+    if claimed != 1:
+        raise HTTPException(409, f"This request is {row['status'].replace('_', ' ')}; only requests awaiting "
+                                 'owner approval can be approved')
+    try:
+        body = GoogleChangeRequestBody.model_validate(json.loads(row['payload']))
+        try:
+            prior_ai = next((item for item in json.loads(row['seed_report'] or '{}').get('checks', [])
+                             if item.get('key') == 'seed_ai_review'), None)
+        except (TypeError, ValueError):
+            prior_ai = None
+        report = google_seed_validate(tenant_id, body, 'approval', prior_ai)
+        if not report['passed']:
+            failed = [f"{item['label']}: {item['detail']}" for item in report['checks'] if not item['passed']]
+            meta_finish_request(tenant_id, request_id, 'seed_failed', GOOGLE_REQUESTS, seed_report=report,
+                                last_error='Seed validation failed at approval')
+            with connect() as db:
+                audit(db, user['user_id'], tenant_id, 'google.change_blocked_by_seed',
+                      {'request_id': request_id, 'failed_checks': [item['key'] for item in report['checks']
+                                                                   if not item['passed']]})
+            raise HTTPException(409, 'Seed validation failed at approval, nothing was sent to Google. ' +
+                                '; '.join(failed)[:900])
+        result = google_execute_change(tenant_id, body, user)
+    except HTTPException as exc:
+        if meta_request_status(tenant_id, request_id, GOOGLE_REQUESTS) == 'executing':
+            meta_finish_request(tenant_id, request_id, 'failed', GOOGLE_REQUESTS, last_error=str(exc.detail))
+            with connect() as db:
+                audit(db, user['user_id'], tenant_id, 'google.change_failed',
+                      {'request_id': request_id, 'error': str(exc.detail)[:300]})
+        raise
+    except Exception:
+        meta_finish_request(tenant_id, request_id, 'failed', GOOGLE_REQUESTS,
+                            last_error='Unexpected error while applying the change')
+        raise
+    finished = meta_finish_request(tenant_id, request_id, 'executed', GOOGLE_REQUESTS, seed_report=report,
+                                   result=result)
+    with connect() as db:
+        db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='google'", (tenant_id,))
+        audit(db, user['user_id'], tenant_id, 'google.change_executed_live', {
+            'request_id': request_id, 'action': body.action, 'campaign_id': body.campaign_id,
+            'target_id': body.target_id or result.get('campaign_id', ''), 'live_status': result.get('status', ''),
+            'approved_by_owner': True, 'seed_engine': META_SEED_ENGINE})
+    return finished
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/google/change-requests/{request_id}/reject')
+def google_reject_change_request(tenant_id: str, request_id: str, user=Depends(tenant_writer)):
+    now = utcnow()
+    with connect() as db:
+        changed = db.execute(f"UPDATE {GOOGLE_REQUESTS} SET status='rejected',decided_by=?,decided_at=?,updated_at=? "
+                             "WHERE id=? AND tenant_id=? AND status IN ('awaiting_owner','seed_failed')",
+                             (user['user_id'], now, now, request_id, tenant_id)).rowcount
+        row = qrow(db, f'SELECT status FROM {GOOGLE_REQUESTS} WHERE id=? AND tenant_id=?', (request_id, tenant_id))
+        if not row:
+            raise HTTPException(404, 'Change request not found')
+        if changed != 1:
+            raise HTTPException(409, f"This request is already {row['status'].replace('_', ' ')}")
+        audit(db, user['user_id'], tenant_id, 'google.change_rejected', {'request_id': request_id})
+    return {'ok': True, 'status': 'rejected'}
+
+
+def approve_campaign_for_launch(tenant_id: str, campaign_id: str, user: dict, action: str) -> dict:
+    """The owner's launch approval is also the internal approval; the workspace cap is re-checked atomically."""
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        campaign = qrow(db, 'SELECT * FROM campaigns WHERE tenant_id=? AND id=?', (tenant_id, campaign_id))
+        if not campaign:
+            raise HTTPException(404, 'Campaign not found')
+        if campaign['status'] == 'pending':
+            settings = qrow(db, 'SELECT * FROM tenant_settings WHERE tenant_id=?', (tenant_id,))
+            authorized = qrow(db, "SELECT COALESCE(SUM(budget_fils),0) AS total FROM campaigns "
+                                  "WHERE tenant_id=? AND status='approved'", (tenant_id,))['total']
+            if settings['budget_limit_fils'] == 0 or authorized + campaign['budget_fils'] > settings['budget_limit_fils']:
+                raise HTTPException(409, 'Proposed approved budgets exceed the configured workspace cap')
+            db.execute('UPDATE campaigns SET status=?,approver_id=?,updated_at=? WHERE id=? AND tenant_id=?',
+                       ('approved', user['user_id'], utcnow(), campaign_id, tenant_id))
+            audit(db, user['user_id'], tenant_id, action, {'campaign_id': campaign_id})
+            campaign['status'] = 'approved'
+        db.commit()
+    if campaign['status'] != 'approved':
+        raise HTTPException(409, 'Approve the campaign before launching it')
+    return campaign
+
+
+def youtube_demand_gen_operations(customer_id: str, campaign: dict, body: GoogleYouTubePublishBody,
+                                  remote_name: str, daily_budget_fils: int, logo: dict) -> list[dict]:
+    """One atomic Demand Gen launch limited to YouTube (in-stream, in-feed, Shorts), created ENABLED."""
+    budget = f'customers/{customer_id}/campaignBudgets/-1'
+    campaign_resource = f'customers/{customer_id}/campaigns/-2'
+    ad_group = f'customers/{customer_id}/adGroups/-3'
+    video_asset = f'customers/{customer_id}/assets/-4'
+    logo_asset = f'customers/{customer_id}/assets/-5'
+    start = datetime.now(timezone.utc).date()
+    end = start + timedelta(days=body.duration_days - 1)
+    campaign_create = {
+        'resourceName': campaign_resource, 'name': remote_name, 'status': 'ENABLED',
+        'advertisingChannelType': 'DEMAND_GEN', 'campaignBudget': budget,
+        'containsEuPoliticalAdvertising': 'DOES_NOT_CONTAIN_EU_POLITICAL_ADVERTISING',
+        'startDateTime': f'{start.isoformat()} 00:00:00', 'endDateTime': f'{end.isoformat()} 23:59:59'}
+    target_cpa = meta_safe_fils(body.target_cpa_aed) if body.target_cpa_aed.strip() else None
+    if target_cpa:
+        campaign_create['targetCpa'] = {'targetCpaMicros': str(target_cpa * 10_000)}
+    else:
+        campaign_create['maximizeConversions'] = {}
+    operations = [
+        {'campaignBudgetOperation': {'create': {'resourceName': budget, 'name': f'{remote_name} budget',
+                                                'amountMicros': str(daily_budget_fils * 10_000),
+                                                'deliveryMethod': 'STANDARD', 'explicitlyShared': False}}},
+        {'campaignOperation': {'create': campaign_create}},
+        {'adGroupOperation': {'create': {
+            'resourceName': ad_group, 'name': f'{remote_name} — YouTube', 'status': 'ENABLED',
+            'campaign': campaign_resource,
+            'demandGenAdGroupSettings': {'channelControls': {'selectedChannels': {
+                'gmail': False, 'discover': False, 'display': False,
+                'youtubeInFeed': body.youtube_in_feed, 'youtubeInStream': body.youtube_in_stream,
+                'youtubeShorts': body.youtube_shorts}}}}}}]
+    for location_id in body.location_ids:
+        operations.append({'adGroupCriterionOperation': {'create': {
+            'adGroup': ad_group, 'location': {'geoTargetConstant': f'geoTargetConstants/{location_id}'}}}})
+    for language_id in body.language_ids:
+        operations.append({'adGroupCriterionOperation': {'create': {
+            'adGroup': ad_group, 'language': {'languageConstant': f'languageConstants/{language_id}'}}}})
+    operations += [
+        {'assetOperation': {'create': {'resourceName': video_asset, 'name': f'{remote_name} video',
+                                       'youtubeVideoAsset': {'youtubeVideoId': youtube_video_id(body.youtube_video_url)}}}},
+        {'assetOperation': {'create': {'resourceName': logo_asset, 'name': f'{remote_name} logo', 'type': 'IMAGE',
+                                       'imageAsset': {'data': logo['data']}}}},
+        {'adGroupAdOperation': {'create': {'adGroup': ad_group, 'status': 'ENABLED', 'ad': {
+            'name': remote_name, 'finalUrls': [body.final_url.strip() or campaign['landing_url']],
+            'demandGenVideoResponsiveAd': {
+                'headlines': [{'text': text} for text in body.headlines],
+                'longHeadlines': [{'text': body.long_headline}],
+                'descriptions': [{'text': text} for text in body.descriptions],
+                'businessName': {'text': body.business_name},
+                'videos': [{'asset': video_asset}], 'logoImages': [{'asset': logo_asset}]}}}}}]
+    return operations
+
+
+def google_execute_publish(tenant_id: str, body: GoogleChangeRequestBody, user: dict, connection: dict,
+                           access_token: str) -> dict:
+    campaign = approve_campaign_for_launch(tenant_id, body.campaign_id, user, 'campaign.approved_for_google_launch')
+    publish = google_publish_body(body)
+    channel = 'SEARCH' if body.action == 'publish_search' else 'DEMAND_GEN (YouTube)'
+    daily_budget_fils = fils(publish.daily_budget_aed)
+    request_data = google_publish_request_data(body, campaign)
+    request_hash = meta_request_hash(request_data)
+    with connect() as db:
+        existing = qrow(db, 'SELECT * FROM provider_publications WHERE tenant_id=? AND campaign_id=?',
+                        (tenant_id, body.campaign_id))
+    if existing and existing['request_hash'] != request_hash:
+        raise HTTPException(409, 'This campaign already has a different Google Ads publication request')
+    if existing and existing['status'] == 'active':
+        return {'published': True, 'idempotent': True, 'status': 'ENABLED', 'resource_name': existing['remote_resource'],
+                'campaign_id': existing['remote_resource'].rsplit('/', 1)[-1], 'channel': channel}
+    remote_name = f"{campaign['name'][:100]} [Adswise {body.campaign_id[:8]}]"
+    publication_id = existing['id'] if existing else secrets.token_hex(12)
+    with connect() as db:
+        db.execute('''INSERT INTO provider_publications(
+                      id,tenant_id,campaign_id,provider,version,request_hash,request_payload,remote_name,status,
+                      created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                      ON CONFLICT(campaign_id) DO UPDATE SET status=excluded.status,last_error='',updated_at=excluded.updated_at''',
+                   (publication_id, tenant_id, body.campaign_id, 'google', publish.version, request_hash,
+                    json.dumps(request_data, ensure_ascii=False), remote_name, 'creating', utcnow(), utcnow()))
+    try:
+        remote_resource = google_find_campaign(connection, access_token, remote_name)
+        if not remote_resource:
+            if body.action == 'publish_search':
+                operations = google_search_operations(connection['customer_id'], campaign, publish, remote_name,
+                                                      daily_budget_fils, status='ENABLED')
+            else:
+                operations = youtube_demand_gen_operations(connection['customer_id'], campaign, publish, remote_name,
+                                                           daily_budget_fils, fetch_logo_image(publish.logo_image_url))
+            base_payload = {'mutateOperations': operations, 'partialFailure': False,
+                            'responseContentType': 'RESOURCE_NAME_ONLY'}
+            # Dry run first: a rejected configuration never leaves a half-built campaign behind.
+            google_post(connection, access_token, 'googleAds:mutate', {**base_payload, 'validateOnly': True},
+                        'Google Ads rejected the campaign configuration', timeout=45)
+            result = google_post(connection, access_token, 'googleAds:mutate', {**base_payload, 'validateOnly': False},
+                                 'Google Ads campaign creation failed', timeout=45)
+            remote_resource = next((item.get('campaignResult', {}).get('resourceName', '')
+                                    for item in result.get('mutateOperationResponses', [])
+                                    if item.get('campaignResult')), '') or \
+                google_find_campaign(connection, access_token, remote_name)
+        if not remote_resource:
+            raise HTTPException(502, 'Google Ads did not return the created campaign resource')
+    except HTTPException as exc:
+        with connect() as db:
+            db.execute('UPDATE provider_publications SET status=?,last_error=?,updated_at=? WHERE id=?',
+                       ('failed', str(exc.detail)[:500], utcnow(), publication_id))
+        raise
+    with connect() as db:
+        db.execute("UPDATE provider_publications SET status='active',remote_resource=?,last_error='',updated_at=? "
+                   "WHERE id=?", (remote_resource, utcnow(), publication_id))
+        audit(db, user['user_id'], tenant_id, 'campaign.published_google_active', {
+            'campaign_id': body.campaign_id, 'remote_resource': remote_resource, 'channel': channel,
+            'daily_budget_aed': publish.daily_budget_aed, 'duration_days': publish.duration_days, 'status': 'ENABLED'})
+    return {'published': True, 'idempotent': False, 'status': 'ENABLED', 'resource_name': remote_resource,
+            'campaign_id': remote_resource.rsplit('/', 1)[-1], 'channel': channel}
+
+
+def google_execute_change(tenant_id: str, body: GoogleChangeRequestBody, user: dict) -> dict:
     connection = google_connection(tenant_id)
     access_token = google_access_token(connection)
-    resource_name = f"customers/{connection['customer_id']}/campaigns/{campaign_id}"
-    google_post(connection, access_token, 'campaigns:mutate', {'operations': [{
-        'update': {'resourceName': resource_name, 'status': body.status}, 'updateMask': 'status'}],
-        'partialFailure': False, 'validateOnly': False}, 'Google Ads campaign status could not be changed')
+    if body.action in ('publish_search', 'publish_youtube'):
+        return google_execute_publish(tenant_id, body, user, connection, access_token)
+    resource = f"customers/{connection['customer_id']}/campaigns/{body.target_id}"
+    managed = google_publications(tenant_id).get(body.target_id)
+    if body.action == 'set_status':
+        google_post(connection, access_token, 'campaigns:mutate', {'operations': [{
+            'update': {'resourceName': resource, 'status': body.status}, 'updateMask': 'status'}],
+            'partialFailure': False}, 'Google Ads campaign status could not be changed')
+        if managed:
+            with connect() as db:
+                db.execute('UPDATE provider_publications SET status=?,updated_at=? WHERE id=?',
+                           ('active' if body.status == 'ENABLED' else 'paused', utcnow(), managed['id']))
+        return {'campaign_id': body.target_id, 'status': body.status}
+    budget = google_campaign_query(connection, access_token, body.target_id, 'campaign.campaign_budget') \
+        .get('campaignBudget', '')
+    if not budget:
+        raise HTTPException(502, 'Google Ads did not return the campaign budget')
+    daily_budget_fils = fils(body.daily_budget_aed)
+    google_post(connection, access_token, 'campaignBudgets:mutate', {'operations': [{
+        'update': {'resourceName': budget, 'amountMicros': str(daily_budget_fils * 10_000)},
+        'updateMask': 'amountMicros'}], 'partialFailure': False}, 'Google Ads budget could not be changed')
+    return {'campaign_id': body.target_id, 'daily_budget_aed': f'{Decimal(daily_budget_fils) / 100:.2f}',
+            'status': 'UPDATED'}
+
+
+def google_emergency_pause(tenant_id: str) -> dict:
+    """Emergency stop: pause every live Google or YouTube campaign Adswise launched for this workspace (only those)."""
+    live = [row for row in google_publications(tenant_id).values() if row['status'] == 'active']
+    if not live:
+        return {'paused': 0, 'failed': 0}
+    try:
+        connection = google_connection(tenant_id)
+        access_token = google_access_token(connection)
+        google_post(connection, access_token, 'campaigns:mutate', {'operations': [
+            {'update': {'resourceName': row['remote_resource'], 'status': 'PAUSED'}, 'updateMask': 'status'}
+            for row in live], 'partialFailure': False}, 'Google Ads campaigns could not be paused')
+    except HTTPException as exc:
+        return {'paused': 0, 'failed': len(live), 'error': str(exc.detail)}
     with connect() as db:
-        audit(db, user['user_id'], tenant_id, 'integration.google_campaign_status_changed',
-              {'campaign_id': campaign_id, 'status': body.status})
-    return {'ok': True, 'campaign_id': campaign_id, 'status': body.status}
+        for row in live:
+            db.execute("UPDATE provider_publications SET status='paused',updated_at=? WHERE id=?", (utcnow(), row['id']))
+        db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='google'", (tenant_id,))
+    return {'paused': len(live), 'failed': 0}
 
 
 def google_find_campaign(connection: dict, access_token: str, remote_name: str) -> str:
@@ -4755,7 +5466,7 @@ def google_find_campaign(connection: dict, access_token: str, remote_name: str) 
 
 
 def google_search_operations(customer_id: str, campaign: dict, body: GoogleSearchPublishBody,
-                             remote_name: str, daily_budget_fils: int) -> list[dict]:
+                             remote_name: str, daily_budget_fils: int, status: str = 'PAUSED') -> list[dict]:
     budget_resource = f'customers/{customer_id}/campaignBudgets/-1'
     campaign_resource = f'customers/{customer_id}/campaigns/-2'
     ad_group_resource = f'customers/{customer_id}/adGroups/-3'
@@ -4771,7 +5482,7 @@ def google_search_operations(customer_id: str, campaign: dict, body: GoogleSearc
     start_date = datetime.now(timezone.utc).date()
     end_date = start_date + timedelta(days=body.duration_days - 1)
     campaign_create = {
-        'resourceName': campaign_resource, 'name': remote_name, 'status': 'PAUSED',
+        'resourceName': campaign_resource, 'name': remote_name, 'status': status,
         'advertisingChannelType': 'SEARCH', 'campaignBudget': budget_resource,
         'startDateTime': f'{start_date.isoformat()} 00:00:00',
         'endDateTime': f'{end_date.isoformat()} 23:59:59',
@@ -4951,86 +5662,12 @@ def google_search_operations(customer_id: str, campaign: dict, body: GoogleSearc
 
 @app.post('/api/workspaces/{tenant_id}/campaigns/{campaign_id}/publish/google-search')
 def publish_google_search_campaign(tenant_id: str, campaign_id: str, body: GoogleSearchPublishBody,
-                                   user=Depends(tenant_writer)):
-    daily_budget_fils = fils(body.daily_budget_aed)
-    if daily_budget_fils <= 0:
-        raise HTTPException(422, 'Daily budget must be greater than zero')
-    with connect() as db:
-        campaign = qrow(db, 'SELECT * FROM campaigns WHERE tenant_id=? AND id=?', (tenant_id, campaign_id))
-        settings = qrow(db, 'SELECT stopped FROM tenant_settings WHERE tenant_id=?', (tenant_id,))
-        existing = qrow(db, 'SELECT * FROM provider_publications WHERE tenant_id=? AND campaign_id=?',
-                        (tenant_id, campaign_id))
-    if not campaign:
+                                   user=Depends(tenant_editor)):
+    """Compatibility route. A Google Search launch is a Seed-validated request that only the owner can approve."""
+    if not re.fullmatch(r'[a-f0-9]{24}', campaign_id):
         raise HTTPException(404, 'Campaign not found')
-    if campaign['provider'] != 'google':
-        raise HTTPException(409, 'Only Google Ads drafts can use Google Search publishing')
-    if campaign['status'] != 'approved':
-        raise HTTPException(409, 'Approve the campaign before publishing')
-    if settings and settings['stopped']:
-        raise HTTPException(409, 'Emergency stop is active')
-    if daily_budget_fils > campaign['budget_fils']:
-        raise HTTPException(409, 'Daily budget cannot exceed the internally approved campaign budget')
-    if daily_budget_fils * body.duration_days > campaign['budget_fils']:
-        raise HTTPException(409, 'Daily budget multiplied by campaign duration exceeds the approved budget')
-    final_url = body.final_url.strip() or campaign['landing_url']
-    if not final_url:
-        raise HTTPException(422, 'An HTTPS final URL is required')
-    remote_name = f"{campaign['name'][:100]} [SpaAds {campaign_id[:8]}]"
-    request_data = body.model_dump()
-    request_data['final_url'] = final_url
-    request_hash = hashlib.sha256(json.dumps(request_data, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    if existing and existing['request_hash'] != request_hash:
-        raise HTTPException(409, 'This campaign already has a different Google Ads publication request')
-    if existing and existing['status'] == 'created':
-        return {'published': True, 'idempotent': True, 'status': 'PAUSED',
-                'resource_name': existing['remote_resource']}
-
-    connection = google_connection(tenant_id)
-    if connection.get('currency_code') and connection['currency_code'] != 'AED':
-        raise HTTPException(409, 'Connected Google Ads account currency must be AED')
-    access_token = google_access_token(connection)
-    publication_id = existing['id'] if existing else secrets.token_hex(12)
-    with connect() as db:
-        db.execute('''INSERT INTO provider_publications(
-                      id,tenant_id,campaign_id,provider,version,request_hash,request_payload,remote_name,status,
-                      created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                      ON CONFLICT(campaign_id) DO UPDATE SET status=excluded.status,last_error='',updated_at=excluded.updated_at''',
-                   (publication_id, tenant_id, campaign_id, 'google', body.version, request_hash,
-                    json.dumps(request_data, ensure_ascii=False), remote_name, 'creating', utcnow(), utcnow()))
-
-    try:
-        remote_resource = google_find_campaign(connection, access_token, remote_name)
-        if not remote_resource:
-            operations = google_search_operations(connection['customer_id'], campaign, body, remote_name,
-                                                  daily_budget_fils)
-            base_payload = {'mutateOperations': operations, 'partialFailure': False,
-                            'responseContentType': 'RESOURCE_NAME_ONLY'}
-            google_post(connection, access_token, 'googleAds:mutate', {**base_payload, 'validateOnly': True},
-                        'Google Ads rejected the campaign configuration', timeout=45)
-            result = google_post(connection, access_token, 'googleAds:mutate',
-                                 {**base_payload, 'validateOnly': False},
-                                 'Google Ads campaign creation failed', timeout=45)
-            responses = result.get('mutateOperationResponses', [])
-            if len(responses) > 1:
-                remote_resource = responses[1].get('campaignResult', {}).get('resourceName', '')
-            remote_resource = remote_resource or google_find_campaign(connection, access_token, remote_name)
-        if not remote_resource:
-            raise HTTPException(502, 'Google Ads did not return the created campaign resource')
-    except HTTPException as exc:
-        with connect() as db:
-            db.execute('UPDATE provider_publications SET status=?,last_error=?,updated_at=? WHERE id=?',
-                       ('failed', str(exc.detail)[:500], utcnow(), publication_id))
-        raise
-
-    with connect() as db:
-        db.execute('''UPDATE provider_publications SET status=?,remote_resource=?,last_error='',updated_at=?
-                      WHERE id=?''', ('created', remote_resource, utcnow(), publication_id))
-        audit(db, user['user_id'], tenant_id, 'campaign.published_google_paused', {
-            'campaign_id': campaign_id, 'remote_resource': remote_resource,
-            'daily_budget_aed': body.daily_budget_aed, 'duration_days': body.duration_days,
-            'status': 'PAUSED', 'version': body.version})
-    return {'published': True, 'idempotent': False, 'status': 'PAUSED',
-            'resource_name': remote_resource, 'campaign_id': remote_resource.rsplit('/', 1)[-1]}
+    return google_open_change_request(tenant_id, GoogleChangeRequestBody(
+        action='publish_search', campaign_id=campaign_id, search=body), user)
 
 
 @app.post('/api/workspaces/{tenant_id}/campaigns/{campaign_id}/publish/meta')
@@ -5087,6 +5724,8 @@ def submit_campaign(tenant_id: str, campaign_id: str, user=Depends(tenant_editor
             raise HTTPException(422, 'Meta campaigns require at least one image or video asset URL')
         if c['provider'] == 'tiktok' and not spec.get('video_urls'):
             raise HTTPException(422, 'TikTok campaigns require at least one video asset URL')
+        if c['provider'] == 'youtube' and not any(youtube_video_id(url) for url in spec.get('video_urls') or []):
+            raise HTTPException(422, 'YouTube campaigns need the link of a video on your YouTube channel')
         db.execute('UPDATE campaigns SET status=?, updated_at=? WHERE id=? AND tenant_id=?',('pending',utcnow(),campaign_id,tenant_id))
         audit(db,user['user_id'],tenant_id,'campaign.submitted',{'campaign_id':campaign_id})
         db.commit()
@@ -5302,10 +5941,14 @@ def emergency_stop(tenant_id: str, user=Depends(tenant_writer)):
         audit(db,user['user_id'],tenant_id,'automation.stopped',{'note':'Planning, approvals and live Meta changes blocked.'})
         db.commit()
     meta = meta_emergency_pause(tenant_id)
-    if meta['paused'] or meta['failed']:
-        with connect() as db:
+    google = google_emergency_pause(tenant_id)
+    with connect() as db:
+        if meta['paused'] or meta['failed']:
             audit(db, user['user_id'], tenant_id, 'meta.emergency_paused', meta)
-    return {'stopped':True,'external_accounts_paused':bool(meta['paused']),'meta':meta}
+        if google['paused'] or google['failed']:
+            audit(db, user['user_id'], tenant_id, 'google.emergency_paused', google)
+    return {'stopped':True,'external_accounts_paused':bool(meta['paused'] or google['paused']),
+            'meta':meta,'google':google}
 
 
 @app.post('/api/workspaces/{tenant_id}/resume-automation')
@@ -5393,7 +6036,8 @@ def seed_review_meta_change(review: dict) -> dict:
     """Seed's pre-launch review of one already rule-checked Meta change (server-side key only)."""
     system = (
         'You are Seed, the strict pre-launch reviewer of an advertising control system for spa and wellness '
-        'businesses. Review only the supplied Meta change, which has already passed deterministic budget, '
+        'businesses. Review only the supplied advertising change (Meta, Google Search or YouTube; the platform is '
+        'named in it), which has already passed deterministic budget, '
         'ownership, token and permission checks. Decide "fail" if the ad text is misleading, makes medical or '
         'health claims or guarantees, asserts or implies personal attributes of the viewer, uses sexual or '
         'adult wording, conflicts with the service or destination, if the budget looks like a data-entry error '
@@ -5502,6 +6146,7 @@ def safe_public_url(url: str) -> bool:
 async def source_pack(body: CampaignRecommendationBody) -> tuple[str, list[dict]]:
     official = {
         'google': ('Google Ads policies', 'https://support.google.com/adspolicy/'),
+        'youtube': ('Google Ads policies', 'https://support.google.com/adspolicy/'),
         'meta': ('Meta Advertising Standards', 'https://transparency.meta.com/policies/ad-standards/'),
         'tiktok': ('TikTok Advertising Policies', 'https://ads.tiktok.com/help/article/tiktok-advertising-policies-industry-entry'),
     }

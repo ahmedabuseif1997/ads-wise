@@ -649,11 +649,12 @@ def test_google_oauth_connects_and_encrypts_refresh_token(client,monkeypatch):
     mutate=[x for x in calls if x[0][0].endswith('/conversionActions:mutate')][0]
     assert [op['create']['type'] for op in mutate[1]['json']['operations']]==[
         'WEBPAGE','WEBPAGE','WEBSITE_CALL']
+    # A live status change is a Seed-validated request; nothing changes on Google until the owner approves.
     status=client.post(f'/api/workspaces/{tid}/integrations/google/campaigns/123/status',headers=hdr,
                        json={'status':'PAUSED'})
-    assert status.status_code==200 and status.json()['status']=='PAUSED'
-    campaign_mutate=[x for x in calls if x[0][0].endswith('/campaigns:mutate')][0]
-    assert campaign_mutate[1]['json']['operations'][0]['updateMask']=='status'
+    assert status.status_code==200 and status.json()['action']=='set_status'
+    assert status.json()['status'] in ('awaiting_owner','seed_failed')
+    assert not [x for x in calls if x[0][0].endswith('/campaigns:mutate')]
 
 
 def test_ad_account_cannot_be_connected_to_two_workspaces(client, monkeypatch):
@@ -741,7 +742,7 @@ def test_all_external_resource_types_are_exclusive_to_one_workspace(client):
                 main.bind_provider_resource(db,other,provider,resource_type,resource_id)
 
 
-def test_approved_google_search_campaign_is_created_paused_with_assets_and_audience(client, monkeypatch):
+def test_approved_google_search_campaign_goes_live_enabled_with_assets_and_audience(client, monkeypatch):
     tid,hdr=session(client)
     body=draft();body.update({'provider':'google','name':'Be Relax Search','service':'Massage Abu Dhabi',
                               'budget_aed':'500.00'})
@@ -756,11 +757,18 @@ def test_approved_google_search_campaign_is_created_paused_with_assets_and_audie
                       currency_code,time_zone,status,connected_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
                    (tid,'google','encrypted','3021854998','4822753321','Be Relax','AED','Asia/Dubai',
                     'connected',main.utcnow(),main.utcnow()))
+        main.bind_provider_resource(db,tid,'google','ad_account','3021854998')
     monkeypatch.setattr(main,'google_access_token',lambda connection:'token')
+    monkeypatch.setattr(main,'GOOGLE_ADS_DEVELOPER_TOKEN','dev-token')
+    monkeypatch.setattr(main,'ARK_API_KEY','ark-test-key')
+    monkeypatch.setattr(main,'seed_review_meta_change',lambda review:{'decision':'pass','summary':'ok','issues':[]})
     calls=[]
     def fake_google_post(connection, token, path, payload, error_message, timeout=30):
         calls.append((path,payload))
-        if path=='googleAds:searchStream': return []
+        if path=='googleAds:searchStream':
+            if 'FROM customer' in payload['query']:
+                return [{'results':[{'customer':{'id':'3021854998','currencyCode':'AED','status':'ENABLED'}}]}]
+            return []
         if payload.get('validateOnly'): return {}
         return {'mutateOperationResponses':[{}, {'campaignResult': {
             'resourceName':'customers/3021854998/campaigns/987'}}]}
@@ -793,13 +801,17 @@ def test_approved_google_search_campaign_is_created_paused_with_assets_and_audie
              'final_url':'https://example.com/book',
              'tracking_url_template':'https://tracker.example/?url={lpurl}',
              'final_url_suffix':'utm_source=google&utm_medium=cpc'}
-    result=client.post(f'/api/workspaces/{tid}/campaigns/{cid}/publish/google-search',
-                       headers=hdr,json=publish)
-    assert result.status_code==200 and result.json()['status']=='PAUSED'
+    requested=client.post(f'/api/workspaces/{tid}/campaigns/{cid}/publish/google-search',
+                          headers=hdr,json=publish)
+    assert requested.status_code==200 and requested.json()['status']=='awaiting_owner', requested.json()
+    assert not [path for path,_ in calls if path=='googleAds:mutate']  # nothing sent before owner approval
+    result=client.post(f"/api/workspaces/{tid}/integrations/google/change-requests/{requested.json()['id']}/approve",
+                       headers=hdr,json={})
+    assert result.status_code==200 and result.json()['result']['status']=='ENABLED'
     mutate=[payload for path,payload in calls if path=='googleAds:mutate' and not payload['validateOnly']][0]
     operations=mutate['mutateOperations']
     campaign_create=operations[1]['campaignOperation']['create']
-    assert campaign_create['status']=='PAUSED'
+    assert campaign_create['status']=='ENABLED'
     assert campaign_create['maximizeConversions']=={'targetCpaMicros':'25000000'}
     assert campaign_create['networkSettings']['targetSearchNetwork'] is True
     assert campaign_create['trackingUrlTemplate'].endswith('{lpurl}')
@@ -835,13 +847,13 @@ def test_approved_google_search_campaign_is_created_paused_with_assets_and_audie
     assert rsa['headlines'][0]['pinnedField']=='HEADLINE_1'
     assert rsa['descriptions'][0]['pinnedField']=='DESCRIPTION_1'
     assert rsa['path1']=='massage' and rsa['path2']=='book'
-    call_count=len(calls)
+    mutations=len([path for path,_ in calls if path=='googleAds:mutate'])
     retry=client.post(f'/api/workspaces/{tid}/campaigns/{cid}/publish/google-search',
                       headers=hdr,json=publish)
-    assert retry.status_code==200 and retry.json()['idempotent'] is True
-    assert len(calls)==call_count
+    assert retry.status_code==200 and retry.json()['status']=='seed_failed'  # already live: no second launch
+    assert len([path for path,_ in calls if path=='googleAds:mutate'])==mutations
     saved=client.get(f'/api/workspaces/{tid}').json()['campaigns'][0]['publication']
-    assert saved['status']=='created' and saved['remote_resource'].endswith('/987')
+    assert saved['status']=='active' and saved['remote_resource'].endswith('/987')
 
 
 @pytest.mark.parametrize(('strategy', 'extra', 'expected_key'), [
@@ -908,7 +920,9 @@ def test_google_publish_requires_approved_budget(client, monkeypatch):
              'descriptions':['First description','Second description']}
     response=client.post(f'/api/workspaces/{tid}/campaigns/{cid}/publish/google-search',
                          headers=hdr,json=payload)
-    assert response.status_code==409 and 'Approve' in response.json()['detail']
+    assert response.status_code==200 and response.json()['status']=='seed_failed'
+    campaign_check=next(item for item in response.json()['seed_report']['checks'] if item['key']=='campaign')
+    assert not campaign_check['passed'] and 'submit it for approval' in campaign_check['detail']
 
 
 def test_meta_and_tiktok_campaign_requirements_are_persisted(client):

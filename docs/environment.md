@@ -45,7 +45,7 @@ If no provider is configured, the UI labels results "Template only (AI not confi
 |---|---|---|
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | OAuth client for Google Ads | Yes |
 | `GOOGLE_TOKEN_ENCRYPTION_KEY` | Fernet key that encrypts all stored OAuth tokens. **Changing it makes existing connections unreadable** | Yes |
-| `GOOGLE_ADS_DEVELOPER_TOKEN` | Google Ads API developer token, sent as the `developer-token` header | **No** |
+| `GOOGLE_ADS_DEVELOPER_TOKEN` | Google Ads API developer token, sent as the `developer-token` header. Required for every Google Ads and YouTube launch or change (Seed blocks them without it). Needs Basic or Standard access in Google Ads → Tools → API Center; Test access cannot touch real accounts | **No** (as of 22 Oct; confirm in Vercel) |
 
 > `GOOGLE_ADS_CUSTOMER_ID` and `GOOGLE_ADS_LOGIN_CUSTOMER_ID` exist on Vercel but are not read anywhere in the current code.
 >

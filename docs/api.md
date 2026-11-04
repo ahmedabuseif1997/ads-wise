@@ -50,7 +50,7 @@ All routes are defined in `app/main.py`. `{tenant_id}` is a workspace ID. Every 
 | POST | `/api/invitations/{invite_token}/accept` | Accept an invitation |
 | POST | `/api/workspaces/{tenant_id}/settings` | Update mode / approval cap |
 | POST | `/api/workspaces/{tenant_id}/tracking` | Save pixel IDs and tracking events |
-| POST | `/api/workspaces/{tenant_id}/emergency-stop` | Stop new approvals and planning, and pause every Meta campaign Adswise launched for this workspace |
+| POST | `/api/workspaces/{tenant_id}/emergency-stop` | Stop new approvals and planning, and pause every Meta, Google and YouTube campaign Adswise launched for this workspace |
 | POST | `/api/workspaces/{tenant_id}/resume-automation` | Lift the emergency stop |
 
 ## Campaigns
@@ -62,7 +62,7 @@ All routes are defined in `app/main.py`. `{tenant_id}` is a workspace ID. Every 
 | POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/approve` | Approve |
 | POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/reject` | Reject |
 | POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/archive` | Archive |
-| POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/publish/google-search` | Publish an approved campaign to Google Ads (created paused) |
+| POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/publish/google-search` | Compatibility route: creates a Seed-validated Google Search launch request |
 | POST | `/api/workspaces/{tenant_id}/campaigns/{campaign_id}/publish/meta` | Compatibility route: creates a Seed-validated Meta launch request (same as `change-requests` with `action=publish`) |
 
 ## AI planner
@@ -82,8 +82,19 @@ All routes are defined in `app/main.py`. `{tenant_id}` is a workspace ID. Every 
 | POST | `/api/workspaces/{tenant_id}/integrations/google/account` | Select the Ads account |
 | POST | `/api/workspaces/{tenant_id}/integrations/google/sync` | Pull metrics |
 | POST | `/api/workspaces/{tenant_id}/integrations/google/conversions/setup` | Create conversion actions |
-| POST | `/api/workspaces/{tenant_id}/integrations/google/campaigns/{campaign_id}/status` | Pause / enable a live campaign |
+| POST | `/api/workspaces/{tenant_id}/integrations/google/campaigns/{campaign_id}/status` | Request a pause / enable (Seed-validated, owner-approved) |
 | POST | `/api/workspaces/{tenant_id}/integrations/google/disconnect` | Disconnect |
+
+### Google and YouTube live changes
+
+| Method | Path | Who | Purpose |
+|---|---|---|---|
+| POST | `/api/workspaces/{tenant_id}/integrations/google/change-requests` | Manager/owner | Request `publish_search`, `publish_youtube`, `set_status` or `set_budget`. Seed validation runs immediately; only a 100% pass becomes `awaiting_owner` |
+| GET | `/api/workspaces/{tenant_id}/integrations/google/change-requests` | Member | Recent requests with their Seed reports |
+| POST | `/api/workspaces/{tenant_id}/integrations/google/change-requests/{request_id}/approve` | Owner | Re-run the Seed rules, then execute live (launches created ENABLED) and audit |
+| POST | `/api/workspaces/{tenant_id}/integrations/google/change-requests/{request_id}/reject` | Owner | Reject; nothing changes on Google |
+
+`POST …/campaigns/{campaign_id}/publish/google-search` and `POST …/integrations/google/campaigns/{campaign_id}/status` remain as compatibility routes that only create a Seed-validated request.
 
 ## Google Growth (Business Profile, Search Console, GA4)
 

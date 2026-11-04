@@ -10,8 +10,8 @@
 - Provider resources are exclusively bound at database level: one Google/Meta/TikTok ad account, GA4 property, Search Console site, or Business Profile account cannot be attached to two workspaces. Reauthorization clears stale snapshots without releasing the existing binding until replacement or explicit disconnect.
 - All monetary values stored as integer fils, accepted to two AED decimal places. Workspace budget cap verified atomically using an SQLite write transaction.
 - AI model credentials only read from server environment. AI responses never trigger ad publishing.
-- Google Search campaigns are created paused. Meta launches and live Meta changes can spend real money only after Seed validation passes 100% (rule checks plus the Seed AI review) **and** the workspace owner approves the request; every step is audited.
-- The emergency stop blocks planning, approvals and live Meta changes, and pauses every Meta campaign Adswise launched for that workspace. It does not pause Google campaigns or Meta campaigns created outside Adswise.
+- Launches and live changes on Meta, Google Search and YouTube can spend real money only after Seed validation passes 100% (rule checks plus the Seed AI review) **and** the workspace owner approves the request; every step is audited.
+- The emergency stop blocks planning, approvals and live Meta changes, and pauses every Meta, Google and YouTube campaign Adswise launched for that workspace. It does not pause campaigns created outside Adswise.
 - Meta tokens are encrypted at rest, verified with `debug_token`, sent with `appsecret_proof`, and never returned to the browser. Meta assets (ad account, Page, Instagram account, Pixel) are verified live and bound to one workspace only. Meta rate limits trigger a shared, database-backed cool-down with no automatic retries.
 
 ## BEFORE a public, multi-customer launch
