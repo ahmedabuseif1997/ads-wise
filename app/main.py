@@ -1308,6 +1308,15 @@ class InvitationBody(BaseModel):
         return value
 
 
+class MemberRemovalBody(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+    @field_validator('email')
+    @classmethod
+    def member_email(cls, value):
+        return value.strip().lower()
+
+
 class WorkspaceBody(BaseModel):
     name: str = Field(min_length=2, max_length=90)
 
@@ -2449,6 +2458,35 @@ def create_invitation(tenant_id: str, body: InvitationBody, user=Depends(tenant_
                     body.role, user['user_id'], expires))
         audit(db, user['user_id'], tenant_id, 'member.invited', {'email': body.email, 'role': body.role})
     return {'invite_url': f'{PUBLIC_ORIGIN}/signup?invite={raw_token}', 'expires_at': expires}
+
+
+@app.post('/api/workspaces/{tenant_id}/members/remove')
+def remove_member(tenant_id: str, body: MemberRemovalBody, user=Depends(tenant_writer)):
+    """An owner removes someone's access to this workspace only; it ends on that person's next request.
+
+    The workspace keeps at least one owner, owners cannot remove themselves (no accidental lock-out), and the
+    person's other workspaces, this workspace's integrations and its history are untouched.
+    """
+    with connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        target = qrow(db, '''SELECT m.user_id,m.role FROM memberships m JOIN users u ON u.id=m.user_id
+                             WHERE m.tenant_id=? AND u.email=?''', (tenant_id, body.email))
+        if not target:
+            raise HTTPException(404, 'This person is not a member of this workspace')
+        if target['user_id'] == user['user_id']:
+            raise HTTPException(409, 'You cannot remove yourself. Ask another owner of this workspace to do it.')
+        if target['role'] == 'owner':
+            owners = qrow(db, "SELECT COUNT(*) AS n FROM memberships WHERE tenant_id=? AND role='owner'",
+                          (tenant_id,))['n']
+            if owners <= 1:
+                raise HTTPException(409, 'A workspace needs at least one owner, so its only owner cannot be removed')
+        db.execute('DELETE FROM memberships WHERE tenant_id=? AND user_id=?', (tenant_id, target['user_id']))
+        # An unused invitation link for the same email must not let them straight back in.
+        db.execute('DELETE FROM invitations WHERE tenant_id=? AND email=? AND accepted_at IS NULL',
+                   (tenant_id, body.email))
+        audit(db, user['user_id'], tenant_id, 'member.removed', {'email': body.email, 'role': target['role']})
+        db.commit()
+    return {'ok': True}
 
 
 @app.post('/api/invitations/{invite_token}/accept')

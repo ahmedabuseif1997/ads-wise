@@ -326,6 +326,83 @@ def test_tenant_registration_and_team_invitation(client):
                        headers=manager_headers, json={}).status_code == 403
 
 
+def _member_workspace(name, members):
+    """A workspace with the given (email, role) members; returns its id. Every password is the same."""
+    tid = secrets.token_hex(12)
+    with main.connect() as db:
+        db.execute('INSERT INTO tenants VALUES(?,?,?)', (tid, name, main.utcnow()))
+        db.execute('INSERT INTO tenant_settings(tenant_id) VALUES(?)', (tid,))
+        for email, role in members:
+            user = main.qrow(db, 'SELECT id FROM users WHERE email=?', (email,))
+            uid = user['id'] if user else secrets.token_hex(12)
+            if not user:
+                db.execute('INSERT INTO users VALUES(?,?,?,?)',
+                           (uid, email, main.hash_password('member-password-long-123'), main.utcnow()))
+            db.execute('INSERT INTO memberships VALUES(?,?,?)', (uid, tid, role))
+    return tid
+
+
+def _sign_in(client, email):
+    client.post('/api/logout', json={})
+    assert client.post('/api/login', json={'email': email, 'password': 'member-password-long-123'}).status_code == 200
+    return {'X-CSRF-Token': client.get('/api/bootstrap').json()['csrf']}
+
+
+def test_owner_removes_member_and_access_ends_immediately(client):
+    arks = _member_workspace('ARKS', [('ahmed@example.com', 'owner'), ('reviewer@example.com', 'owner'),
+                                       ('viewer@example.com', 'viewer')])
+    review = _member_workspace('Reviewer Workspace', [('reviewer@example.com', 'owner')])
+    owner = _sign_in(client, 'ahmed@example.com')
+    with main.connect() as db:
+        inviter = main.qrow(db, 'SELECT id FROM users WHERE email=?', ('ahmed@example.com',))['id']
+        db.execute('''INSERT INTO invitations(token_hash,tenant_id,email,role,invited_by,expires_at,accepted_at)
+                      VALUES(?,?,?,?,?,?,NULL)''', ('unused-link', arks, 'reviewer@example.com', 'manager',
+                                                    inviter, '2999-01-01T00:00:00+00:00'))
+    removed = client.post(f'/api/workspaces/{arks}/members/remove', headers=owner,
+                          json={'email': ' Reviewer@Example.com '})
+    assert removed.status_code == 200
+    members = client.get(f'/api/workspaces/{arks}').json()['members']
+    assert [m['email'] for m in members] == ['ahmed@example.com', 'viewer@example.com']
+    audit = client.get(f'/api/workspaces/{arks}').json()['audit']
+    assert audit[0]['action'] == 'member.removed' and audit[0]['detail'] == {'email': 'reviewer@example.com',
+                                                                               'role': 'owner'}
+    with main.connect() as db:
+        assert not main.qrow(db, 'SELECT 1 AS x FROM invitations WHERE tenant_id=? AND email=?',
+                             (arks, 'reviewer@example.com'))
+    # The removed person loses this workspace on their next request, and keeps their other workspace.
+    reviewer = _sign_in(client, 'reviewer@example.com')
+    assert [t['id'] for t in client.get('/api/bootstrap').json()['tenants']] == [review]
+    assert client.get(f'/api/workspaces/{arks}').status_code == 404
+    assert client.post(f'/api/workspaces/{arks}/settings', headers=reviewer, json={}).status_code == 404
+    assert client.get(f'/api/workspaces/{review}').status_code == 200
+
+
+def test_member_removal_guards(client):
+    arks = _member_workspace('ARKS', [('ahmed@example.com', 'owner'), ('manager@example.com', 'manager')])
+    other = _member_workspace('Other', [('someone@example.com', 'owner'), ('kept@example.com', 'viewer')])
+    manager = _sign_in(client, 'manager@example.com')
+    assert client.post(f'/api/workspaces/{arks}/members/remove', headers=manager,
+                       json={'email': 'ahmed@example.com'}).status_code == 403
+    owner = _sign_in(client, 'ahmed@example.com')
+    myself = client.post(f'/api/workspaces/{arks}/members/remove', headers=owner, json={'email': 'ahmed@example.com'})
+    assert myself.status_code == 409 and 'yourself' in myself.json()['detail']
+    # Tenant isolation: an owner of one workspace cannot remove anyone from another workspace.
+    assert client.post(f'/api/workspaces/{other}/members/remove', headers=owner,
+                       json={'email': 'kept@example.com'}).status_code == 404
+    assert client.post(f'/api/workspaces/{arks}/members/remove', headers=owner,
+                       json={'email': 'kept@example.com'}).status_code == 404
+    with main.connect() as db:
+        assert main.qrow(db, 'SELECT COUNT(*) AS n FROM memberships WHERE tenant_id=?', (other,))['n'] == 2
+    # The platform admin can act on any workspace, but never leaves it without an owner.
+    _, admin = session(client)
+    last = client.post(f'/api/workspaces/{arks}/members/remove', headers=admin, json={'email': 'ahmed@example.com'})
+    assert last.status_code == 409 and 'only owner' in last.json()['detail']
+    assert client.post(f'/api/workspaces/{arks}/members/remove', headers=admin,
+                       json={'email': 'manager@example.com'}).status_code == 200
+    # No CSRF token, no change.
+    assert client.post(f'/api/workspaces/{arks}/members/remove', json={'email': 'ahmed@example.com'}).status_code == 403
+
+
 def test_workspace_isolation(client):
     _, hdr=session(client)
     # Create another user without membership and give them an authorized session.
