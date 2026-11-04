@@ -48,6 +48,7 @@ All routes are defined in `app/main.py`. `{tenant_id}` is a workspace ID. Every 
 | GET | `/api/workspaces/{tenant_id}` | Workspace detail (campaigns, settings, connections, snapshots) |
 | POST | `/api/workspaces/{tenant_id}/invitations` | Invite a user |
 | POST | `/api/invitations/{invite_token}/accept` | Accept an invitation |
+| POST | `/api/workspaces/{tenant_id}/members/remove` | Owner removes another member (`{"email"}`); never yourself or the only owner. Unused invitation links for that email are deleted. Audited as `member.removed` |
 | POST | `/api/workspaces/{tenant_id}/settings` | Update mode / approval cap |
 | POST | `/api/workspaces/{tenant_id}/tracking` | Save pixel IDs and tracking events |
 | POST | `/api/workspaces/{tenant_id}/emergency-stop` | Stop new approvals and planning, and pause every Meta campaign Adswise launched for this workspace |
