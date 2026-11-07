@@ -47,7 +47,9 @@ def database():
     if DATABASE_URL:
         import psycopg
         from psycopg.rows import dict_row
-        db = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        db = psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None, connect_timeout=10)
+        # SET LOCAL is scoped to this transaction, including through Supavisor transaction pooling.
+        db.execute('SET LOCAL search_path TO audit_private, pg_catalog')
     else:
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(DB_PATH, timeout=15)
@@ -79,6 +81,13 @@ def one(db, sql, params=()):
 
 
 def init_db():
+    if DATABASE_URL:
+        # Hosted schema is provisioned through schema.sql, never by the runtime role.
+        with database() as db:
+            for table in ('audit_tenants', 'audit_users', 'audit_sessions', 'audit_attempts',
+                          'audit_connections', 'audit_oauth', 'audit_reports'):
+                db.execute(f'SELECT 1 FROM {table} LIMIT 0')
+        return
     # Separate database AND table namespace prevent accidental reuse of main users/sessions.
     statements = [
         'CREATE TABLE IF NOT EXISTS audit_tenants(id TEXT PRIMARY KEY, name TEXT NOT NULL)',
@@ -242,7 +251,9 @@ def index():
 
 @app.get('/api/health')
 def health():
-    return {'status': 'ok', 'service': 'adswise-audit', 'mode': 'read-only'}
+    with database() as db:
+        db.execute('SELECT 1 FROM audit_tenants LIMIT 0')
+    return {'status': 'ok', 'service': 'adswise-audit', 'mode': 'read-only', 'database': 'ready'}
 
 
 def sign_in(response, user_id):
