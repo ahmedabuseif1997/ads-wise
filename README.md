@@ -65,6 +65,10 @@ node --check app/static/app.js
 | Integrations (Google, Meta, TikTok, pixels) | [`docs/integrations.md`](docs/integrations.md) |
 | Security model | [`SECURITY.md`](SECURITY.md) |
 
+## Independent Google Ads Audit
+
+The separate audit service lives in [`audit_app/`](audit_app/README.md). It is prepared for `audit.ads-wise.com` with independent accounts and data, while reusing the existing Adswise Google OAuth application and developer token. See its README for local testing, supported checks and the deployment plan.
+
 ## Not built yet
 
 TikTok publishing, Meta Conversions API (server-side events, deliberately deferred until explicit opt-in), image generation, CRM integration, end-to-end attribution and 2FA. Google publishing supports Search campaigns only, and new Google campaigns are always created **paused**. Meta launches go live as **ACTIVE** only after Seed validation passes 100% and the workspace owner approves.
