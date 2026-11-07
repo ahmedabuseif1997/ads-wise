@@ -78,3 +78,7 @@ The owner subsequently authorized staging setup. The status above records comple
 Apply `migrations/001_admin_access.sql` to existing dedicated Audit databases. Provision the owner in `audit_users` with a scrypt password hash and add its ID to `audit_admins` through a trusted database administrator. The runtime can read admin membership but cannot grant it. No public signup can create an admin.
 
 Public signup stores a pending request and cannot create a session until the owner approves it. The owner sees requests and Approve/Reject controls after signing in, and can generate a private invitation link for one email. An invitation is an explicit pre-approval, expires after seven days, and can be used once. Only its hash is stored; URL fragments keep the code out of HTTP request URLs. Share links manually; the service sends no email. Rejected requests stay rejected until the owner deliberately issues an invitation. Main Adswise accounts and data remain separate.
+
+## Installable app
+
+The root-scoped service worker, manifest and branded icons support home-screen installation. iPhone users choose Safari → Share → Add to Home Screen; compatible Chromium browsers show Install app when eligible. Only the generic offline screen and its stylesheet are cached. API calls, authenticated pages, reports, connections and credentials are never stored by the service worker. An internet connection is required to sign in and use Audit.

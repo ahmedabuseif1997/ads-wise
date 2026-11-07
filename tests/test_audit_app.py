@@ -271,3 +271,21 @@ def test_rejected_request_cannot_resubmit(app, monkeypatch):
     with audit.database() as db:
         row = audit.one(db, 'SELECT * FROM audit_access_requests WHERE email=?', (body['email'],))
     assert row['status'] == 'rejected' and row['password_hash'] is None
+
+
+def test_pwa_public_assets_and_private_api_boundary(app):
+    manifest = app.get('/assets/manifest.webmanifest')
+    assert manifest.status_code == 200
+    data = manifest.json()
+    assert data['display'] == 'standalone' and data['scope'] == '/'
+    for icon in data['icons']:
+        response = app.get(icon['src'])
+        assert response.status_code == 200 and response.headers['content-type'] == 'image/png'
+    worker = app.get('/sw.js')
+    assert worker.status_code == 200
+    assert worker.headers['service-worker-allowed'] == '/'
+    assert 'javascript' in worker.headers['content-type']
+    assert app.get('/assets/offline.html').status_code == 200
+    assert app.get('/api/me').status_code == 401
+    assert app.get('/api/reports/latest').status_code == 401
+    assert app.get('/api/admin/requests').status_code == 401

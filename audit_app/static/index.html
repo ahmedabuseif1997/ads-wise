@@ -3,6 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#05060f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Adswise Audit">
+<link rel="manifest" href="/assets/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/assets/icon-180.png">
+<script src="/assets/pwa.js" defer></script>
 <title>Adswise Audit · Your next clear move</title>
 <link rel="stylesheet" href="/assets/audit.css">
 <script src="/assets/audit.js" defer>
@@ -19,6 +26,8 @@
 </div>
 </header>
 <main>
+<button id="installApp" type="button" class="secondary hidden">Install app</button>
+<p id="installHint" class="small hidden" role="status">On iPhone or iPad, open this page in Safari, tap Share, then Add to Home Screen and choose Open as Web App if shown.</p>
 <section class="intro">
 <p class="eyebrow">YOUR NEXT CLEAR MOVE</p>
 <h1>Less guesswork.<br><em>Clearer Google Ads.</em></h1>

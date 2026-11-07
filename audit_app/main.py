@@ -253,6 +253,11 @@ async def security_headers(request, call_next):
 app.mount('/assets', StaticFiles(directory=ROOT / 'static'), name='assets')
 
 
+@app.get('/sw.js')
+def service_worker():
+    return FileResponse(ROOT / 'static' / 'sw.js', media_type='application/javascript', headers={'Service-Worker-Allowed': '/'})
+
+
 @app.get('/')
 def index():
     return FileResponse(ROOT / 'static' / 'index.html')
