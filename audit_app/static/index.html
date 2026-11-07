@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#05060f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Adswise Audit">
+<link rel="manifest" href="/assets/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/assets/icon-180.png">
+<script src="/assets/pwa.js" defer></script>
+<title>Adswise Audit · Your next clear move</title>
+<link rel="stylesheet" href="/assets/audit.css">
+<script src="/assets/audit.js" defer>
+</script>
+</head>
+<body>
+<header>
+<a class="brand" href="/" aria-label="Adswise Audit"><img src="/assets/adswise-mark.png" alt="" width="36" height="36">adswise
+<small>AUDIT</small>
+</a>
+<div class="header-right">
+<span class="pill">Analysis only</span>
+<button id="logout" class="quiet hidden" type="button">Sign out</button>
+</div>
+</header>
+<main>
+<button id="installApp" type="button" class="secondary hidden">Install app</button>
+<p id="installHint" class="small hidden" role="status">On iPhone or iPad, open this page in Safari, tap Share, then Add to Home Screen and choose Open as Web App if shown.</p>
+<section class="intro">
+<p class="eyebrow">YOUR NEXT CLEAR MOVE</p>
+<h1>Less guesswork.<br><em>Clearer Google Ads.</em></h1>
+<p class="muted">See what needs attention, understand the evidence, and follow the steps to fix it yourself.</p>
+</section>
+<div id="message" role="status" aria-live="polite" class="message hidden">
+</div>
+<section id="auth" class="auth-grid hidden">
+<div class="card">
+<div class="tabs" role="group" aria-label="Account access">
+<button id="loginTab" class="active" type="button" aria-pressed="true">Sign in</button>
+<button id="signupTab" type="button" aria-pressed="false">Create account</button>
+</div>
+<h2 id="authTitle">Welcome to your audit workspace</h2>
+<p class="muted">Use your separate Audit account. Your main Adswise login does not sign you in here.</p>
+<form id="authForm">
+<div class="signup-only hidden">
+<label for="business">Business name</label>
+<input id="business" maxlength="100" autocomplete="organization">
+<label for="invitation">Invitation code (if invited)</label>
+<input id="invitation" type="password" maxlength="200" autocomplete="off">
+</div>
+<label for="email">Email address</label>
+<input id="email" type="email" required autocomplete="username" maxlength="254">
+<label for="password">Password</label>
+<input id="password" type="password" minlength="12" maxlength="128" required autocomplete="current-password">
+<p class="small">Use at least 12 characters. Keep your password private.</p>
+<button class="primary full" type="submit" id="authSubmit">Sign in →</button>
+</form>
+<p class="small">Invitation-only pilot. For account recovery, contact your pilot administrator.</p>
+</div>
+<div class="explain">
+<span class="large-icon">↗</span>
+<h2>A clear path from data to action.</h2>
+<ol class="journey">
+<li>
+<strong>Connect your account</strong>
+<span>Authorize Google Ads and verify your customer ID.</span>
+</li>
+<li>
+<strong>Review the evidence</strong>
+<span>Read findings based on the last 14 complete days.</span>
+</li>
+<li>
+<strong>Make your next move</strong>
+<span>Follow manual instructions and track your progress.</span>
+</li>
+</ol>
+<p class="small">No AI analysis. No automatic ad changes. No shared tenant credentials.</p>
+</div>
+</section>
+<section id="workspace" class="workspace hidden">
+<aside>
+<div id="adminPanel" class="card section hidden">
+<p class="eyebrow">SUPER ADMIN</p><h2>Invitations & approvals</h2>
+<p class="small">New requests need your approval. Invitations pre-approve one email for a separate workspace.</p>
+<form id="inviteForm"><label for="inviteEmail">Email to invite</label><input id="inviteEmail" type="email" required><button class="primary full" type="submit">Create invitation link</button></form>
+<p id="inviteResult" class="small" style="overflow-wrap:anywhere"></p><div id="accessRequests"></div>
+</div>
+
+<div class="card section">
+<p class="eyebrow">YOUR WORKSPACE</p>
+<h2 id="tenantName">
+</h2>
+<p id="userEmail" class="small">
+</p>
+<div id="connectionStatus" class="connection">
+</div>
+<button id="connect" class="primary full" type="button">Connect Google Ads</button>
+<form id="accountForm" class="hidden">
+<label for="customer">Google Ads customer ID</label>
+<input id="customer" inputmode="numeric" placeholder="123-456-7890" required pattern="[0-9\- ]{10,14}" maxlength="14">
+<label for="manager">Manager ID <span class="muted">(optional)</span>
+</label>
+<input id="manager" inputmode="numeric" placeholder="Only if accessed through a manager" pattern="[0-9\- ]{10,14}" maxlength="14">
+<p class="small">Find your customer ID in Google Ads. We verify access with your Google connection before selecting it.</p>
+<button class="secondary full" type="submit">Verify and select account</button>
+</form>
+<button id="disconnect" class="quiet full hidden" type="button">Disconnect and delete audit reports</button>
+</div>
+<form id="auditForm" class="card">
+<p class="eyebrow">BUSINESS CONTEXT</p>
+<h2>What matters to you?</h2>
+<label for="goal">Main business goal</label>
+<select id="goal">
+<option value="bookings">Confirmed bookings</option>
+<option value="enquiries">Enquiries</option>
+</select>
+<label class="checkbox">
+<input id="homeVisits" type="checkbox">We offer home visits</label>
+<p class="small">Your answers help us avoid suggesting exclusions for services you offer.</p>
+<button id="run" class="primary full" type="submit">Run health check →</button>
+<p class="small">Reads your Google Ads data. It cannot edit campaigns, ads, or budgets.</p>
+</form>
+</aside>
+<section class="card report-panel">
+<div id="empty" class="empty">
+<div class="large-icon">◎</div>
+<h2>Your next steps will appear here</h2>
+<p class="muted">Connect and select an advertising account, then run your health check.</p>
+<p class="small">Every finding includes its evidence and manual fix instructions.</p>
+</div>
+<div id="report" class="hidden">
+</div>
+</section>
+</section>
+<p class="footer">Adswise Audit · Independent login and tenant data · Google authorization grants the Google Ads scope; this application's Google API calls only read data. You can revoke consent in your Google account.</p>
+</main>
+</body>
+</html>
