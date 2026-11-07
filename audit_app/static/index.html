@@ -38,7 +38,7 @@
 <div class="signup-only hidden">
 <label for="business">Business name</label>
 <input id="business" maxlength="100" autocomplete="organization">
-<label for="invitation">Pilot invitation code</label>
+<label for="invitation">Invitation code (if invited)</label>
 <input id="invitation" type="password" maxlength="200" autocomplete="off">
 </div>
 <label for="email">Email address</label>
@@ -72,6 +72,13 @@
 </section>
 <section id="workspace" class="workspace hidden">
 <aside>
+<div id="adminPanel" class="card section hidden">
+<p class="eyebrow">SUPER ADMIN</p><h2>Invitations & approvals</h2>
+<p class="small">New requests need your approval. Invitations pre-approve one email for a separate workspace.</p>
+<form id="inviteForm"><label for="inviteEmail">Email to invite</label><input id="inviteEmail" type="email" required><button class="primary full" type="submit">Create invitation link</button></form>
+<p id="inviteResult" class="small" style="overflow-wrap:anywhere"></p><div id="accessRequests"></div>
+</div>
+
 <div class="card section">
 <p class="eyebrow">YOUR WORKSPACE</p>
 <h2 id="tenantName">

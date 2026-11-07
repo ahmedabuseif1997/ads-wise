@@ -35,12 +35,12 @@ async function busy(button, action) {
 function authMode(signup) {
   signupMode = signup;
   document.querySelectorAll('.signup-only').forEach(x => x.classList.toggle('hidden', !signup));
-  $('business').required = signup; $('invitation').required = signup;
+  $('business').required = signup; $('invitation').required = false;
   $('loginTab').classList.toggle('active', !signup); $('signupTab').classList.toggle('active', signup);
   $('loginTab').setAttribute('aria-pressed', String(!signup)); $('signupTab').setAttribute('aria-pressed', String(signup));
   $('password').autocomplete = signup ? 'new-password' : 'current-password';
   $('authTitle').textContent = signup ? 'Create a separate audit account' : 'Welcome to your audit workspace';
-  $('authSubmit').textContent = signup ? 'Create audit account →' : 'Sign in →';
+  $('authSubmit').textContent = signup ? 'Request access →' : 'Sign in →';
 }
 $('loginTab').addEventListener('click', () => authMode(false));
 $('signupTab').addEventListener('click', () => authMode(true));
@@ -49,7 +49,8 @@ $('authForm').addEventListener('submit', event => {
   busy($('authSubmit'), async () => {
     const body = {email:$('email').value, password:$('password').value};
     if (signupMode) Object.assign(body, {business:$('business').value, invitation_code:$('invitation').value});
-    await api(signupMode ? '/api/signup' : '/api/login', body);
+    const result = await api(signupMode ? '/api/signup' : '/api/login', body);
+    if (result.pending_approval) { $('password').value = ''; authMode(false); message('Request submitted. Your administrator must approve access before you can sign in.'); return; }
     $('password').value = ''; $('invitation').value = ''; await boot();
   });
 });
@@ -62,6 +63,8 @@ async function boot() {
   }
   $('auth').classList.add('hidden'); $('workspace').classList.remove('hidden'); $('logout').classList.remove('hidden');
   $('tenantName').textContent = session.name; $('userEmail').textContent = session.email;
+  $('adminPanel').classList.toggle('hidden', !session.is_admin);
+  if (session.is_admin) await loadRequests();
   const c = session.connection;
   $('accountForm').classList.toggle('hidden', !c); $('disconnect').classList.toggle('hidden', !c);
   $('customer').value = c?.customer_id || ''; $('manager').value = c?.manager_id || '';
@@ -114,3 +117,26 @@ function renderReport() {
   $('print').addEventListener('click',()=>{ $('report').querySelectorAll('details').forEach(node=>node.open=true); window.print(); });
 }
 boot().catch(error=>message(error.message,true));
+
+async function loadRequests() {
+  const rows = await api('/api/admin/requests');
+  $('accessRequests').replaceChildren();
+  for (const row of rows) {
+    const item = document.createElement('div'); item.className = 'connection section';
+    const label = document.createElement('p'); label.textContent = `${row.email} · ${row.business || 'Invitation'} · ${row.status}`; item.append(label);
+    if (row.status === 'pending') for (const action of ['approve', 'reject']) {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'secondary'; button.textContent = action === 'approve' ? 'Approve' : 'Reject';
+      button.addEventListener('click', () => busy(button, async () => { await api('/api/admin/requests', {email:row.email,action}); await loadRequests(); })); item.append(button);
+    }
+    $('accessRequests').append(item);
+  }
+}
+$('inviteForm').addEventListener('submit', event => {
+  event.preventDefault(); busy(event.submitter, async () => {
+    const result = await api('/api/admin/requests', {email:$('inviteEmail').value,action:'invite'});
+    $('inviteResult').textContent = `Copy and share this private link (expires in 7 days): ${result.url}`;
+    await loadRequests();
+  });
+});
+const invitation = new URLSearchParams(location.hash.slice(1));
+if (invitation.has('invite')) { authMode(true); $('email').value = invitation.get('email') || ''; $('invitation').value = invitation.get('invite'); history.replaceState(null, '', '/'); }

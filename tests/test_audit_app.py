@@ -14,6 +14,7 @@ PASSWORD = 'private-pilot-password-123'
 
 @pytest.fixture
 def app(tmp_path, monkeypatch):
+    monkeypatch.setattr(audit, 'REQUIRE_APPROVAL', False)
     monkeypatch.setattr(audit, 'DATABASE_URL', '')
     monkeypatch.setattr(audit, 'DB_PATH', tmp_path / 'audit.db')
     monkeypatch.setattr(audit, 'ORIGIN', ORIGIN)
@@ -224,3 +225,49 @@ def test_production_cookie_attributes(app, monkeypatch):
         assert 'Secure' in cookie and 'HttpOnly' in cookie and 'Path=/' in cookie
         assert 'Domain=' not in cookie
         assert secure.get('/api/me').status_code == 200
+
+
+def test_admin_approval_and_email_bound_invites(app, monkeypatch):
+    admin_user, headers = signup(app, 'owner@example.com')
+    with audit.database() as db:
+        db.execute('INSERT INTO audit_admins VALUES(?)', (admin_user['id'],))
+    monkeypatch.setattr(audit, 'REQUIRE_APPROVAL', True)
+    other = TestClient(audit.app)
+    payload = {'email':'waiting@example.com','password':PASSWORD,'business':'Waiting Spa'}
+    response = other.post('/api/signup', json=payload, headers={'Origin':ORIGIN})
+    assert response.json()['pending_approval'] is True
+    assert other.get('/api/me').status_code == 401
+    assert other.post('/api/login', json=payload, headers={'Origin':ORIGIN}).status_code == 401
+    assert app.post('/api/admin/requests', json={'email':payload['email'],'action':'approve'}, headers=headers).status_code == 200
+    assert other.post('/api/login', json=payload, headers={'Origin':ORIGIN}).status_code == 200
+    member = other.get('/api/me').json()
+    assert member['is_admin'] is False
+    assert member['tenant_id'] != admin_user['tenant_id']
+    assert other.get('/api/admin/requests').status_code == 403
+    member_headers = {'Origin':ORIGIN,'X-CSRF-Token':member['csrf']}
+    assert other.post('/api/admin/requests', json={'email':'bad@example.com','action':'invite'}, headers=member_headers).status_code == 403
+    assert app.post('/api/admin/requests', json={'email':'x@example.com','action':'invite'}, headers={'Origin':ORIGIN}).status_code == 403
+    invite = app.post('/api/admin/requests', json={'email':'invited@example.com','action':'invite'}, headers=headers).json()
+    token = parse_qs(urlparse(invite['url']).fragment)['invite'][0]
+    guest = TestClient(audit.app)
+    invitation = {'email':'wrong@example.com','password':PASSWORD,'business':'Invited','invitation_code':token}
+    assert guest.post('/api/signup', json=invitation, headers={'Origin':ORIGIN}).status_code == 403
+    invitation['email'] = 'invited@example.com'
+    assert guest.post('/api/signup', json=invitation, headers={'Origin':ORIGIN}).status_code == 200
+    assert guest.post('/api/signup', json=invitation, headers={'Origin':ORIGIN}).status_code == 409
+    assert guest.get('/api/me').json()['is_admin'] is False
+
+
+def test_rejected_request_cannot_resubmit(app, monkeypatch):
+    owner, headers = signup(app)
+    with audit.database() as db:
+        db.execute('INSERT INTO audit_admins VALUES(?)', (owner['id'],))
+    monkeypatch.setattr(audit, 'REQUIRE_APPROVAL', True)
+    guest = TestClient(audit.app)
+    body = {'email':'reject@example.com','password':PASSWORD,'business':'Test'}
+    guest.post('/api/signup', json=body, headers={'Origin':ORIGIN})
+    app.post('/api/admin/requests', json={'email':body['email'],'action':'reject'}, headers=headers)
+    guest.post('/api/signup', json=body, headers={'Origin':ORIGIN})
+    with audit.database() as db:
+        row = audit.one(db, 'SELECT * FROM audit_access_requests WHERE email=?', (body['email'],))
+    assert row['status'] == 'rejected' and row['password_hash'] is None

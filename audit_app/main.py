@@ -32,6 +32,7 @@ CLIENT_SECRET = os.getenv('AUDIT_GOOGLE_CLIENT_SECRET', '')
 DEVELOPER_TOKEN = os.getenv('AUDIT_GOOGLE_DEVELOPER_TOKEN', '')
 ENCRYPTION_KEY = os.getenv('AUDIT_TOKEN_ENCRYPTION_KEY', '')
 API_VERSION = os.getenv('AUDIT_GOOGLE_API_VERSION', 'v26')
+REQUIRE_APPROVAL = True
 COOKIE = '__Host-adswise_audit' if SECURE else 'adswise_audit_local'
 CALLBACK = ORIGIN + '/api/google/callback'
 
@@ -85,7 +86,7 @@ def init_db():
         # Hosted schema is provisioned through schema.sql, never by the runtime role.
         with database() as db:
             for table in ('audit_tenants', 'audit_users', 'audit_sessions', 'audit_attempts',
-                          'audit_connections', 'audit_oauth', 'audit_reports'):
+                          'audit_connections', 'audit_oauth', 'audit_reports', 'audit_admins', 'audit_access_requests'):
                 db.execute(f'SELECT 1 FROM {table} LIMIT 0')
         return
     # Separate database AND table namespace prevent accidental reuse of main users/sessions.
@@ -105,10 +106,18 @@ def init_db():
         '''CREATE TABLE IF NOT EXISTS audit_reports(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL
            REFERENCES audit_tenants(id), customer_id TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL)''',
     ]
+    statements += ADMIN_SCHEMA
     with database() as db:
         db.lock('schema-init')
         for statement in statements:
             db.execute(statement)
+
+
+ADMIN_SCHEMA = [
+    'CREATE TABLE IF NOT EXISTS audit_admins(user_id TEXT PRIMARY KEY REFERENCES audit_users(id))',
+    """CREATE TABLE IF NOT EXISTS audit_access_requests(email TEXT PRIMARY KEY, business TEXT NOT NULL,
+    password_hash TEXT, status TEXT NOT NULL, invite_hash TEXT, expires_at TEXT, created_at TEXT NOT NULL)""",
+]
 
 
 def now():
@@ -200,7 +209,7 @@ class Credentials(BaseModel):
 
 class Signup(Credentials):
     business: str = Field(min_length=1, max_length=100)
-    invitation_code: str = Field(min_length=1, max_length=200)
+    invitation_code: str = Field(default='', max_length=200)
 
     @field_validator('business')
     @classmethod
@@ -269,6 +278,8 @@ def sign_in(response, user_id):
 def signup(body: Signup, request: Request, response: Response):
     origin_check(request)
     limit_request(request, 'signup', body.email, limit=5)
+    if REQUIRE_APPROVAL:
+        return request_access(body, response)
     if not SIGNUP_CODE or not hmac.compare_digest(body.invitation_code, SIGNUP_CODE):
         raise HTTPException(403, 'A valid audit pilot invitation code is required')
     uid, tid = secrets.token_hex(16), secrets.token_hex(16)
@@ -280,6 +291,77 @@ def signup(body: Signup, request: Request, response: Response):
         db.execute('INSERT INTO audit_tenants VALUES(?,?)', (tid, body.business.strip()))
         db.execute('INSERT INTO audit_users VALUES(?,?,?,?)', (uid, body.email, hashed, tid))
     return sign_in(response, uid)
+
+
+def request_access(body, response):
+    hashed = password_hash(body.password)
+    with database() as db:
+        db.lock('signup')
+        if one(db, 'SELECT id FROM audit_users WHERE email=?', (body.email,)):
+            raise HTTPException(409, 'Unable to create account. Try signing in instead.')
+        pending = one(db, 'SELECT * FROM audit_access_requests WHERE email=?', (body.email,))
+        if body.invitation_code:
+            if not pending or pending['status'] != 'invited' or not pending['expires_at'] or pending['expires_at'] < now() or not hmac.compare_digest(pending['invite_hash'] or '', digest(body.invitation_code)):
+                raise HTTPException(403, 'Invitation is invalid or expired')
+            uid, tid = secrets.token_hex(16), secrets.token_hex(16)
+            db.execute('INSERT INTO audit_tenants VALUES(?,?)', (tid, body.business))
+            db.execute('INSERT INTO audit_users VALUES(?,?,?,?)', (uid, body.email, hashed, tid))
+            db.execute("UPDATE audit_access_requests SET status='approved',invite_hash=NULL,password_hash=NULL WHERE email=?", (body.email,))
+        else:
+            # Never replace an existing request or an administrator's decision anonymously.
+            if not pending:
+                db.execute('INSERT INTO audit_access_requests VALUES(?,?,?,?,?,?,?)',
+                           (body.email, body.business, hashed, 'pending', None, None, now()))
+            return {'ok': True, 'pending_approval': True}
+    return sign_in(response, uid)
+
+
+def admin(current=Depends(writer)):
+    with database() as db:
+        if not one(db, 'SELECT user_id FROM audit_admins WHERE user_id=?', (current['id'],)):
+            raise HTTPException(403, 'Administrator access required')
+    return current
+
+
+class AccessDecision(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    action: str = Field(pattern=r'^(approve|reject|invite)$')
+
+
+@app.get('/api/admin/requests')
+def access_requests(current=Depends(user)):
+    with database() as db:
+        if not one(db, 'SELECT user_id FROM audit_admins WHERE user_id=?', (current['id'],)):
+            raise HTTPException(403, 'Administrator access required')
+        return [dict(row) for row in db.execute('SELECT email,business,status,created_at FROM audit_access_requests ORDER BY created_at DESC').fetchall()]
+
+
+@app.post('/api/admin/requests')
+def decide_access(body: AccessDecision, request: Request, current=Depends(admin)):
+    email = body.email.strip().lower()
+    if '@' not in email or any(c.isspace() for c in email):
+        raise HTTPException(422, 'Enter a valid email')
+    limit_request(request, 'admin-invites', current['id'], limit=50)
+    token = secrets.token_urlsafe(32)
+    with database() as db:
+        db.lock('signup')
+        row = one(db, 'SELECT * FROM audit_access_requests WHERE email=?', (email,))
+        if one(db, 'SELECT id FROM audit_users WHERE email=?', (email,)):
+            raise HTTPException(409, 'This email already has an account')
+        if body.action == 'invite':
+            db.execute('DELETE FROM audit_access_requests WHERE email=?', (email,))
+            db.execute('INSERT INTO audit_access_requests VALUES(?,?,?,?,?,?,?)',
+                       (email, '', None, 'invited', digest(token), expiry(604800), now()))
+            return {'url': ORIGIN + '/#' + urlencode({'invite': token, 'email': email}), 'expires_in_days': 7}
+        if not row or row['status'] != 'pending':
+            raise HTTPException(409, 'No pending request for this email')
+        if body.action == 'approve':
+            uid, tid = secrets.token_hex(16), secrets.token_hex(16)
+            db.execute('INSERT INTO audit_tenants VALUES(?,?)', (tid, row['business']))
+            db.execute('INSERT INTO audit_users VALUES(?,?,?,?)', (uid, email, row['password_hash'], tid))
+        db.execute('UPDATE audit_access_requests SET status=?,password_hash=NULL,invite_hash=NULL WHERE email=?',
+                   ('approved' if body.action == 'approve' else 'rejected', email))
+    return {'ok': True}
 
 
 @app.post('/api/login')
@@ -300,7 +382,8 @@ def me(current=Depends(user)):
     with database() as db:
         connection = one(db, '''SELECT customer_id,manager_id,account_name,currency FROM audit_connections
             WHERE tenant_id=?''', (current['tenant_id'],))
-    return {**current, 'connection': connection, 'google_configured': bool(CLIENT_ID and CLIENT_SECRET and DEVELOPER_TOKEN and ENCRYPTION_KEY)}
+        is_admin = bool(one(db, 'SELECT user_id FROM audit_admins WHERE user_id=?', (current['id'],)))
+    return {**current, 'is_admin': is_admin, 'connection': connection, 'google_configured': bool(CLIENT_ID and CLIENT_SECRET and DEVELOPER_TOKEN and ENCRYPTION_KEY)}
 
 
 @app.post('/api/logout')

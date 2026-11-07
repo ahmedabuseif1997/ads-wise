@@ -72,3 +72,9 @@ The owner subsequently authorized staging setup. The status above records comple
 - Google requests run synchronously with a 30-second timeout per request; review Vercel duration and account/report size before using large accounts. No background sync or automatic retries.
 - Rate limits use database transactions/advisory locks across instances. Configure a trusted edge rate limiter as well before broad public access. The app intentionally does not trust arbitrary `X-Forwarded-For` headers.
 - Completion is self-reported, not verification of a remote fix.
+
+## Administrator and approvals
+
+Apply `migrations/001_admin_access.sql` to existing dedicated Audit databases. Provision the owner in `audit_users` with a scrypt password hash and add its ID to `audit_admins` through a trusted database administrator. The runtime can read admin membership but cannot grant it. No public signup can create an admin.
+
+Public signup stores a pending request and cannot create a session until the owner approves it. The owner sees requests and Approve/Reject controls after signing in, and can generate a private invitation link for one email. An invitation is an explicit pre-approval, expires after seven days, and can be used once. Only its hash is stored; URL fragments keep the code out of HTTP request URLs. Share links manually; the service sends no email. Rejected requests stay rejected until the owner deliberately issues an invitation. Main Adswise accounts and data remain separate.
