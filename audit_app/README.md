@@ -35,7 +35,21 @@ python -m pytest tests/test_audit_app.py -q
 node --check audit_app/static/audit.js
 ```
 
-## Deployment plan — not performed
+## Staging setup status (7 November 2026)
+
+- Vercel project created: `adswise-audit` (`prj_zdlTA0BngiS3popdFfHHAFtK5rgs`) in team `team_5CTlokwNst5caFkIIs7qKp07`.
+- [Project dashboard](https://vercel.com/httpsgithubcomahmedabuseif1997nexora-crmg/adswise-audit). Repository connected; root directory configured as `audit_app`, FastAPI preset.
+- `audit.ads-wise.com` is assigned to preview branch `feat/separate-audit-app`; Vercel confirms domain ownership. DNS routing and HTTPS service are not yet verified.
+- Preview configuration present: `AUDIT_PUBLIC_ORIGIN=https://audit.ads-wise.com`, `AUDIT_COOKIE_SECURE=true`, `AUDIT_GOOGLE_API_VERSION=v26`.
+- No audit deployment has been created, no database provisioned, no migration run, and no DNS or Google Cloud setting changed. Main Adswise production remains unchanged. PR #18 remains a draft.
+- Missing Preview secrets: `AUDIT_DATABASE_URL`, `AUDIT_GOOGLE_CLIENT_ID`, `AUDIT_GOOGLE_CLIENT_SECRET`, `AUDIT_GOOGLE_DEVELOPER_TOKEN`, `AUDIT_TOKEN_ENCRYPTION_KEY`, `AUDIT_SIGNUP_CODE`. Enter them directly in the new project's environment settings; do not paste values into chat or GitHub.
+- Existing Google client credentials in the main Vercel project are write-only Secret variables and cannot be exported by this connection. No `GOOGLE_ADS_DEVELOPER_TOKEN` was listed in the main project's environment metadata. Reuse the existing Google OAuth application and any existing approved developer token; a new OAuth application is not required.
+- Create a new audit-only staging PostgreSQL database via the project's Storage tab and set `AUDIT_DATABASE_URL` (do not reuse the main database). Choose the provider plan explicitly; no paid storage was ordered.
+- In the existing Google Cloud OAuth client's authorized redirect URIs, add `https://audit.ads-wise.com/api/google/callback` while preserving all existing URIs.
+- Authoritative DNS is external (`dns1.registrar-servers.com`, `dns2.registrar-servers.com`). Vercel returned the required CNAME target `7b9202f64d9b984a.vercel-dns-017.com.` for host `audit`. Add only that subdomain record at the authoritative provider, preserving all other records. Recheck Vercel's current recommendation before applying if setup is resumed later.
+- After secrets and database are ready, deploy the reviewed audit commit to Preview, verify PostgreSQL initialization and the real account consent/report flow, then verify DNS and HTTPS. Do not merge or deploy the main Adswise project as part of this step.
+
+## Deployment procedure
 
 1. Create a **separate Vercel project** from this repository, with **Root Directory `audit_app`** and the FastAPI framework preset. `main.py` exports `app`; native FastAPI routing needs no catch-all rewrite. Python 3.12 and dependencies are declared inside this root. See [Vercel FastAPI documentation](https://vercel.com/docs/frameworks/backend/fastapi).
 2. Use a **new audit-only PostgreSQL database and credentials**, and a separate test database for previews. Do not set the main app's `DATABASE_URL`, admin bootstrapping variables or AI secrets in this project. `AUDIT_DATABASE_URL` must point to the audit database. Production refuses SQLite, insecure cookies, or an HTTP origin. If both database URL variables are present with identical values, startup fails.
@@ -45,7 +59,7 @@ node --check audit_app/static/audit.js
 6. Set up the custom subdomain in the new Vercel project and apply the DNS record **returned by Vercel**. Do not guess its target or change the main site's records.
 7. Register approved pilot tenants and test with their own Google Ads accounts. Verify real API queries, diagnostics, currencies, manager-account access, and no cross-tenant reports before inviting more users. Run the API suite against the staging PostgreSQL database as well; automated local tests cover SQLite only.
 
-No deployment, domain, database provisioning or Google Cloud configuration is authorized by the implementation step. Review these steps with the owner first. Existing production remains untouched.
+The owner subsequently authorized staging setup. The status above records completed and blocked actions. Main Adswise production remains untouched; do not silently promote a staging build or change the main site.
 
 ## Deliberate limits and pilot operations
 
