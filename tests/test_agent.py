@@ -263,6 +263,28 @@ def test_seed_performance_analysis_is_advisory_cached_and_tenant_isolated(client
     assert client.get(f'/api/workspaces/{other}').json()['seed_analysis'] is None
 
 
+def test_seed_response_normalizes_content_parts_and_schema_drift():
+    payload = {'choices': [{'message': {'content': [{'type': 'text', 'text': json.dumps({
+        'executive_summary': 'Useful analysis',
+        'confidence': 'MEDIUM',
+        'forecast': {'next_30_day_clicks': '12', 'next_30_day_conversions': -2,
+                     'predicted_cpa_aed': 'not-known'},
+        'findings': ['Finding'],
+        'recommendations': [{'priority': 'URGENT', 'title': 'Test landing page',
+                             'action': 'Run an A/B test.', 'rationale': 'Bounce rate may improve.',
+                             'metric_to_watch': 'Conversion rate', 'requires_approval': False}],
+        'experiments': ['A/B test'], 'data_quality_notes': [],
+    })}]}}]}
+    normalized = main.normalize_seed_analysis(main.parse_model_json_object(main.seed_response_text(payload)))
+    assert normalized['confidence'] == 'medium'
+    assert normalized['forecast']['next_30_day_clicks'] == 12
+    assert normalized['forecast']['next_30_day_conversions'] is None
+    assert normalized['forecast']['basis']
+    assert normalized['recommendations'][0]['priority'] == 'medium'
+    assert normalized['recommendations'][0]['requires_approval'] is True
+    assert normalized['recommendations'][0]['expected_impact']
+
+
 def test_sitemap_submission_is_limited_to_connected_tenant_property(client, monkeypatch):
     class PutResponse:
         status_code = 200
