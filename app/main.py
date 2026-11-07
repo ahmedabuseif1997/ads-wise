@@ -5414,6 +5414,84 @@ def seed_configured() -> bool:
     return bool(ARK_BASE_URL and ARK_API_KEY and ARK_MODEL)
 
 
+def seed_response_text(payload: dict) -> str:
+    """Extract text from OpenAI-compatible string or content-part responses."""
+    content = payload['choices'][0]['message'].get('content')
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        return json.dumps(content, ensure_ascii=False)
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                value = item.get('text') or item.get('content')
+                if isinstance(value, str):
+                    parts.append(value)
+        return '\n'.join(parts)
+    raise ValueError('Seed response contains no readable content')
+
+
+def normalize_seed_analysis(raw: dict) -> dict:
+    """Normalize harmless model formatting drift while preserving fail-closed approval rules."""
+    if not isinstance(raw, dict):
+        raise ValueError('Seed analysis must be an object')
+
+    def text(value, limit, fallback=''):
+        result = str(value or fallback).strip()
+        return result[:limit]
+
+    def text_list(value, limit):
+        return [text(item, 1000) for item in value[:limit] if text(item, 1000)] if isinstance(value, list) else []
+
+    def number(value):
+        try:
+            parsed = Decimal(str(value))
+            return float(parsed) if parsed.is_finite() and parsed >= 0 else None
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+
+    forecast = raw.get('forecast') if isinstance(raw.get('forecast'), dict) else {}
+    recommendations = []
+    for item in raw.get('recommendations', [])[:8] if isinstance(raw.get('recommendations'), list) else []:
+        if not isinstance(item, dict):
+            continue
+        recommendation = {
+            'priority': str(item.get('priority', 'medium')).lower(),
+            'title': text(item.get('title'), 160),
+            'action': text(item.get('action'), 1000),
+            'rationale': text(item.get('rationale'), 1000),
+            'expected_impact': text(item.get('expected_impact'), 500, 'Impact is uncertain; validate with a controlled test.'),
+            'metric_to_watch': text(item.get('metric_to_watch'), 160),
+            'requires_approval': True,
+        }
+        if recommendation['priority'] not in ('high', 'medium', 'low'):
+            recommendation['priority'] = 'medium'
+        if all(recommendation[field] for field in ('title', 'action', 'rationale', 'metric_to_watch')):
+            recommendations.append(recommendation)
+
+    confidence = str(raw.get('confidence', 'low')).lower()
+    if confidence not in ('high', 'medium', 'low'):
+        confidence = 'low'
+    normalized = {
+        'executive_summary': text(raw.get('executive_summary'), 2000),
+        'confidence': confidence,
+        'forecast': {
+            'next_30_day_clicks': number(forecast.get('next_30_day_clicks')),
+            'next_30_day_conversions': number(forecast.get('next_30_day_conversions')),
+            'predicted_cpa_aed': number(forecast.get('predicted_cpa_aed')),
+            'basis': text(forecast.get('basis'), 1000, 'Based on the supplied aggregate campaign and website metrics.'),
+        },
+        'findings': text_list(raw.get('findings'), 8),
+        'recommendations': recommendations,
+        'experiments': text_list(raw.get('experiments'), 6),
+        'data_quality_notes': text_list(raw.get('data_quality_notes'), 8),
+    }
+    return PerformanceAnalysisResult.model_validate(normalized).model_dump()
+
+
 async def seed_analyze_performance(dataset: dict) -> dict:
     system = (
         'You are a cautious paid-media performance analyst. Use only the supplied aggregate tenant data. '
@@ -5435,9 +5513,8 @@ async def seed_analyze_performance(dataset: dict) -> dict:
                       {'role': 'user', 'content': 'Analyze this aggregate dataset:\n' +
                        json.dumps(dataset, ensure_ascii=False, separators=(',', ':'))}]})
         response.raise_for_status()
-    content = response.json()['choices'][0]['message']['content']
-    parsed = parse_model_json_object(content)
-    return PerformanceAnalysisResult.model_validate(parsed).model_dump()
+    content = seed_response_text(response.json())
+    return normalize_seed_analysis(parse_model_json_object(content))
 
 
 class SeedMetaReview(BaseModel):
