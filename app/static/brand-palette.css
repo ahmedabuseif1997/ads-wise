@@ -1,5 +1,22 @@
 @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&display=swap');
 
+/* Keep the mobile/PWA sign-in header sized to its content. */
+@media (max-width: 760px) {
+  .auth { align-content: start; }
+  .auth-art {
+    min-height: 0;
+    padding: 24px;
+    justify-content: flex-start;
+    gap: 28px;
+  }
+  .auth-brand { padding-right: 84px; }
+  .auth-story h1 { margin: 16px 0 0; }
+  .auth-story p, .auth-points, .auth-caption { display: none; }
+  .auth-form-wrap { padding: 20px; }
+  .auth-form { padding: 24px; }
+  .auth-form h2 { font-size: clamp(28px, 7vw, 36px); }
+}
+
 :root {
   --bg: #f5f6ff;
   --paper: #ffffff;
