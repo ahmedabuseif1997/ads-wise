@@ -16,6 +16,7 @@ jobs:
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m pytest tests/ -q
       - run: node --check app/static/app.js
+      - run: node --check audit_app/static/audit.js
     env:
       ADMIN_EMAIL: test@example.com
       ADMIN_PASSWORD: a-valid-test-password-long-123
