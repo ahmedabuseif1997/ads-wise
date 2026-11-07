@@ -1,7 +1,7 @@
 :root {
   font-family:Inter,ui-sans-serif,system-ui,sans-serif;
-  color:#203832;
-  background:#f5f7f3;
+  color:#eef0ff;
+  background:#05060f;
   font-synthesis:none;
   line-height:1.55
 }
@@ -16,15 +16,15 @@ button,input,select {
 }
 header {
   padding:22px max(24px,calc((100vw - 1160px)/2));
-  border-bottom:1px solid #dce4da;
+  border-bottom:1px solid #e1e6ff26;
   display:flex;
   align-items:center;
   justify-content:space-between;
-  background:#fff
+  background:#eef0ff
 }
 .brand {
   font-size:29px;
-  color:#1c342e;
+  color:#eef0ff;
   text-decoration:none;
   font-weight:800;
   letter-spacing:-1.8px;
@@ -32,13 +32,13 @@ header {
   align-items:center
 }
 .brand span {
-  color:#387c57
+  color:#29f4e2
 }
 .brand small {
   font-size:10px;
   font-weight:650;
   letter-spacing:2px;
-  border-left:1px solid #ccd8cf;
+  border-left:1px solid #e1e6ff26;
   padding-left:14px;
   margin-left:14px
 }
@@ -49,8 +49,8 @@ header {
 }
 .pill {
   font-size:11px;
-  background:#e6eee4;
-  color:#3c6043;
+  background:#151937;
+  color:#29f4e2;
   border-radius:20px;
   padding:6px 12px;
   font-weight:650
@@ -68,7 +68,7 @@ main {
   font-size:10px;
   font-weight:750;
   letter-spacing:2px;
-  color:#638168;
+  color:#29f4e2;
   margin:0 0 12px
 }
 h1 {
@@ -92,15 +92,15 @@ p {
   margin:8px 0 16px
 }
 .muted {
-  color:#6c7c71
+  color:#9aa1c6
 }
 .small {
-  color:#6c7c71;
+  color:#9aa1c6;
   font-size:12px
 }
 .card {
-  border:1px solid #dce4da;
-  background:white;
+  border:1px solid #e1e6ff26;
+  background:#0f1229;
   padding:27px;
   border-radius:16px;
   box-shadow:0 5px 20px #294a3103
@@ -116,7 +116,7 @@ p {
 }
 .large-icon {
   font-size:46px;
-  color:#77976a
+  color:#ac56fb
 }
 .journey {
   padding-left:22px
@@ -127,7 +127,7 @@ p {
 }
 .journey span {
   display:block;
-  color:#6c7c71;
+  color:#9aa1c6;
   font-size:14px;
   margin-top:3px
 }
@@ -135,18 +135,18 @@ p {
   display:flex;
   gap:8px;
   margin-bottom:25px;
-  background:#f2f5ef;
+  background:#151937;
   border-radius:8px;
   padding:4px
 }
 .tabs button {
   flex:1;
   background:transparent;
-  color:#6c7c71
+  color:#9aa1c6
 }
 .tabs button.active {
-  background:white;
-  color:#26462f;
+  background:#0f1229;
+  color:#eef0ff;
   box-shadow:0 1px 4px #20383215
 }
 button {
@@ -163,19 +163,19 @@ button:disabled {
   cursor:wait
 }
 .primary {
-  color:#fff;
-  background:#2f694c
+  color:#eef0ff;
+  background:#8336fb
 }
 .primary:hover {
-  background:#24583e
+  background:#6b25dc
 }
 .secondary {
-  background:#eaf0e5;
-  color:#36573c
+  background:#151937;
+  color:#eef0ff
 }
 .quiet {
   background:transparent;
-  color:#53695a
+  color:#9aa1c6
 }
 .full {
   width:100%;
@@ -185,10 +185,10 @@ input,select {
   display:block;
   width:100%;
   padding:11px 12px;
-  border:1px solid #cbd6c8;
+  border:1px solid #e1e6ff26;
   border-radius:8px;
-  color:#203832;
-  background:#fff;
+  color:#eef0ff;
+  background:#eef0ff;
   min-width:0
 }
 label {
@@ -204,7 +204,7 @@ label {
 }
 .checkbox input {
   width:auto;
-  accent-color:#2f694c
+  accent-color:#8336fb
 }
 .workspace {
   display:grid;
@@ -216,7 +216,7 @@ label {
   margin-bottom:20px
 }
 .connection {
-  background:#f0f5ec;
+  background:#151937;
   border-radius:8px;
   padding:12px;
   font-size:12px;
@@ -234,8 +234,8 @@ label {
 }
 .message {
   padding:14px 18px;
-  background:#e9f1e5;
-  border:1px solid #ceddc6;
+  background:#151937;
+  border:1px solid #e1e6ff26;
   border-radius:9px;
   margin:0 0 24px;
   white-space:pre-line
@@ -259,7 +259,7 @@ label {
 }
 .stat {
   padding:14px;
-  background:#f2f5ee;
+  background:#151937;
   border-radius:10px;
   overflow-wrap:anywhere
 }
@@ -269,7 +269,7 @@ label {
   letter-spacing:-.6px
 }
 .finding {
-  border:1px solid #dce4da;
+  border:1px solid #e1e6ff26;
   border-radius:10px;
   margin:12px 0;
   overflow:hidden
@@ -305,8 +305,8 @@ label {
 }
 .finding-body {
   padding:18px;
-  border-top:1px solid #e0e6da;
-  background:#fafcf8;
+  border-top:1px solid #e1e6ff26;
+  background:#090b1c;
   font-size:14px
 }
 .finding li {
@@ -322,10 +322,10 @@ label {
   text-transform:uppercase
 }
 .done .label {
-  color:#387c57
+  color:#29f4e2
 }
 .ad {
-  border:1px solid #e0e6da;
+  border:1px solid #e1e6ff26;
   padding:16px;
   border-radius:10px;
   margin:12px 0;
@@ -340,7 +340,7 @@ label {
 }
 .footer {
   font-size:11px;
-  color:#7c887d;
+  color:#9aa1c6;
   margin-top:32px;
   max-width:900px
 }
@@ -352,14 +352,14 @@ button:focus-visible,a:focus-visible,summary:focus-visible {
   outline-offset:3px
 }
 input:focus,select:focus {
-  outline:2px solid #7b9b6f;
+  outline:2px solid #29f4e2;
   outline-offset:1px
 }
 a {
-  color:#2f694c
+  color:#8336fb
 }
 .limits {
-  border-top:1px solid #e0e6da;
+  border-top:1px solid #e1e6ff26;
   padding-top:18px;
   margin-top:25px
 }
@@ -433,7 +433,18 @@ main {
   break-inside:avoid
 }
 body {
-  background:white
+  background:#0f1229
 }
 
 }
+
+/* Adswise brand: original logo, midnight surfaces and blue-violet accents. */
+:root{color-scheme:dark}body{min-height:100vh;background:radial-gradient(ellipse at 95% 0%,#8336fb18,transparent 45%),#05060f}
+header{max-width:1240px;margin:14px auto 0;padding:14px 24px;border:1px solid #e1e6ff26;border-radius:20px;background:#0f1229}
+.brand{gap:8px;letter-spacing:-1.2px}.brand img{object-fit:contain}
+h1 em{font-family:Georgia,serif;font-weight:400;background:linear-gradient(115deg,#0170fc,#8336fb 55%,#ac56fb);background-clip:text;-webkit-background-clip:text;color:transparent}
+.primary{background:linear-gradient(115deg,#0170fc,#8336fb 55%,#ac56fb);color:#fff;box-shadow:0 8px 24px #8336fb22}.primary:hover{filter:brightness(1.12)}
+header,input,select,.tabs button.active{background:#0f1229}.ad h3{color:#29f4e2}.message.error{color:#ffb9a8;background:#382127}
+button:focus-visible,a:focus-visible,summary:focus-visible{outline-color:#29f4e2}
+@media(max-width:680px){header{margin:8px;padding:12px}.brand{font-size:23px;gap:5px}.brand img{width:28px;height:28px}.pill{padding:5px 8px;font-size:10px}}
+@media print{body,.card,.finding-body{background:#fff;color:#111}.small,.muted,.footer{color:#444}}
