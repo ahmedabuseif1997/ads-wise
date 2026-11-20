@@ -1,6 +1,6 @@
 # Meta App Review — submission draft
 
-**Status: draft. Do not submit until the owner confirms.** Nothing here has been sent to Meta.
+**Live status checked 2026-11-20:** app published and business verified. Meta approved the November 19 submission for `pages_show_list`, `ads_read`, `pages_read_engagement`, `public_profile`, `ads_management`, `business_management`, and `pages_manage_ads`. Marketing API Access Tier remains **Testing in progress: 3/500 legitimate API calls, with at least 85% success required**. The previous Access Tier submissions were not approved, and a new Access Tier submission cannot be completed until this live testing threshold is met. Permission approval does not by itself grant Marketing API Access Tier.
 
 | | |
 |---|---|
