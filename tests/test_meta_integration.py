@@ -27,6 +27,9 @@ def client(tmp_path, monkeypatch):
                  'TIKTOK_AUTHORIZATION_URL', 'GOOGLE_GROWTH_CLIENT_ID', 'GOOGLE_GROWTH_CLIENT_SECRET',
                  'RESEND_API_KEY'):
         monkeypatch.setattr(main, name, '')
+    monkeypatch.setattr(main, 'META_MIN_INTERVAL_SECONDS', 0)
+    monkeypatch.setattr(main, 'META_JITTER_MAX_SECONDS', 0)
+    monkeypatch.setattr(main, 'META_RATE_REFILL_PER_SECOND', 1000)
     main._LOGIN_ATTEMPTS.clear()
     main.init_db()
     with TestClient(main.app) as c:
@@ -520,6 +523,83 @@ def test_rate_limits_start_shared_cooldown_without_retrying(client, monkeypatch)
     main.meta_set_scope('')
     main.meta_track_usage({'x-app-usage': json.dumps({'call_count': 91})}, '')
     assert main.meta_cooldown_until(other)  # app-wide usage ceiling pauses every workspace
+
+
+def test_meta_controller_retries_reads_redacts_secrets_and_isolates_connections(client, monkeypatch):
+    monkeypatch.setattr(main, 'META_APP_SECRET', 'never-log-this-secret')
+    monkeypatch.setattr(main, 'META_MAX_READ_RETRIES', 2)
+    tid, _ = session(client)
+    sleeps, responses = [], [
+        httpx.Response(503, json={'error': {'code': 2, 'message': 'Temporary'}}),
+        httpx.Response(200, json={'data': []}, headers={'x-app-usage': '{"call_count":12}'})]
+    monkeypatch.setattr(main.time, 'sleep', lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(main.httpx, 'get', lambda *args, **kwargs: responses.pop(0))
+    main.meta_set_scope(tid)
+    assert main.meta_graph('GET', 'act_123456789/campaigns', 'private-user-token',
+                           {'fields': 'id,name', 'after': 'private-cursor'}) == {'data': []}
+    assert sleeps and sleeps[0] >= 2
+    with main.connect() as db:
+        logs = main.qrows(db, 'SELECT * FROM meta_api_requests WHERE tenant_id=? ORDER BY created_at', (tid,))
+    serialized = json.dumps(logs)
+    assert len(logs) == 2 and {row['outcome'] for row in logs} == {'failure', 'success'}
+    assert ':id/campaigns' in serialized
+    assert all(secret not in serialized for secret in ('private-user-token', 'private-cursor',
+                                                        'never-log-this-secret', '123456789'))
+    other = client.post('/api/workspaces', headers=session(client)[1], json={'name': 'Other'}).json()['id']
+    main.meta_set_scope(other)
+    scope_other, _ = main.meta_rate_acquire(other)
+    with main.connect() as db:
+        scopes = {row['scope'] for row in main.qrows(db, 'SELECT scope FROM meta_rate_state')}
+    assert scope_other in scopes and len(scopes) >= 2
+
+
+def test_meta_circuit_breaker_opens_after_abnormal_failures(client, monkeypatch):
+    monkeypatch.setattr(main, 'META_APP_SECRET', 'meta-secret')
+    monkeypatch.setattr(main, 'META_MAX_READ_RETRIES', 0)
+    tid, _ = session(client)
+    monkeypatch.setattr(main.httpx, 'get', lambda *args, **kwargs:
+                        httpx.Response(400, json={'error': {'code': 100, 'message': 'Bad request'}}))
+    main.meta_set_scope(tid)
+    for _ in range(3):
+        with pytest.raises(main.MetaAPIError):
+            main.meta_graph('GET', 'act_111/campaigns', 'token')
+    assert main.meta_cooldown_until(tid)
+    with pytest.raises(main.MetaAPIError) as blocked:
+        main.meta_graph('GET', 'act_111/campaigns', 'token')
+    assert blocked.value.kind == 'cooling_down'
+
+
+def test_meta_webhook_signature_deduplication_and_tenant_resolution(client, monkeypatch):
+    monkeypatch.setattr(main, 'META_APP_SECRET', 'webhook-secret')
+    monkeypatch.setattr(main, 'META_WEBHOOK_VERIFY_TOKEN', 'verify-me')
+    tid, _ = session(client)
+    with main.connect() as db:
+        db.execute('''INSERT INTO meta_connection_state(tenant_id,page_id,updated_at)
+                      VALUES(?,?,?) ON CONFLICT(tenant_id) DO UPDATE SET page_id=excluded.page_id''',
+                   (tid, '501', main.utcnow()))
+    verified = client.get('/api/integrations/meta/webhook', params={
+        'hub.mode': 'subscribe', 'hub.verify_token': 'verify-me', 'hub.challenge': 'challenge-123'})
+    assert verified.status_code == 200 and verified.text == 'challenge-123'
+    payload = {'object': 'page', 'entry': [{'id': '501', 'changes': [{'field': 'feed', 'value': {
+        'item': 'comment', 'verb': 'add', 'comment_id': 'comment-1', 'message': 'I need a refund',
+        'from': {'id': 'person-1'}}}]}]}
+    raw = json.dumps(payload, separators=(',', ':')).encode()
+    signature = 'sha256=' + main.hmac.new(b'webhook-secret', raw, main.hashlib.sha256).hexdigest()
+    first = client.post('/api/integrations/meta/webhook', content=raw,
+                        headers={'X-Hub-Signature-256': signature, 'Content-Type': 'application/json'})
+    second = client.post('/api/integrations/meta/webhook', content=raw,
+                         headers={'X-Hub-Signature-256': signature, 'Content-Type': 'application/json'})
+    assert first.json()['accepted'] == 1 and second.json()['duplicates'] == 1
+    with main.connect() as db:
+        actions = main.qrows(db, 'SELECT * FROM meta_comment_actions WHERE tenant_id=?', (tid,))
+    assert len(actions) == 1 and actions[0]['classification'] == 'sensitive'
+    assert actions[0]['status'] == 'awaiting_human' and not actions[0]['remote_reply_id']
+    unknown = {**payload, 'entry': [{**payload['entry'][0], 'id': '999'}]}
+    unknown_raw = json.dumps(unknown, separators=(',', ':')).encode()
+    unknown_sig = 'sha256=' + main.hmac.new(b'webhook-secret', unknown_raw, main.hashlib.sha256).hexdigest()
+    ignored = client.post('/api/integrations/meta/webhook', content=unknown_raw,
+                          headers={'X-Hub-Signature-256': unknown_sig, 'Content-Type': 'application/json'})
+    assert ignored.json()['ignored'] == 1
 
 
 # ---------------------------------------------------------------- Seed + owner approval -------------------------

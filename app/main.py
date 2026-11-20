@@ -7,6 +7,7 @@ import hmac
 import ipaddress
 import json
 import os
+import random
 import re
 import secrets
 import socket
@@ -82,6 +83,15 @@ META_DEFAULT_COOLDOWN_SECONDS = 420
 META_OAUTH_STARTS_PER_WINDOW = 5
 META_OAUTH_WINDOW_MINUTES = 15
 META_HEALTH_LIVE_MIN_SECONDS = 60
+META_RATE_CAPACITY = max(1, int(os.getenv('META_RATE_CAPACITY', '6')))
+META_RATE_REFILL_PER_SECOND = max(0.05, float(os.getenv('META_RATE_REFILL_PER_SECOND', '0.5')))
+META_MIN_INTERVAL_SECONDS = max(0.0, float(os.getenv('META_MIN_INTERVAL_SECONDS', '0.75')))
+META_JITTER_MAX_SECONDS = max(0.0, float(os.getenv('META_JITTER_MAX_SECONDS', '0.25')))
+META_MAX_CONCURRENCY = max(1, min(4, int(os.getenv('META_MAX_CONCURRENCY', '2'))))
+META_MAX_READ_RETRIES = max(0, min(3, int(os.getenv('META_MAX_READ_RETRIES', '2'))))
+META_CIRCUIT_FAILURE_PERCENT = max(10, min(100, int(os.getenv('META_CIRCUIT_FAILURE_PERCENT', '40'))))
+META_CIRCUIT_MIN_SAMPLES = max(3, int(os.getenv('META_CIRCUIT_MIN_SAMPLES', '5')))
+META_WEBHOOK_VERIFY_TOKEN = os.getenv('META_WEBHOOK_VERIFY_TOKEN', '').strip()
 SUPER_ADMIN_EMAILS = {email.strip().lower() for email in
                       os.getenv('SUPER_ADMIN_EMAILS', os.getenv('ADMIN_EMAIL', '')).split(',') if email.strip()}
 REGISTRATION_INBOX = os.getenv('REGISTRATION_INBOX', 'info@ads-wise.com').strip()
@@ -98,6 +108,8 @@ SESSION_DAYS = 7
 _LOGIN_ATTEMPTS: dict[str, list[float]] = {}
 _HEATMAP_BATCHES: dict[str, list[float]] = {}
 _RATE_LOCK = threading.Lock()
+_META_RATE_LOCK = threading.Lock()
+_META_CONCURRENCY = threading.BoundedSemaphore(META_MAX_CONCURRENCY)
 
 
 def utcnow() -> str:
@@ -319,6 +331,46 @@ def init_db():
         CREATE TABLE IF NOT EXISTS meta_rate_limits(
           scope TEXT PRIMARY KEY, blocked_until TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
           updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS meta_rate_state(
+          scope TEXT PRIMARY KEY, tokens REAL NOT NULL, last_refill_at TEXT NOT NULL,
+          last_request_at TEXT NOT NULL DEFAULT '', consecutive_failures INTEGER NOT NULL DEFAULT 0,
+          circuit_open_until TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS meta_api_requests(
+          id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, connection_ref TEXT NOT NULL,
+          method TEXT NOT NULL, endpoint TEXT NOT NULL, request_fingerprint TEXT NOT NULL,
+          attempt INTEGER NOT NULL, outcome TEXT NOT NULL, status_code INTEGER NOT NULL DEFAULT 0,
+          error_kind TEXT NOT NULL DEFAULT '', meta_code INTEGER NOT NULL DEFAULT 0,
+          duration_ms INTEGER NOT NULL DEFAULT 0, usage TEXT NOT NULL DEFAULT '{}',
+          cooling_decision TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS meta_requests_tenant_time
+          ON meta_api_requests(tenant_id,created_at DESC);
+        CREATE INDEX IF NOT EXISTS meta_requests_connection_time
+          ON meta_api_requests(connection_ref,created_at DESC);
+        CREATE TABLE IF NOT EXISTS meta_webhook_events(
+          id TEXT PRIMARY KEY, event_key TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL,
+          object_type TEXT NOT NULL, object_id TEXT NOT NULL, event_type TEXT NOT NULL,
+          payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL, processed_at TEXT NOT NULL DEFAULT '',
+          FOREIGN KEY(tenant_id) REFERENCES tenants(id));
+        CREATE INDEX IF NOT EXISTS meta_webhooks_tenant_status
+          ON meta_webhook_events(tenant_id,status,received_at DESC);
+        CREATE TABLE IF NOT EXISTS meta_comment_actions(
+          id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE,
+          comment_id TEXT NOT NULL, asset_type TEXT NOT NULL, asset_id TEXT NOT NULL,
+          author_id TEXT NOT NULL DEFAULT '', comment_text TEXT NOT NULL DEFAULT '',
+          classification TEXT NOT NULL, policy_decision TEXT NOT NULL,
+          action TEXT NOT NULL, status TEXT NOT NULL, reply_text TEXT NOT NULL DEFAULT '',
+          remote_reply_id TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+          FOREIGN KEY(tenant_id) REFERENCES tenants(id),
+          FOREIGN KEY(event_id) REFERENCES meta_webhook_events(id));
+        CREATE UNIQUE INDEX IF NOT EXISTS meta_comment_reply_once
+          ON meta_comment_actions(tenant_id,comment_id) WHERE remote_reply_id <> '';
+        CREATE TABLE IF NOT EXISTS meta_comment_settings(
+          tenant_id TEXT PRIMARY KEY, ingestion_enabled INTEGER NOT NULL DEFAULT 1,
+          automatic_replies_enabled INTEGER NOT NULL DEFAULT 0,
+          updated_by TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+          FOREIGN KEY(tenant_id) REFERENCES tenants(id));
         ''')
         if db.postgres:
             db.execute('ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS tenant_paused INTEGER NOT NULL DEFAULT 0')
@@ -776,12 +828,14 @@ META_REAUTH_KINDS = ('token_expired', 'token_invalid')
 
 
 class MetaAPIError(Exception):
-    def __init__(self, kind: str, provider_message: str = '', code: int = 0, subcode: int = 0):
+    def __init__(self, kind: str, provider_message: str = '', code: int = 0, subcode: int = 0,
+                 status_code: int = 0):
         super().__init__(kind)
         self.kind = kind if kind in META_ERROR_MESSAGES else 'meta_error'
         self.provider_message = provider_message[:300]
         self.code = code
         self.subcode = subcode
+        self.status_code = status_code
 
     def user_message(self, context: str = '') -> str:
         base = META_ERROR_MESSAGES[self.kind]
@@ -907,47 +961,198 @@ def meta_appsecret_proof(access_token: str) -> str:
     return hmac.new(META_APP_SECRET.encode(), access_token.encode(), hashlib.sha256).hexdigest()
 
 
+def meta_request_identity(tenant_id: str) -> tuple[str, str]:
+    """Return durable isolation scope and a non-reversible connection reference."""
+    customer_id = ''
+    if tenant_id:
+        with connect() as db:
+            row = qrow(db, "SELECT customer_id FROM provider_connections WHERE tenant_id=? AND provider='meta'",
+                       (tenant_id,))
+        customer_id = row['customer_id'] if row else ''
+    connection_ref = hashlib.sha256(f'{tenant_id}:{customer_id}'.encode()).hexdigest()[:24]
+    return f'tenant:{tenant_id}:{connection_ref}' if tenant_id else 'app:unscoped', connection_ref
+
+
+def meta_safe_endpoint(path: str) -> str:
+    """Keep request logs useful without retaining account, asset, or user identifiers."""
+    clean = path.split('?', 1)[0].strip('/')
+    return re.sub(r'(?<![A-Za-z])(?:act_)?\d{4,}(?![A-Za-z])', ':id', clean)[:180]
+
+
+def meta_usage_snapshot(headers) -> dict:
+    """Keep numeric throttle evidence while dropping account identifiers from durable logs."""
+    snapshot: dict = {}
+    try:
+        app = json.loads(headers.get('x-app-usage') or '{}')
+        if isinstance(app, dict):
+            snapshot['app_max_percent'] = _meta_usage_percent(app)
+    except (TypeError, ValueError):
+        pass
+    try:
+        business = json.loads(headers.get('x-business-use-case-usage') or '{}')
+        rows = [row for values in business.values() for row in values
+                if isinstance(values, list) and isinstance(row, dict)] if isinstance(business, dict) else []
+        if rows:
+            snapshot['business_max_percent'] = max(_meta_usage_percent(row) for row in rows)
+            snapshot['estimated_regain_minutes'] = max(
+                int(float(row.get('estimated_time_to_regain_access') or 0)) for row in rows)
+    except (TypeError, ValueError):
+        pass
+    try:
+        account = json.loads(headers.get('x-ad-account-usage') or '{}')
+        if isinstance(account, dict):
+            snapshot['account_max_percent'] = _meta_usage_percent(account)
+            snapshot['account_reset_seconds'] = int(float(account.get('reset_time_duration') or 0))
+    except (TypeError, ValueError):
+        pass
+    return snapshot
+
+
+def meta_rate_acquire(tenant_id: str) -> tuple[str, str]:
+    """Consume one token from a durable tenant/connection bucket and conservatively pace calls."""
+    scope, connection_ref = meta_request_identity(tenant_id)
+    now_dt = datetime.now(timezone.utc)
+    wait_seconds = 0.0
+    with _META_RATE_LOCK, connect() as db:
+        row = qrow(db, 'SELECT * FROM meta_rate_state WHERE scope=?', (scope,))
+        if row and row['circuit_open_until'] and row['circuit_open_until'] > utcnow():
+            raise MetaAPIError('cooling_down', row['circuit_open_until'])
+        last_refill = datetime.fromisoformat(row['last_refill_at']) if row else now_dt
+        if last_refill.tzinfo is None:
+            last_refill = last_refill.replace(tzinfo=timezone.utc)
+        tokens = min(float(META_RATE_CAPACITY),
+                     float(row['tokens']) + max(0.0, (now_dt - last_refill).total_seconds()) *
+                     META_RATE_REFILL_PER_SECOND) if row else float(META_RATE_CAPACITY)
+        if tokens < 1:
+            wait_seconds = (1 - tokens) / META_RATE_REFILL_PER_SECOND
+            tokens = 0.0
+        else:
+            tokens -= 1
+        if row and row['last_request_at']:
+            last_request = datetime.fromisoformat(row['last_request_at'])
+            if last_request.tzinfo is None:
+                last_request = last_request.replace(tzinfo=timezone.utc)
+            wait_seconds = max(wait_seconds,
+                               META_MIN_INTERVAL_SECONDS - max(0.0, (now_dt - last_request).total_seconds()))
+        db.execute('''INSERT INTO meta_rate_state(scope,tokens,last_refill_at,last_request_at,updated_at)
+                      VALUES(?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET tokens=excluded.tokens,
+                      last_refill_at=excluded.last_refill_at,last_request_at=excluded.last_request_at,
+                      updated_at=excluded.updated_at''',
+                   (scope, tokens, now_dt.isoformat(timespec='seconds'), now_dt.isoformat(timespec='seconds'),
+                    now_dt.isoformat(timespec='seconds')))
+    delay = max(0.0, wait_seconds) + random.uniform(0, META_JITTER_MAX_SECONDS)
+    if delay:
+        time.sleep(delay)
+    return scope, connection_ref
+
+
+def meta_request_log(tenant_id: str, connection_ref: str, method: str, path: str, params: dict,
+                     attempt: int, outcome: str, status_code: int, error_kind: str, meta_code: int,
+                     duration_ms: int, usage: dict, cooling_decision: str = '') -> None:
+    fingerprint = hashlib.sha256(json.dumps({
+        'method': method, 'endpoint': meta_safe_endpoint(path), 'parameter_names': sorted(params),
+    }, separators=(',', ':'), sort_keys=True).encode()).hexdigest()
+    with connect() as db:
+        db.execute('''INSERT INTO meta_api_requests(id,tenant_id,connection_ref,method,endpoint,
+                      request_fingerprint,attempt,outcome,status_code,error_kind,meta_code,duration_ms,usage,
+                      cooling_decision,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                   (secrets.token_hex(12), tenant_id, connection_ref, method, meta_safe_endpoint(path),
+                    fingerprint, attempt, outcome, status_code, error_kind, meta_code, duration_ms,
+                    json.dumps(usage, separators=(',', ':'), sort_keys=True), cooling_decision[:200], utcnow()))
+
+
+def meta_circuit_record(scope: str, tenant_id: str, failed: bool, force_open: bool = False) -> None:
+    """Open a durable circuit on throttling, repeated failures, or an elevated recent failure rate."""
+    with _META_RATE_LOCK, connect() as db:
+        row = qrow(db, 'SELECT consecutive_failures FROM meta_rate_state WHERE scope=?', (scope,))
+        consecutive = (int(row['consecutive_failures']) if row else 0) + 1 if failed else 0
+        recent = qrows(db, 'SELECT outcome,status_code FROM meta_api_requests WHERE tenant_id=? '
+                       'ORDER BY created_at DESC LIMIT 20', (tenant_id,)) if tenant_id else []
+        failures = sum(1 for item in recent if item['outcome'] != 'success')
+        elevated = (len(recent) >= META_CIRCUIT_MIN_SAMPLES and
+                    failures * 100 / len(recent) >= META_CIRCUIT_FAILURE_PERCENT)
+        open_circuit = force_open or consecutive >= 3 or elevated
+        until = ((datetime.now(timezone.utc) + timedelta(seconds=META_DEFAULT_COOLDOWN_SECONDS))
+                 .isoformat(timespec='seconds')) if open_circuit else ''
+        db.execute('UPDATE meta_rate_state SET consecutive_failures=?,circuit_open_until=?,updated_at=? '
+                   'WHERE scope=?', (consecutive, until, utcnow(), scope))
+    if open_circuit:
+        meta_set_cooldown(f'tenant:{tenant_id}' if tenant_id else 'app', META_DEFAULT_COOLDOWN_SECONDS,
+                          'Meta API circuit breaker opened')
+
+
+def meta_retry_after(headers, attempt: int) -> float:
+    try:
+        retry_after = max(0.0, float(headers.get('retry-after') or 0))
+    except (TypeError, ValueError):
+        retry_after = 0.0
+    return max(retry_after, min(30.0, 2 ** attempt)) + random.uniform(0, META_JITTER_MAX_SECONDS)
+
+
 def meta_graph(method: str, path: str, access_token: str = '', params: dict | None = None,
                timeout: int = 25, allow_during_cooldown: bool = False) -> dict:
-    """Single HTTP path to the Graph API. User tokens always carry appsecret_proof.
-
-    No automatic retries: while a Meta cool-down is active the call is refused locally, so Adswise
-    never hammers Meta into blocking the app or the workspace's ad account.
-    """
+    """Single controlled Graph API path with bounded retries for idempotent reads only."""
     tenant_id = _META_TENANT_SCOPE.get()
     cooling_until = '' if allow_during_cooldown else meta_cooldown_until(tenant_id)
     if cooling_until:
         raise MetaAPIError('cooling_down', cooling_until)
-    params = {key: value for key, value in (params or {}).items() if value is not None}
+    safe_params = {key: value for key, value in (params or {}).items() if value is not None}
+    request_params = dict(safe_params)
     if access_token:
-        params['access_token'] = access_token
-        params['appsecret_proof'] = meta_appsecret_proof(access_token)
+        request_params['access_token'] = access_token
+        request_params['appsecret_proof'] = meta_appsecret_proof(access_token)
     url = f'https://graph.facebook.com/{META_GRAPH_VERSION}/{path.lstrip("/")}'
-    try:
-        if method == 'GET':
-            response = httpx.get(url, params=params, timeout=timeout)
-        else:
-            response = httpx.post(url, data=params, timeout=timeout)
-    except httpx.HTTPError as exc:
-        raise MetaAPIError('network') from exc
-    try:
-        data = response.json()
-    except ValueError:
-        data = {}
-    if response.status_code >= 400 or (isinstance(data, dict) and data.get('error')):
-        error = data.get('error') if isinstance(data, dict) and isinstance(data.get('error'), dict) else {}
+    max_attempts = 1 + (META_MAX_READ_RETRIES if method == 'GET' else 0)
+    for attempt in range(1, max_attempts + 1):
+        started = time.monotonic()
+        with _META_CONCURRENCY:
+            scope, connection_ref = meta_rate_acquire(tenant_id)
+            try:
+                response = (httpx.get(url, params=request_params, timeout=timeout) if method == 'GET' else
+                            httpx.post(url, data=request_params, timeout=timeout))
+            except httpx.HTTPError as exc:
+                duration = int((time.monotonic() - started) * 1000)
+                meta_request_log(tenant_id, connection_ref, method, path, safe_params, attempt, 'failure', 0,
+                                 'network', 0, duration, {})
+                meta_circuit_record(scope, tenant_id, True)
+                if attempt < max_attempts:
+                    time.sleep(meta_retry_after({}, attempt))
+                    continue
+                raise MetaAPIError('network') from exc
         try:
-            code, subcode = int(error.get('code') or 0), int(error.get('error_subcode') or 0)
-        except (TypeError, ValueError):
-            code, subcode = 0, 0
-        kind = meta_error_kind(code, subcode)
-        meta_track_usage(response.headers, tenant_id, code if kind == 'rate_limited' else 0)
-        if not code and response.status_code >= 500:
-            raise MetaAPIError('temporary')
-        message = str(error.get('error_user_msg') or error.get('message') or '')
-        raise MetaAPIError(kind, message, code, subcode)
-    meta_track_usage(response.headers, tenant_id)
-    return data if isinstance(data, dict) else {}
+            data = response.json()
+        except ValueError:
+            data = {}
+        usage = meta_usage_snapshot(response.headers)
+        duration = int((time.monotonic() - started) * 1000)
+        if response.status_code >= 400 or (isinstance(data, dict) and data.get('error')):
+            error = data.get('error') if isinstance(data, dict) and isinstance(data.get('error'), dict) else {}
+            try:
+                code, subcode = int(error.get('code') or 0), int(error.get('error_subcode') or 0)
+            except (TypeError, ValueError):
+                code, subcode = 0, 0
+            kind = meta_error_kind(code, subcode)
+            if not code and response.status_code >= 500:
+                kind = 'temporary'
+            meta_track_usage(response.headers, tenant_id, code if kind == 'rate_limited' else 0)
+            cooling = meta_cooldown_until(tenant_id)
+            meta_request_log(tenant_id, connection_ref, method, path, safe_params, attempt, 'failure',
+                             response.status_code, kind, code, duration, usage,
+                             f'paused_until:{cooling}' if cooling else '')
+            meta_circuit_record(scope, tenant_id, True, kind == 'rate_limited' or response.status_code == 429)
+            if kind in ('network', 'temporary') and attempt < max_attempts:
+                time.sleep(meta_retry_after(response.headers, attempt))
+                continue
+            message = str(error.get('error_user_msg') or error.get('message') or '')
+            raise MetaAPIError(kind, message, code, subcode, response.status_code)
+        meta_track_usage(response.headers, tenant_id)
+        cooling = meta_cooldown_until(tenant_id)
+        meta_request_log(tenant_id, connection_ref, method, path, safe_params, attempt, 'success',
+                         response.status_code, '', 0, duration, usage,
+                         f'paused_until:{cooling}' if cooling else '')
+        meta_circuit_record(scope, tenant_id, False)
+        return data if isinstance(data, dict) else {}
+    raise MetaAPIError('temporary')
 
 
 def meta_get_all(path: str, access_token: str, params: dict, max_items: int = 500) -> list[dict]:
@@ -1788,6 +1993,11 @@ class MetaAssetSelectionBody(BaseModel):
     page_id: str = Field(default='', pattern=r'^\d{0,30}$')
     instagram_account_id: str = Field(default='', pattern=r'^\d{0,30}$')
     pixel_id: str = Field(default='', pattern=r'^\d{0,30}$')
+
+
+class MetaCommentPolicyBody(BaseModel):
+    ingestion_enabled: bool = True
+    automatic_replies_enabled: bool = False
 
 
 class MetaChangeRequestBody(BaseModel):
@@ -3503,6 +3713,193 @@ def meta_select_assets(tenant_id: str, body: MetaAssetSelectionBody, user=Depend
             'instagram_account_id': body.instagram_account_id, 'pixel_id': body.pixel_id})
         db.commit()
     return {'ok': True, 'ad_account': account, 'page': page, 'instagram_account': instagram, 'pixel': pixel}
+
+
+# ------------------------------- Meta: webhooks and comments --------------------------------------------
+
+def meta_webhook_signature_valid(raw_body: bytes, signature: str) -> bool:
+    if not META_APP_SECRET or not signature.startswith('sha256='):
+        return False
+    expected = hmac.new(META_APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature[7:], expected)
+
+
+def meta_webhook_tenant(object_id: str) -> str:
+    """Resolve a Page/Instagram webhook only through a unique server-side asset binding."""
+    if not object_id:
+        return ''
+    with connect() as db:
+        rows = qrows(db, '''SELECT tenant_id FROM meta_connection_state
+                            WHERE page_id=? OR instagram_id=?''', (object_id, object_id))
+    return rows[0]['tenant_id'] if len(rows) == 1 else ''
+
+
+def meta_comment_payload(object_type: str, object_id: str, change: dict) -> dict | None:
+    value = change.get('value') if isinstance(change.get('value'), dict) else {}
+    field = str(change.get('field') or '')
+    is_facebook_comment = field == 'feed' and value.get('item') == 'comment'
+    is_instagram_comment = field in ('comments', 'live_comments')
+    if not (is_facebook_comment or is_instagram_comment):
+        return None
+    author = value.get('from') if isinstance(value.get('from'), dict) else {}
+    comment_id = str(value.get('comment_id') or value.get('id') or '')
+    if not comment_id:
+        return None
+    return {'comment_id': comment_id, 'asset_type': 'instagram' if is_instagram_comment else 'facebook',
+            'asset_id': object_id, 'author_id': str(author.get('id') or value.get('from_id') or ''),
+            'text': str(value.get('message') or value.get('text') or '')[:4000],
+            'verb': str(value.get('verb') or 'add')}
+
+
+def meta_classify_comment(text: str) -> tuple[str, str, str]:
+    """Conservative policy gate: uncertain or sensitive comments always require a person."""
+    lowered = text.lower()
+    sensitive = ('refund', 'fraud', 'scam', 'lawyer', 'legal', 'injury', 'allergy', 'medical',
+                 'complaint', 'angry', 'harass', 'threat', 'emergency')
+    if any(term in lowered for term in sensitive):
+        return 'sensitive', 'human_required', 'escalate'
+    if not text.strip() or len(text.strip()) < 3:
+        return 'uncertain', 'human_required', 'escalate'
+    if re.search(r'https?://|(?:\b\w+\.){2,}\w+', lowered):
+        return 'possible_spam', 'human_required', 'escalate'
+    return 'routine', 'reply_requires_authorization', 'suggest_reply'
+
+
+def meta_store_webhook_event(tenant_id: str, object_type: str, object_id: str, event_type: str,
+                             payload: dict) -> tuple[str, bool]:
+    canonical = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
+    event_key = hashlib.sha256(f'{tenant_id}:{object_type}:{object_id}:{event_type}:{canonical}'.encode()).hexdigest()
+    now = utcnow()
+    with connect() as db:
+        existing = qrow(db, 'SELECT id FROM meta_webhook_events WHERE event_key=?', (event_key,))
+        if existing:
+            return existing['id'], False
+        event_id = secrets.token_hex(12)
+        db.execute('''INSERT INTO meta_webhook_events(id,event_key,tenant_id,object_type,object_id,event_type,
+                      payload,status,received_at) VALUES(?,?,?,?,?,?,?,?,?)''',
+                   (event_id, event_key, tenant_id, object_type, object_id, event_type, canonical,
+                    'pending', now))
+    return event_id, True
+
+
+def meta_process_comment_event(event_id: str, tenant_id: str, comment: dict) -> None:
+    classification, policy, action = meta_classify_comment(comment['text'])
+    now = utcnow()
+    with connect() as db:
+        existing = qrow(db, 'SELECT id FROM meta_comment_actions WHERE event_id=?', (event_id,))
+        if not existing:
+            db.execute('''INSERT INTO meta_comment_actions(id,tenant_id,event_id,comment_id,asset_type,asset_id,
+                          author_id,comment_text,classification,policy_decision,action,status,created_at,updated_at)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                       (secrets.token_hex(12), tenant_id, event_id, comment['comment_id'],
+                        comment['asset_type'], comment['asset_id'], comment['author_id'], comment['text'],
+                        classification, policy, action, 'awaiting_human', now, now))
+        db.execute("UPDATE meta_webhook_events SET status='processed',attempts=attempts+1,processed_at=? WHERE id=?",
+                   (now, event_id))
+
+
+@app.get('/api/integrations/meta/webhook')
+def meta_webhook_verify(request: Request):
+    mode = request.query_params.get('hub.mode', '')
+    token = request.query_params.get('hub.verify_token', '')
+    challenge = request.query_params.get('hub.challenge', '')
+    if mode != 'subscribe' or not META_WEBHOOK_VERIFY_TOKEN or not hmac.compare_digest(token,
+                                                                                       META_WEBHOOK_VERIFY_TOKEN):
+        raise HTTPException(403, 'Meta webhook verification failed')
+    return Response(content=challenge, media_type='text/plain')
+
+
+@app.post('/api/integrations/meta/webhook')
+async def meta_webhook_receive(request: Request):
+    raw_body = await request.body()
+    if len(raw_body) > 1_000_000:
+        raise HTTPException(413, 'Meta webhook payload is too large')
+    if not meta_webhook_signature_valid(raw_body, request.headers.get('x-hub-signature-256', '')):
+        raise HTTPException(401, 'Invalid Meta webhook signature')
+    try:
+        body = json.loads(raw_body)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, 'Invalid Meta webhook payload') from exc
+    object_type = str(body.get('object') or '') if isinstance(body, dict) else ''
+    accepted = duplicates = ignored = 0
+    for entry in body.get('entry', []) if isinstance(body, dict) else []:
+        if not isinstance(entry, dict):
+            continue
+        object_id = str(entry.get('id') or '')
+        tenant_id = meta_webhook_tenant(object_id)
+        if not tenant_id:
+            ignored += 1
+            continue
+        with connect() as db:
+            settings = qrow(db, 'SELECT ingestion_enabled FROM meta_comment_settings WHERE tenant_id=?',
+                            (tenant_id,))
+        if settings and not settings['ingestion_enabled']:
+            ignored += 1
+            continue
+        for change in entry.get('changes', []) if isinstance(entry.get('changes'), list) else []:
+            if not isinstance(change, dict):
+                continue
+            comment = meta_comment_payload(object_type, object_id, change)
+            if not comment or comment['verb'] in ('remove', 'hide'):
+                ignored += 1
+                continue
+            event_id, created = meta_store_webhook_event(tenant_id, object_type, object_id,
+                                                         str(change.get('field') or ''), change)
+            if not created:
+                duplicates += 1
+                continue
+            meta_process_comment_event(event_id, tenant_id, comment)
+            accepted += 1
+    return {'ok': True, 'accepted': accepted, 'duplicates': duplicates, 'ignored': ignored}
+
+
+@app.get('/api/workspaces/{tenant_id}/integrations/meta/comments')
+def meta_comments(tenant_id: str, user=Depends(tenant_member)):
+    with connect() as db:
+        rows = qrows(db, '''SELECT id,comment_id,asset_type,asset_id,comment_text,classification,
+                            policy_decision,action,status,created_at FROM meta_comment_actions
+                            WHERE tenant_id=? ORDER BY created_at DESC LIMIT 100''', (tenant_id,))
+    return {'comments': rows}
+
+
+@app.get('/api/workspaces/{tenant_id}/integrations/meta/rate-health')
+def meta_rate_health(tenant_id: str, user=Depends(tenant_member)):
+    _, connection_ref = meta_request_identity(tenant_id)
+    with connect() as db:
+        rows = qrows(db, '''SELECT outcome,status_code,error_kind,duration_ms,usage,cooling_decision,created_at
+                            FROM meta_api_requests WHERE tenant_id=? AND connection_ref=?
+                            ORDER BY created_at DESC LIMIT 20''', (tenant_id, connection_ref))
+        state = qrow(db, 'SELECT * FROM meta_rate_state WHERE scope=?',
+                     (f'tenant:{tenant_id}:{connection_ref}',))
+    successes = sum(1 for row in rows if row['outcome'] == 'success')
+    return {'sample_size': len(rows),
+            'success_rate_percent': round(successes * 100 / len(rows), 1) if rows else None,
+            'failure_count': len(rows) - successes,
+            'cooldown_until': meta_cooldown_until(tenant_id),
+            'circuit_open_until': state['circuit_open_until'] if state else '',
+            'consecutive_failures': state['consecutive_failures'] if state else 0,
+            'latest_usage': json.loads(rows[0]['usage']) if rows else {},
+            'latest_request_at': rows[0]['created_at'] if rows else ''}
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/meta/comments/policy')
+def meta_comment_policy(tenant_id: str, body: MetaCommentPolicyBody, user=Depends(tenant_writer)):
+    meta_require_owner(user, 'Only workspace owners can change Meta comment policy')
+    now = utcnow()
+    with connect() as db:
+        db.execute('''INSERT INTO meta_comment_settings(tenant_id,ingestion_enabled,automatic_replies_enabled,
+                      updated_by,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(tenant_id) DO UPDATE SET
+                      ingestion_enabled=excluded.ingestion_enabled,
+                      automatic_replies_enabled=excluded.automatic_replies_enabled,
+                      updated_by=excluded.updated_by,updated_at=excluded.updated_at''',
+                   (tenant_id, int(body.ingestion_enabled), int(body.automatic_replies_enabled),
+                    user['user_id'], now))
+        audit(db, user['user_id'], tenant_id, 'integration.meta_comment_policy_updated', {
+            'ingestion_enabled': body.ingestion_enabled,
+            'automatic_replies_enabled': body.automatic_replies_enabled})
+    return {'ok': True, 'ingestion_enabled': body.ingestion_enabled,
+            'automatic_replies_enabled': body.automatic_replies_enabled,
+            'automatic_reply_status': 'policy gate only; no automatic reply executor is enabled'}
 
 
 # ------------------------------- Meta: reporting --------------------------------------------------------
