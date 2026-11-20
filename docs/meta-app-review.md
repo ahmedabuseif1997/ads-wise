@@ -1,6 +1,6 @@
 # Meta App Review — submission draft
 
-**Live status checked 2026-11-20:** app published and business verified. Marketing API Access Tier remains **Testing in progress: 3/500 calls, 85% success required**. The Access Tier App Review is rejected. Completed permission tests are not Advanced Access approval. The live permissions table shows `ads_read`, `ads_management`, `pages_read_engagement`, and `pages_show_list` as **Verification required**; `business_management` and `pages_manage_ads` as **Ready for testing**; `public_profile` as **Ready to publish**.
+**Live status checked 2026-11-20:** app published and business verified. Meta approved the November 19 submission for `pages_show_list`, `ads_read`, `pages_read_engagement`, `public_profile`, `ads_management`, `business_management`, and `pages_manage_ads`. Marketing API Access Tier remains **Testing in progress: 3/500 legitimate API calls, with at least 85% success required**. The previous Access Tier submissions were not approved, and a new Access Tier submission cannot be completed until this live testing threshold is met. Permission approval does not by itself grant Marketing API Access Tier.
 
 | | |
 |---|---|
