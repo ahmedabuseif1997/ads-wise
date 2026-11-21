@@ -568,9 +568,11 @@ def tiktok_configured() -> bool:
                 GOOGLE_TOKEN_ENCRYPTION_KEY)
 
 
-def integration_redirect(provider: str, result: str, reason: str = '') -> RedirectResponse:
+def integration_redirect(provider: str, result: str, reason: str = '', tenant_id: str = '') -> RedirectResponse:
     suffix = f'&reason={quote(reason)}' if reason else ''
-    return RedirectResponse(f'{PUBLIC_ORIGIN}/app?view=accounts&{provider}={result}{suffix}', status_code=303)
+    tenant = f'&tenant={quote(tenant_id)}' if tenant_id else ''
+    return RedirectResponse(
+        f'{PUBLIC_ORIGIN}/app?view=accounts{tenant}&{provider}={result}{suffix}', status_code=303)
 
 
 def consume_oauth_state(state: str, user: dict) -> dict | None:
@@ -3466,17 +3468,17 @@ def meta_oauth_callback(request: Request, code: str = '', state: str = '', error
         return integration_redirect('meta', 'error', 'session')
     saved = consume_oauth_state(state, user) if state else None
     if error:
-        return integration_redirect('meta', 'error', 'denied')
+        return integration_redirect('meta', 'error', 'denied', saved['tenant_id'] if saved else '')
     if not saved:
         return integration_redirect('meta', 'error', 'state')
-    if not code:
-        return integration_redirect('meta', 'error', 'invalid')
-    if not meta_configured():
-        return integration_redirect('meta', 'error', 'not_configured')
     tenant_id = saved['tenant_id']
+    if not code:
+        return integration_redirect('meta', 'error', 'invalid', tenant_id)
+    if not meta_configured():
+        return integration_redirect('meta', 'error', 'not_configured', tenant_id)
     meta_set_scope(tenant_id)
     if meta_cooldown_until(tenant_id):
-        return integration_redirect('meta', 'error', 'cooling_down')
+        return integration_redirect('meta', 'error', 'cooling_down', tenant_id)
     try:
         access_token = meta_graph('GET', 'oauth/access_token', params={
             'client_id': META_APP_ID, 'client_secret': META_APP_SECRET,
@@ -3484,7 +3486,7 @@ def meta_oauth_callback(request: Request, code: str = '', state: str = '', error
         if not access_token:
             raise MetaAPIError('token_invalid')
     except MetaAPIError as exc:
-        return integration_redirect('meta', 'error', exc.kind)
+        return integration_redirect('meta', 'error', exc.kind, tenant_id)
     exchanged, exchange_expires_in, exchange_error = False, 0, ''
     try:
         # User-token configurations: swap the short-lived (~1-2 h) token for a long-lived (~60 day) one.
@@ -3503,7 +3505,7 @@ def meta_oauth_callback(request: Request, code: str = '', state: str = '', error
         summary = meta_debug_token(access_token)
     except MetaAPIError as exc:
         if exc.kind not in ('cooling_down', 'rate_limited', 'temporary', 'network'):
-            return integration_redirect('meta', 'error', exc.kind)
+            return integration_redirect('meta', 'error', exc.kind, tenant_id)
         fallback_expiry = ((datetime.now(timezone.utc) + timedelta(seconds=exchange_expires_in))
                            .isoformat(timespec='seconds') if exchange_expires_in else '')
         summary = {'valid': True, 'app_id': META_APP_ID, 'user_id': '', 'expires_at': fallback_expiry,
@@ -3514,11 +3516,11 @@ def meta_oauth_callback(request: Request, code: str = '', state: str = '', error
     problem = meta_token_problem(summary)
     if problem:
         return integration_redirect('meta', 'error', 'app_mismatch' if summary.get('app_id') != META_APP_ID
-                                    else problem)
+                                    else problem, tenant_id)
     try:
         info = meta_store_authorization(tenant_id, access_token, summary)
     except HTTPException:
-        return integration_redirect('meta', 'error', 'not_configured')
+        return integration_redirect('meta', 'error', 'not_configured', tenant_id)
     result, reason, previous_check = 'authorized', '', 'none'
     if info['previous_ad_account']:
         try:
@@ -3572,7 +3574,7 @@ def meta_oauth_callback(request: Request, code: str = '', state: str = '', error
             'meta_user_id': summary.get('user_id', ''), 'granted_scopes': summary.get('scopes', []),
             'missing_scopes': missing, 'ad_account_kept': result == 'connected',
             'token_expires_at': summary.get('expires_at', ''), 'permission_diagnostics': diagnostics})
-    return integration_redirect('meta', result, reason)
+    return integration_redirect('meta', result, reason, tenant_id)
 
 
 # ------------------------------- Meta: asset selection ---------------------------------------------------

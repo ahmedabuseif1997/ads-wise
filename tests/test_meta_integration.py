@@ -300,7 +300,8 @@ def test_callback_encrypts_token_records_scopes_and_requires_asset_choice(client
     tid, hdr = session(client)
     response = connect_meta(client, tid, hdr, 'code-A')
     assert response.status_code == 303
-    assert response.headers['location'] == 'https://ads-wise.com/app?view=accounts&meta=authorized'
+    assert response.headers['location'] == (
+        f'https://ads-wise.com/app?view=accounts&tenant={tid}&meta=authorized')
     assert [call[1] for call in fake.calls] == ['oauth/access_token', 'oauth/access_token', 'debug_token']
     with main.connect() as db:
         stored = main.qrow(db, "SELECT * FROM provider_connections WHERE tenant_id=? AND provider='meta'", (tid,))
@@ -329,6 +330,12 @@ def test_callback_rejects_reused_foreign_denied_and_sessionless_states(client, f
     state = parse_qs(urlparse(start.json()['authorization_url']).query)['state'][0]
     denied = client.get(f'/api/integrations/meta/callback?error=access_denied&state={state}', follow_redirects=False)
     assert denied.headers['location'].endswith('meta=error&reason=denied')
+    assert f'tenant={tid}' in denied.headers['location']
+    start = client.post(f'/api/workspaces/{tid}/integrations/meta/start', headers=hdr, json={})
+    state = parse_qs(urlparse(start.json()['authorization_url']).query)['state'][0]
+    invalid = client.get(f'/api/integrations/meta/callback?state={state}', follow_redirects=False)
+    assert invalid.headers['location'].endswith('meta=error&reason=invalid')
+    assert f'tenant={tid}' in invalid.headers['location']
     anonymous = TestClient(main.app).get('/api/integrations/meta/callback?code=code-A&state=x', follow_redirects=False)
     assert anonymous.headers['location'].endswith('meta=error&reason=session')
     assert fake.calls == []
