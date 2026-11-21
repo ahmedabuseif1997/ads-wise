@@ -579,12 +579,21 @@ def consume_oauth_state(state: str, user: dict) -> dict | None:
     state_hash = hashlib.sha256(state.encode()).hexdigest()
     with connect() as db:
         saved = qrow(db, 'SELECT * FROM oauth_states WHERE state_hash=?', (state_hash,))
-        db.execute('DELETE FROM oauth_states WHERE state_hash=?', (state_hash,))
-        if not saved or saved['user_id'] != user['user_id'] or saved['expires_at'] <= utcnow():
+        if not saved:
+            return None
+        if saved['expires_at'] <= utcnow():
+            db.execute('DELETE FROM oauth_states WHERE state_hash=?', (state_hash,))
+            return None
+        if saved['user_id'] != user['user_id']:
             return None
         membership = qrow(db, 'SELECT role FROM memberships WHERE user_id=? AND tenant_id=?',
                           (user['user_id'], saved['tenant_id']))
-        return saved if membership and membership['role'] == 'owner' else None
+        tenant_exists = qrow(db, 'SELECT id FROM tenants WHERE id=?', (saved['tenant_id'],))
+        authorized = (membership and membership['role'] == 'owner') or (is_super_admin(user) and tenant_exists)
+        if not authorized:
+            return None
+        db.execute('DELETE FROM oauth_states WHERE state_hash=?', (state_hash,))
+        return saved
 
 
 def save_provider_connection(tenant_id: str, provider: str, token: str, account_id: str,

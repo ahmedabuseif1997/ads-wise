@@ -90,6 +90,7 @@ def test_health_and_static(client):
     assert 'tenantLoading:false' in app_js.text
     assert 'workspace?.tenant?.id===id' in app_js.text
     assert 'tenantReady(tenant)' in app_js.text
+    assert 'Meta refreshes only when the owner explicitly chooses Sync Meta' in app_js.text
     assert client.get('/assets/workspace-isolation.js').status_code==200
     assert client.get('/assets/landing.css').status_code==200
     assert client.get('/assets/cinematic.css').status_code==200

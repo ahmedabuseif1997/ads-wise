@@ -316,6 +316,20 @@ def test_callback_encrypts_token_records_scopes_and_requires_asset_choice(client
     assert 'token-A' not in client.get(f'/api/workspaces/{tid}/integrations/meta/health').text
 
 
+def test_super_admin_callback_can_finish_workspace_without_membership(client, fake):
+    _, hdr = session(client)
+    tid = client.post('/api/workspaces', headers=hdr, json={'name': 'Reviewer Workspace'}).json()['id']
+    with main.connect() as db:
+        db.execute('DELETE FROM memberships WHERE tenant_id=?', (tid,))
+    response = connect_meta(client, tid, hdr, 'code-A')
+    assert response.headers['location'] == (
+        f'https://ads-wise.com/app?view=accounts&tenant={tid}&meta=authorized')
+    with main.connect() as db:
+        stored = main.qrow(db, "SELECT status FROM provider_connections WHERE tenant_id=? AND provider='meta'",
+                           (tid,))
+    assert stored['status'] == 'authorized'
+
+
 def test_callback_rejects_reused_foreign_denied_and_sessionless_states(client, fake):
     tid, hdr = session(client)
     start = client.post(f'/api/workspaces/{tid}/integrations/meta/start', headers=hdr, json={})
@@ -323,14 +337,12 @@ def test_callback_rejects_reused_foreign_denied_and_sessionless_states(client, f
     other, _ = member_client(tid, 'manager@example.com', 'manager')
     foreign = other.get(f'/api/integrations/meta/callback?code=code-A&state={state}', follow_redirects=False)
     assert foreign.headers['location'].endswith('meta=error&reason=state')
-    # The foreign attempt consumed the state, so the owner cannot replay it either.
-    replay = client.get(f'/api/integrations/meta/callback?code=code-A&state={state}', follow_redirects=False)
-    assert replay.headers['location'].endswith('meta=error&reason=state')
-    start = client.post(f'/api/workspaces/{tid}/integrations/meta/start', headers=hdr, json={})
-    state = parse_qs(urlparse(start.json()['authorization_url']).query)['state'][0]
+    # A foreign session cannot invalidate the owner's one-time state.
     denied = client.get(f'/api/integrations/meta/callback?error=access_denied&state={state}', follow_redirects=False)
     assert denied.headers['location'].endswith('meta=error&reason=denied')
     assert f'tenant={tid}' in denied.headers['location']
+    replay = client.get(f'/api/integrations/meta/callback?code=code-A&state={state}', follow_redirects=False)
+    assert replay.headers['location'].endswith('meta=error&reason=state')
     start = client.post(f'/api/workspaces/{tid}/integrations/meta/start', headers=hdr, json={})
     state = parse_qs(urlparse(start.json()['authorization_url']).query)['state'][0]
     invalid = client.get(f'/api/integrations/meta/callback?state={state}', follow_redirects=False)
