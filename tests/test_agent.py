@@ -85,7 +85,11 @@ def test_health_and_static(client):
     assert 'info@ads-wise.com' in authority.text
     assert client.get('/assets/style.css').status_code==200
     assert client.get('/assets/analytics.css').status_code==200
-    assert client.get('/assets/app.js').status_code==200
+    app_js=client.get('/assets/app.js')
+    assert app_js.status_code==200
+    assert 'tenantLoading:false' in app_js.text
+    assert 'workspace?.tenant?.id===id' in app_js.text
+    assert 'tenantReady(tenant)' in app_js.text
     assert client.get('/assets/workspace-isolation.js').status_code==200
     assert client.get('/assets/landing.css').status_code==200
     assert client.get('/assets/cinematic.css').status_code==200
