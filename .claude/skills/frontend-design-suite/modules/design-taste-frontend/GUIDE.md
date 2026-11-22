@@ -25,7 +25,7 @@ Build the website a good company would ship: it says plainly what is sold, shows
 every screen, and looks made for this client, not from a template and not like an art piece.
 figma.com and x.ai are the bar (in words: `layout-v4.md` section 1).
 
-`<skill>` is this folder (`.claude/skills/frontend-design-suite/modules/design-taste-frontend`). It needs Node 22+ and Chrome, Edge or Chromium (ffmpeg optional).
+`<skill>` is this folder (`<suite>/modules/design-taste-frontend`, where `<suite>` is the folder holding the suite SKILL.md). It needs Node 22+ and Chrome, Edge or Chromium (ffmpeg optional).
 
 ## House rules
 

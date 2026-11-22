@@ -1,12 +1,6 @@
 ---
 name: frontend-design-suite
-description: >-
-  One skill for frontend design, build, review and browser testing. Use whenever you build, design,
-  redesign, restyle, polish, critique, audit or animate a website, landing page, dashboard, app UI,
-  component or design system (DESIGN.md); when a page looks generic or "AI-made"; when the user wants
-  a UI that looks like a named brand or site (Apple, Stripe, Linear, Vercel, Notion, Nike, x.ai and 77
-  more); and when you need to automate a browser, write or run Playwright tests, set up React/Vue
-  component tests, or inspect Playwright trace files.
+description: "Design, build, restyle, critique or polish websites, landing pages, app UI and design systems; match a named brand look; test in a browser with Playwright."
 user-invocable: true
 argument-hint: "[build|style <site>|impeccable <command>|browser|component-test|trace] [target]"
 allowed-tools: Bash(playwright-cli:*) Bash(npx playwright:*) Bash(npx --no-install playwright:*)
@@ -20,7 +14,7 @@ hooks:
 
 # Frontend Design Suite
 
-Six modules merged into one skill. `<suite>` = `.claude/skills/frontend-design-suite` (this folder).
+Six modules merged into one skill. `<suite>` = the folder that contains this SKILL.md (the skill base directory the runtime reports; in this repo `.claude/skills/frontend-design-suite`, when synced from claude.ai somewhere else). Always use absolute paths built from it.
 Each module keeps its full original instructions in `<suite>/modules/<module>/GUIDE.md`; every
 relative path inside a GUIDE.md (`references/…`, `reference/…`, `scripts/…`, `assets/…`, `designs/…`)
 resolves against that module's own folder, never against `<suite>`.
