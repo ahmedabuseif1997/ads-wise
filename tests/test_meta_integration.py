@@ -96,6 +96,13 @@ class FakeMeta:
         self.campaign_rows = {'act_111': [{'id': '8001', 'name': 'Existing A', 'status': 'ACTIVE',
                                            'effective_status': 'ACTIVE', 'objective': 'OUTCOME_TRAFFIC'}],
                               'act_222': []}
+        self.adset_rows = {'act_111': [{'id': '8101', 'name': 'Existing ad set', 'status': 'ACTIVE',
+                                       'effective_status': 'ACTIVE', 'campaign_id': '8001'}],
+                           'act_222': []}
+        self.ad_rows = {'act_111': [{'id': '8201', 'name': 'Existing ad', 'status': 'ACTIVE',
+                                     'effective_status': 'ACTIVE', 'campaign_id': '8001',
+                                     'adset_id': '8101'}],
+                        'act_222': []}
         self.insight_rows = {'act_111': [{'campaign_id': '8001', 'campaign_name': 'Existing A', 'spend': '120.50',
                                           'impressions': '10000', 'clicks': '250',
                                           'actions': [{'action_type': 'lead', 'value': '7'},
@@ -183,6 +190,10 @@ class FakeMeta:
                     return {'data': user['pixels'].get(account, [])}
                 if name == 'campaigns':
                     return {'data': self.campaign_rows.get(account, [])}
+                if name == 'adsets':
+                    return {'data': self.adset_rows.get(account, [])}
+                if name == 'ads':
+                    return {'data': self.ad_rows.get(account, [])}
                 if name == 'insights':
                     rows = self.daily_rows if params.get('level') == 'account' else self.insight_rows
                     return {'data': rows.get(account, [])}
@@ -458,6 +469,14 @@ def test_sync_counts_conversions_once_caches_per_workspace_and_never_leaks(clien
     assert data['totals'] == {'impressions': 10000, 'clicks': 250, 'spend': '120.50', 'conversions': 10.0,
                               'ctr_percent': 2.5}
     assert data['campaigns'][0]['conversions_by_event'] == {'lead': 7.0, 'schedule': 3.0}
+    assert data['asset_inventory'] == {'campaigns': 1, 'ad_sets': 1, 'ads': 1}
+    assert data['delivery_coverage'] == {'campaigns': 1, 'ad_sets': 1, 'ads': 1}
+    sync_calls = [(path, params.get('level')) for method, path, _, params in fake.calls
+                  if method == 'GET' and path.startswith('act_111/')]
+    assert sync_calls[-7:] == [
+        ('act_111/campaigns', None), ('act_111/adsets', None), ('act_111/ads', None),
+        ('act_111/insights', 'campaign'), ('act_111/insights', 'adset'),
+        ('act_111/insights', 'ad'), ('act_111/insights', 'account')]
     calls = len(fake.calls)
     assert client.post(f'/api/workspaces/{tid}/integrations/meta/sync?range=last_30_days', headers=hdr,
                        json={}).json() == data
