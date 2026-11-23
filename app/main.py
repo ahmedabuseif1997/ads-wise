@@ -2569,6 +2569,12 @@ def developer_mcp(request_body: dict, request: Request):
              'inputSchema':{'type':'object','required':['id','status'],'properties':{
                  'id':{'type':'string'},'status':{'type':'string','enum':['in_progress','needs_approval','completed','failed']},
                  'branch_name':{'type':'string'},'pull_request_url':{'type':'string'}},'additionalProperties':False}}
+            ,{'name':'run_safe_meta_refresh',
+              'description':'Run one guarded, read-only Meta analytics refresh for one tenant.',
+              'inputSchema':{'type':'object','required':['tenant_id'],'properties':{
+                  'tenant_id':{'type':'string','minLength':24,'maxLength':64},
+                  'range':{'type':'string','enum':['yesterday','this_week','last_week','last_30_days']}},
+                  'additionalProperties':False}}
             ,{'name':'report_runner_status','description':'Report a secured local runner heartbeat.',
               'inputSchema':{'type':'object','required':['agent','status','runner_name'],'properties':{
                   'agent':{'type':'string','enum':['codex','claude']},
@@ -2606,6 +2612,22 @@ def developer_mcp(request_body: dict, request: Request):
                               WHERE id=?''',(status,str(args.get('branch_name',''))[:200],pull_request_url,
                                              utcnow(),task['id']))
             payload={'ok':True,'status':status}
+        elif name == 'run_safe_meta_refresh':
+            tenant_id=str(args.get('tenant_id','')).strip()
+            report_range=str(args.get('range') or 'last_30_days')
+            guard=meta_safe_refresh_guard(tenant_id)
+            started_at=utcnow()
+            snapshot=meta_metrics_sync(tenant_id,range=report_range,force=True,
+                                       user={'user_id':'mcp:developer'})
+            with connect() as db:
+                requests=qrows(db,'''SELECT endpoint,outcome,status_code,error_kind,attempt,usage,
+                                      cooling_decision,created_at FROM meta_api_requests
+                                      WHERE tenant_id=? AND created_at>=? ORDER BY created_at''',
+                              (tenant_id,started_at))
+            payload={'ok':True,'tenant_id':tenant_id,'synced_at':snapshot['synced_at'],
+                     'asset_inventory':snapshot.get('asset_inventory',{}),
+                     'delivery_coverage':snapshot.get('delivery_coverage',{}),
+                     'guard':guard,'request_count':len(requests),'requests':requests}
         elif name == 'report_runner_status':
             agent,status=str(args.get('agent','')),str(args.get('status',''))
             runner_name=str(args.get('runner_name','')).strip()[:120]
@@ -3891,6 +3913,45 @@ def meta_rate_health(tenant_id: str, user=Depends(tenant_member)):
             'consecutive_failures': state['consecutive_failures'] if state else 0,
             'latest_usage': json.loads(rows[0]['usage']) if rows else {},
             'latest_request_at': rows[0]['created_at'] if rows else ''}
+
+
+def meta_safe_refresh_guard(tenant_id: str, minimum_age_seconds: int = 15 * 60) -> dict:
+    """Fail closed unless one tenant/connection is healthy enough for a scheduled read batch."""
+    if not tenant_id:
+        raise HTTPException(422, 'A tenant is required')
+    meta_ready_connection(tenant_id)
+    _, connection_ref = meta_request_identity(tenant_id)
+    with connect() as db:
+        rows = qrows(db, '''SELECT outcome,status_code,error_kind,usage,cooling_decision,created_at
+                            FROM meta_api_requests WHERE tenant_id=? AND connection_ref=?
+                            ORDER BY created_at DESC LIMIT 20''', (tenant_id, connection_ref))
+        state = qrow(db, 'SELECT consecutive_failures,circuit_open_until FROM meta_rate_state WHERE scope=?',
+                     (f'tenant:{tenant_id}:{connection_ref}',))
+    cooldown_until = meta_cooldown_until(tenant_id)
+    if cooldown_until:
+        raise HTTPException(429, meta_cooldown_message(cooldown_until))
+    if state and (state['circuit_open_until'] or int(state['consecutive_failures'] or 0)):
+        raise HTTPException(429, 'Meta refresh paused because its circuit breaker is not healthy')
+    successes = sum(1 for row in rows if row['outcome'] == 'success')
+    success_rate = round(successes * 100 / len(rows), 1) if rows else 100.0
+    if success_rate < 85 or any(row['status_code'] == 429 or row['error_kind'] == 'rate_limited' for row in rows):
+        raise HTTPException(429, 'Meta refresh paused because recent API health is below the safety threshold')
+    if any(row['cooling_decision'] for row in rows):
+        raise HTTPException(429, 'Meta refresh paused because a recent request required cooling')
+    latest_at = rows[0]['created_at'] if rows else ''
+    if latest_at:
+        latest = datetime.fromisoformat(latest_at)
+        if latest.tzinfo is None:
+            latest = latest.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - latest).total_seconds() < minimum_age_seconds:
+            raise HTTPException(429, f'Meta refresh cooling guard requires {minimum_age_seconds} seconds between batches')
+    latest_usage = json.loads(rows[0]['usage'] or '{}') if rows else {}
+    usage_percent = max((float(value or 0) for value in latest_usage.values()
+                         if isinstance(value, (int, float))), default=0)
+    if usage_percent >= META_USAGE_CEILING_PERCENT:
+        raise HTTPException(429, 'Meta refresh paused because the latest usage header is elevated')
+    return {'sample_size':len(rows),'success_rate_percent':success_rate,'latest_request_at':latest_at,
+            'latest_usage_max_percent':usage_percent,'cooldown_until':'','consecutive_failures':0}
 
 
 @app.post('/api/workspaces/{tenant_id}/integrations/meta/comments/policy')

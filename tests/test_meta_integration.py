@@ -493,6 +493,41 @@ def test_sync_counts_conversions_once_caches_per_workspace_and_never_leaks(clien
     assert client.get(f'/api/workspaces/{tid}').json()['meta']['metrics'] is None
 
 
+def test_developer_mcp_meta_refresh_is_guarded_read_only_and_tenant_scoped(client, fake, monkeypatch):
+    tid, hdr = ready_workspace(client, fake)
+    monkeypatch.setattr(main, 'MCP_AGENT_TOKEN', 'test-mcp-token')
+    headers = {'Authorization': 'Bearer test-mcp-token'}
+    _, connection_ref = main.meta_request_identity(tid)
+    main.meta_request_log(tid, connection_ref, 'GET', 'act_111/campaigns', {}, 1, 'success',
+                          200, '', 0, 1, {}, '')
+    listed = client.post('/mcp/developer', headers=headers, json={
+        'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'})
+    assert 'run_safe_meta_refresh' in listed.text
+    too_soon = client.post('/mcp/developer', headers=headers, json={
+        'jsonrpc': '2.0', 'id': 2, 'method': 'tools/call', 'params': {
+            'name': 'run_safe_meta_refresh', 'arguments': {'tenant_id': tid}}})
+    assert too_soon.status_code == 429
+    with main.connect() as db:
+        db.execute("UPDATE meta_api_requests SET created_at='2026-01-01T00:00:00+00:00' WHERE tenant_id=?", (tid,))
+    def logged_graph(method, path, access_token='', params=None, timeout=25, allow_during_cooldown=False):
+        result = fake(method, path, access_token, params, timeout, allow_during_cooldown)
+        if method == 'GET' and path.startswith('act_111/'):
+            main.meta_request_log(tid, connection_ref, method, path, params or {}, 1, 'success',
+                                  200, '', 0, 1, {}, '')
+        return result
+    monkeypatch.setattr(main, 'meta_graph', logged_graph)
+    before = len(fake.calls)
+    refreshed = client.post('/mcp/developer', headers=headers, json={
+        'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {
+            'name': 'run_safe_meta_refresh', 'arguments': {'tenant_id': tid, 'range': 'last_30_days'}}})
+    assert refreshed.status_code == 200, refreshed.text
+    payload = json.loads(refreshed.json()['result']['content'][0]['text'])
+    assert payload['tenant_id'] == tid and payload['request_count'] == 7
+    assert all(item['outcome'] == 'success' and item['status_code'] == 200 for item in payload['requests'])
+    assert len(fake.calls) - before == 7
+    assert fake.posts() == []
+
+
 def test_meta_errors_are_classified_and_expired_tokens_require_reconnect(client, fake):
     assert main.meta_error_kind(190, 463) == 'token_expired'
     assert main.meta_error_kind(190, 460) == 'token_invalid'
