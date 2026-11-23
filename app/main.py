@@ -3990,8 +3990,19 @@ def meta_metrics_sync(tenant_id: str, range: str = 'last_30_days', force: bool =
     try:
         campaign_rows = meta_get_all(f'{ad_account_id}/campaigns', access_token, {
             'fields': 'id,name,status,effective_status,objective,daily_budget'}, 200)
+        adset_rows = meta_get_all(f'{ad_account_id}/adsets', access_token, {
+            'fields': 'id,name,status,effective_status,campaign_id'}, 500)
+        ad_rows = meta_get_all(f'{ad_account_id}/ads', access_token, {
+            'fields': 'id,name,status,effective_status,campaign_id,adset_id'}, 500)
         insight_rows = meta_get_all(f'{ad_account_id}/insights', access_token, {
             'level': 'campaign', 'fields': 'campaign_id,campaign_name,spend,impressions,clicks,actions',
+            'time_range': time_range}, 500)
+        adset_insight_rows = meta_get_all(f'{ad_account_id}/insights', access_token, {
+            'level': 'adset',
+            'fields': 'campaign_id,adset_id,adset_name,spend,impressions,clicks,actions',
+            'time_range': time_range}, 500)
+        ad_insight_rows = meta_get_all(f'{ad_account_id}/insights', access_token, {
+            'level': 'ad', 'fields': 'campaign_id,adset_id,ad_id,ad_name,spend,impressions,clicks,actions',
             'time_range': time_range}, 500)
         daily_rows = meta_get_all(f'{ad_account_id}/insights', access_token, {
             'level': 'account', 'fields': 'spend,impressions,clicks,actions', 'time_range': time_range,
@@ -4034,7 +4045,11 @@ def meta_metrics_sync(tenant_id: str, range: str = 'last_30_days', force: bool =
     snapshot = {'provider': 'meta', 'ad_account_id': ad_account_id, 'range': range, 'period': period_label,
                 'start_date': start_date.isoformat(), 'end_date': end_date.isoformat(),
                 'currency': connection['currency_code'] or 'AED', 'synced_at': utcnow(), 'totals': totals,
-                'campaigns': rows, 'daily': sorted(daily, key=lambda item: item['date'])}
+                'campaigns': rows, 'daily': sorted(daily, key=lambda item: item['date']),
+                'asset_inventory': {'campaigns': len(campaign_rows), 'ad_sets': len(adset_rows),
+                                    'ads': len(ad_rows)},
+                'delivery_coverage': {'campaigns': len(insight_rows), 'ad_sets': len(adset_insight_rows),
+                                      'ads': len(ad_insight_rows)}}
     with connect() as db:
         db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)
                       ON CONFLICT(tenant_id,provider) DO UPDATE SET payload=excluded.payload,
