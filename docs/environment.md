@@ -79,6 +79,7 @@ If no provider is configured, the UI labels results "Template only (AI not confi
 |---|---|---|
 | `TIKTOK_APP_ID`, `TIKTOK_APP_SECRET` | TikTok for Business app credentials | No |
 | `TIKTOK_AUTHORIZATION_URL` | Authorization URL copied from the TikTok app portal | No |
-| `TIKTOK_API_VERSION` | e.g. `v2.0` | No |
+| `TIKTOK_API_VERSION` | OAuth token API version; `v2.0` | No |
+| `TIKTOK_MARKETING_API_VERSION` | Campaign/read API version; `v1.3` | No |
 
 TikTok is not configured in production yet.

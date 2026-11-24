@@ -630,6 +630,70 @@ def test_meta_and_tiktok_oauth_start_are_scoped(client, monkeypatch):
     assert 'state=' in tiktok.json()['authorization_url']
 
 
+def test_tiktok_marketing_api_authorizes_selects_account_and_syncs_read_only(client, monkeypatch):
+    tid, hdr = session(client)
+    monkeypatch.setattr(main, 'PUBLIC_ORIGIN', 'https://ads-wise.com')
+    monkeypatch.setattr(main, 'GOOGLE_TOKEN_ENCRYPTION_KEY', Fernet.generate_key().decode())
+    monkeypatch.setattr(main, 'TIKTOK_APP_ID', 'tiktok-app')
+    monkeypatch.setattr(main, 'TIKTOK_APP_SECRET', 'tiktok-secret')
+    monkeypatch.setattr(main, 'TIKTOK_AUTHORIZATION_URL',
+                        'https://business-api.tiktok.com/authorize?app_id=tiktok-app')
+
+    class FakeResponse:
+        def __init__(self, payload): self.payload = payload
+        def raise_for_status(self): return None
+        def json(self): return self.payload
+
+    token_calls = []
+    def exchange(*args, **kwargs):
+        token_calls.append(kwargs['json'])
+        return FakeResponse({'code': 0, 'data': {'access_token': 'long-term-token',
+                            'advertiser_ids': ['7001', '7002']}})
+    monkeypatch.setattr(main.httpx, 'post', exchange)
+    started = client.post(f'/api/workspaces/{tid}/integrations/tiktok/start', headers=hdr, json={}).json()
+    state = parse_qs(urlparse(started['authorization_url']).query)['state'][0]
+    callback = client.get('/api/integrations/tiktok/callback',
+                          params={'auth_code': 'one-time-code', 'state': state})
+    assert callback.status_code == 200
+    assert 'tiktok=authorized' in str(callback.url)
+    assert token_calls[0]['is_long_term'] is True
+    assert token_calls[0]['return_advertiser_ids'] is True
+    accounts = client.get(f'/api/workspaces/{tid}/integrations/tiktok/accounts').json()['accounts']
+    assert [item['advertiser_id'] for item in accounts] == ['7001', '7002']
+
+    calls = []
+    def marketing_get(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith('/advertiser/info/'):
+            return FakeResponse({'code': 0, 'data': {'list': [{
+                'advertiser_id': '7002', 'name': 'Adswise UAE', 'currency': 'AED',
+                'timezone': 'Asia/Dubai'}]}})
+        if url.endswith('/campaign/get/'):
+            return FakeResponse({'code': 0, 'data': {'list': [{'campaign_id': 'c1'}]}})
+        if url.endswith('/adgroup/get/'):
+            return FakeResponse({'code': 0, 'data': {'list': [{'adgroup_id': 'g1'}]}})
+        if url.endswith('/ad/get/'):
+            return FakeResponse({'code': 0, 'data': {'list': [{'ad_id': 'a1'}]}})
+        return FakeResponse({'code': 0, 'data': {'list': [{
+            'dimensions': {'campaign_id': 'c1'},
+            'metrics': {'spend': '12.50', 'impressions': '1000', 'clicks': '50', 'conversion': '4'}}]}})
+    monkeypatch.setattr(main.httpx, 'get', marketing_get)
+    selected = client.post(f'/api/workspaces/{tid}/integrations/tiktok/account', headers=hdr,
+                           json={'advertiser_id': '7002'})
+    assert selected.status_code == 200 and selected.json()['account_name'] == 'Adswise UAE'
+    workspace = client.get(f'/api/workspaces/{tid}').json()
+    assert workspace['integrations']['tiktok']['customer_id'] == '7002'
+    assert workspace['integrations']['tiktok']['status'] == 'connected'
+
+    synced = client.post(f'/api/workspaces/{tid}/integrations/tiktok/sync', headers=hdr, json={})
+    assert synced.status_code == 200
+    assert synced.json()['totals'] == {'campaigns': 1, 'ad_groups': 1, 'ads': 1,
+                                      'spend': 12.5, 'impressions': 1000,
+                                      'clicks': 50, 'conversions': 4.0}
+    assert all(call[1]['headers'] == {'Access-Token': 'long-term-token'} for call in calls)
+    assert all('long-term-token' not in str(call[1].get('params')) for call in calls)
+
+
 def test_minimax_is_primary_provider(client, monkeypatch):
     tid, hdr = session(client)
     monkeypatch.setattr(main, 'MINIMAX_API_KEY', 'configured')

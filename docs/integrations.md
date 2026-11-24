@@ -59,7 +59,12 @@ Set `ARK_API_KEY` (server-side only), `ARK_BASE_URL=https://ark.ap-southeast.byt
 
 ## TikTok
 
-Needs a TikTok for Business developer app. Set `TIKTOK_APP_ID`, `TIKTOK_APP_SECRET`, `TIKTOK_AUTHORIZATION_URL` (from the app portal) and `TIKTOK_API_VERSION`, and register `<PUBLIC_ORIGIN>/api/integrations/tiktok/callback`. Not configured in production yet.
+Uses the official TikTok Marketing API. Set `TIKTOK_APP_ID`, `TIKTOK_APP_SECRET`, `TIKTOK_AUTHORIZATION_URL` (generated in the app portal), `TIKTOK_API_VERSION=v2.0` and `TIKTOK_MARKETING_API_VERSION=v1.3`; register `https://ads-wise.com/api/integrations/tiktok/callback`.
+
+- OAuth exchanges the one-time code for a long-term advertiser token on the server. Tokens are encrypted and never reach the browser or audit log.
+- The workspace owner chooses one advertiser account from those granted during authorization. An advertiser account can belong to only one workspace.
+- Sync is read-only and retrieves campaigns, ad groups, ads and 30-day campaign reporting. The snapshot is isolated by workspace and refreshes on app reload.
+- Campaign creation remains approval-gated and is not enabled by this read-only integration milestone.
 
 ## Website tracking tag (Pixels & Tracking)
 
