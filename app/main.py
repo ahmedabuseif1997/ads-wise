@@ -101,6 +101,7 @@ TIKTOK_APP_ID = os.getenv('TIKTOK_APP_ID', '').strip()
 TIKTOK_APP_SECRET = os.getenv('TIKTOK_APP_SECRET', '').strip()
 TIKTOK_AUTHORIZATION_URL = os.getenv('TIKTOK_AUTHORIZATION_URL', '').strip()
 TIKTOK_API_VERSION = os.getenv('TIKTOK_API_VERSION', 'v2.0').strip()
+TIKTOK_MARKETING_API_VERSION = os.getenv('TIKTOK_MARKETING_API_VERSION', 'v1.3').strip()
 GITHUB_REPOSITORY = os.getenv('GITHUB_REPOSITORY', 'ahmedabuseif1997/ads-wise').strip()
 MCP_AGENT_TOKEN = os.getenv('MCP_AGENT_TOKEN', '').strip()
 COOKIE_NAME = 'spa_ads_session'
@@ -597,7 +598,8 @@ def consume_oauth_state(state: str, user: dict) -> dict | None:
 
 
 def save_provider_connection(tenant_id: str, provider: str, token: str, account_id: str,
-                             account_name: str, currency: str = '', time_zone: str = '') -> None:
+                             account_name: str, currency: str = '', time_zone: str = '',
+                             status: str = 'connected') -> None:
     encrypted = google_cipher().encrypt(token.encode()).decode()
     now = utcnow()
     with connect() as db:
@@ -614,7 +616,51 @@ def save_provider_connection(tenant_id: str, provider: str, token: str, account_
             currency_code=excluded.currency_code, time_zone=excluded.time_zone,
             status=excluded.status, connected_at=excluded.connected_at, updated_at=excluded.updated_at''',
             (tenant_id, provider, encrypted, account_id, '', account_name, currency, time_zone,
-             'connected', now, now))
+             status, now, now))
+
+
+def provider_token(connection: dict, provider: str) -> str:
+    try:
+        return google_cipher().decrypt(connection['refresh_token_encrypted'].encode()).decode()
+    except (InvalidToken, ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(502, f'Stored {provider} authorization is invalid; reconnect {provider}') from exc
+
+
+def tiktok_connection(tenant_id: str, connected_only: bool = False) -> dict:
+    statuses = "status='connected'" if connected_only else "status IN ('authorized','connected')"
+    with connect() as db:
+        connection = qrow(db, f"SELECT * FROM provider_connections WHERE tenant_id=? AND provider='tiktok' AND {statuses}",
+                          (tenant_id,))
+    if not connection:
+        raise HTTPException(409, 'Connect TikTok Ads Manager to this workspace first')
+    return connection
+
+
+def tiktok_api_get(endpoint: str, access_token: str, params: dict,
+                   version: str = TIKTOK_MARKETING_API_VERSION) -> dict:
+    """Call an approved read-only Marketing API endpoint without exposing credentials."""
+    try:
+        response = httpx.get(
+            f'https://business-api.tiktok.com/open_api/{version}/{endpoint.strip("/")}/',
+            headers={'Access-Token': access_token}, params=params, timeout=25)
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(502, 'TikTok Ads Manager could not be reached; try again shortly') from exc
+    if payload.get('code') not in (0, '0', None):
+        request_id = str(payload.get('request_id') or '')[:80]
+        message = str(payload.get('message') or 'TikTok rejected the request')[:240]
+        suffix = f' (request {request_id})' if request_id else ''
+        raise HTTPException(502, f'{message}{suffix}')
+    return payload.get('data') or {}
+
+
+def tiktok_items(data: dict, *keys: str) -> list[dict]:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+    return []
 
 
 class ProviderResourceConflict(ValueError):
@@ -1681,6 +1727,10 @@ class GoogleCampaignStatusBody(BaseModel):
 class GoogleAccountSelectionBody(BaseModel):
     customer_id: str = Field(pattern=r'^\d{1,20}$')
     login_customer_id: str = Field(default='', pattern=r'^\d{0,20}$')
+
+
+class TikTokAccountSelectionBody(BaseModel):
+    advertiser_id: str = Field(pattern=r'^\d{1,30}$')
 
 
 class TrackingConfigBody(BaseModel):
@@ -2856,6 +2906,8 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
                                      WHERE tenant_id=? ORDER BY created_at DESC LIMIT 1''', (tenant_id,))
         meta_snapshot = qrow(db, "SELECT payload FROM provider_snapshots WHERE tenant_id=? AND provider='meta'",
                              (tenant_id,))
+        tiktok_snapshot = qrow(db, "SELECT payload FROM provider_snapshots WHERE tenant_id=? AND provider='tiktok'",
+                               (tenant_id,))
     meta_connection_row = next((item for item in connections if item['provider'] == 'meta'), None)
     count = {s:sum(c['status']==s for c in campaigns) for s in ['draft','pending','approved','rejected','archived']}
     total_authorized = sum(c['budget_fils'] for c in campaigns if c['status']=='approved')
@@ -2874,6 +2926,7 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
             'integrations':{p:integrations.get(p, {'status':'not_connected'})
                             for p in ('google','meta','tiktok','google_growth')},
             'google_metrics':json.loads(google_snapshot['payload']) if google_snapshot else None,
+            'tiktok_metrics':json.loads(tiktok_snapshot['payload']) if tiktok_snapshot else None,
             'growth_metrics':workspace_growth_snapshot(growth_payload, growth_connection),
             'tracking':{'meta_pixel_id':tracking['meta_pixel_id'] if tracking else '',
                         'tiktok_pixel_id':tracking['tiktok_pixel_id'] if tracking else '',
@@ -2886,7 +2939,8 @@ def workspace(tenant_id: str, user=Depends(tenant_member)):
             'seed_analysis':{**latest_analysis, 'analysis':json.loads(latest_analysis['analysis'])}
                             if latest_analysis else None,
             'meta':meta_workspace_summary(tenant_id, meta_connection_row, meta_snapshot),
-            'live_metrics_available':bool(google_snapshot), 'current_role':user['role'], 'members':members}
+            'live_metrics_available':bool(google_snapshot or meta_snapshot or tiktok_snapshot),
+            'current_role':user['role'], 'members':members}
 
 
 @app.post('/api/workspaces/{tenant_id}/integrations/google/start')
@@ -5082,7 +5136,9 @@ def tiktok_oauth_callback(auth_code: str = '', code: str = '', state: str = '', 
     try:
         response = httpx.post(
             f'https://business-api.tiktok.com/open_api/{TIKTOK_API_VERSION}/oauth2/access_token/',
-            json={'app_id': TIKTOK_APP_ID, 'secret': TIKTOK_APP_SECRET, 'auth_code': authorization_code},
+            json={'app_id': TIKTOK_APP_ID, 'secret': TIKTOK_APP_SECRET,
+                  'auth_code': authorization_code, 'is_long_term': True,
+                  'return_advertiser_ids': True},
             timeout=20)
         response.raise_for_status()
         payload = response.json()
@@ -5090,17 +5146,104 @@ def tiktok_oauth_callback(auth_code: str = '', code: str = '', state: str = '', 
             raise ValueError('TikTok authorization failed')
         data = payload.get('data') or {}
         access_token = data.get('access_token', '')
-        advertiser_ids = data.get('advertiser_ids') or []
+        advertiser_ids = [str(value) for value in (data.get('advertiser_ids') or [])
+                          if re.fullmatch(r'\d{1,30}', str(value))]
         if not access_token or not advertiser_ids:
             raise ValueError('No accessible TikTok advertiser account')
-        advertiser_id = str(advertiser_ids[0])
-        save_provider_connection(saved['tenant_id'], 'tiktok', access_token, advertiser_id, 'TikTok Ads')
+        save_provider_connection(saved['tenant_id'], 'tiktok', access_token, '',
+                                 'TikTok authorization', status='authorized')
+        accounts = [{'advertiser_id': advertiser_id, 'account_name': f'TikTok Ads {advertiser_id}'}
+                    for advertiser_id in advertiser_ids]
         with connect() as db:
+            db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at)
+                          VALUES(?,?,?,?) ON CONFLICT(tenant_id,provider) DO UPDATE SET
+                          payload=excluded.payload,updated_at=excluded.updated_at''',
+                       (saved['tenant_id'], 'tiktok_accounts', json.dumps({'accounts': accounts}), utcnow()))
             audit(db, user['user_id'], saved['tenant_id'], 'integration.tiktok_authorized',
-                  {'advertiser_id': advertiser_id})
-        return integration_redirect('tiktok', 'connected')
+                  {'advertiser_accounts': len(accounts)})
+        return integration_redirect('tiktok', 'authorized', tenant_id=saved['tenant_id'])
     except (httpx.HTTPError, ValueError, KeyError, InvalidToken):
         return integration_redirect('tiktok', 'error')
+
+
+@app.get('/api/workspaces/{tenant_id}/integrations/tiktok/accounts')
+def tiktok_accounts(tenant_id: str, user=Depends(tenant_member)):
+    tiktok_connection(tenant_id)
+    with connect() as db:
+        row = qrow(db, "SELECT payload FROM provider_snapshots WHERE tenant_id=? AND provider='tiktok_accounts'",
+                   (tenant_id,))
+    accounts = (json.loads(row['payload']).get('accounts') or []) if row else []
+    return {'accounts': accounts}
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/tiktok/account')
+def select_tiktok_account(tenant_id: str, body: TikTokAccountSelectionBody,
+                          user=Depends(tenant_writer)):
+    connection = tiktok_connection(tenant_id)
+    with connect() as db:
+        row = qrow(db, "SELECT payload FROM provider_snapshots WHERE tenant_id=? AND provider='tiktok_accounts'",
+                   (tenant_id,))
+    allowed = (json.loads(row['payload']).get('accounts') or []) if row else []
+    selected = next((item for item in allowed if str(item.get('advertiser_id')) == body.advertiser_id), None)
+    if not selected:
+        raise HTTPException(403, 'This advertiser account was not granted by the TikTok authorization')
+    token = provider_token(connection, 'TikTok')
+    info = tiktok_api_get('advertiser/info', token, {'advertiser_ids': json.dumps([body.advertiser_id])})
+    details = next(iter(tiktok_items(info, 'list', 'advertiser_info_list')), {})
+    account_name = str(details.get('name') or details.get('advertiser_name') or selected['account_name'])[:160]
+    currency = str(details.get('currency') or '')[:20]
+    time_zone = str(details.get('timezone') or details.get('time_zone') or '')[:80]
+    try:
+        save_provider_connection(tenant_id, 'tiktok', token, body.advertiser_id,
+                                 account_name, currency, time_zone)
+    except ProviderResourceConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    with connect() as db:
+        db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='tiktok_accounts'", (tenant_id,))
+        audit(db, user['user_id'], tenant_id, 'integration.tiktok_account_selected',
+              {'advertiser_id': body.advertiser_id})
+    return {'ok': True, 'advertiser_id': body.advertiser_id, 'account_name': account_name}
+
+
+@app.post('/api/workspaces/{tenant_id}/integrations/tiktok/sync')
+def tiktok_metrics_sync(tenant_id: str, user=Depends(tenant_writer)):
+    connection = tiktok_connection(tenant_id, connected_only=True)
+    advertiser_id = connection['customer_id']
+    token = provider_token(connection, 'TikTok')
+    common = {'advertiser_id': advertiser_id, 'page': 1, 'page_size': 1000}
+    campaigns = tiktok_items(tiktok_api_get('campaign/get', token, common), 'list', 'campaigns')
+    ad_groups = tiktok_items(tiktok_api_get('adgroup/get', token, common), 'list', 'adgroups', 'ad_groups')
+    ads = tiktok_items(tiktok_api_get('ad/get', token, common), 'list', 'ads')
+    today = datetime.now(timezone.utc).date()
+    report = tiktok_api_get('report/integrated/get', token, {
+        'advertiser_id': advertiser_id, 'service_type': 'AUCTION', 'report_type': 'BASIC',
+        'data_level': 'AUCTION_CAMPAIGN', 'dimensions': json.dumps(['campaign_id']),
+        'metrics': json.dumps(['campaign_id', 'campaign_name', 'spend', 'impressions', 'clicks',
+                               'conversion', 'cost_per_conversion']),
+        'start_date': str(today - timedelta(days=29)), 'end_date': str(today),
+        'page': 1, 'page_size': 1000,
+    })
+    rows = tiktok_items(report, 'list', 'rows')
+    snapshot = {
+        'advertiser_id': advertiser_id, 'account_name': connection['account_name'],
+        'currency': connection['currency_code'], 'time_zone': connection['time_zone'],
+        'range': 'last_30_days', 'campaigns': campaigns, 'ad_groups': ad_groups, 'ads': ads,
+        'report': rows, 'totals': {
+            'campaigns': len(campaigns), 'ad_groups': len(ad_groups), 'ads': len(ads),
+            'spend': round(sum(float((item.get('metrics') or {}).get('spend') or 0) for item in rows), 2),
+            'impressions': sum(int(float((item.get('metrics') or {}).get('impressions') or 0)) for item in rows),
+            'clicks': sum(int(float((item.get('metrics') or {}).get('clicks') or 0)) for item in rows),
+            'conversions': round(sum(float((item.get('metrics') or {}).get('conversion') or 0) for item in rows), 2),
+        }, 'updated_at': utcnow(),
+    }
+    with connect() as db:
+        db.execute('''INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at)
+                      VALUES(?,?,?,?) ON CONFLICT(tenant_id,provider) DO UPDATE SET
+                      payload=excluded.payload,updated_at=excluded.updated_at''',
+                   (tenant_id, 'tiktok', json.dumps(snapshot, ensure_ascii=False), snapshot['updated_at']))
+        audit(db, user['user_id'], tenant_id, 'integration.tiktok_synced', {
+            'campaigns': len(campaigns), 'ad_groups': len(ad_groups), 'ads': len(ads)})
+    return snapshot
 
 
 @app.post('/api/workspaces/{tenant_id}/integrations/{provider}/disconnect')
@@ -5108,6 +5251,9 @@ def disconnect_provider(tenant_id: str, provider: Literal['meta', 'tiktok'], use
     with connect() as db:
         db.execute('DELETE FROM provider_connections WHERE tenant_id=? AND provider=?', (tenant_id, provider))
         db.execute('DELETE FROM provider_snapshots WHERE tenant_id=? AND provider=?', (tenant_id, provider))
+        if provider == 'tiktok':
+            db.execute("DELETE FROM provider_snapshots WHERE tenant_id=? AND provider='tiktok_accounts'",
+                       (tenant_id,))
         db.execute('DELETE FROM provider_resource_bindings WHERE tenant_id=? AND provider=?',
                    (tenant_id, provider))
         if provider == 'meta':
