@@ -19,6 +19,8 @@ from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from app import main
 
+REAL_META_GRAPH = main.meta_graph
+
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
@@ -509,13 +511,11 @@ def test_developer_mcp_meta_refresh_is_guarded_read_only_and_tenant_scoped(clien
     assert too_soon.status_code == 429
     with main.connect() as db:
         db.execute("UPDATE meta_api_requests SET created_at='2026-01-01T00:00:00+00:00' WHERE tenant_id=?", (tid,))
-    def logged_graph(method, path, access_token='', params=None, timeout=25, allow_during_cooldown=False):
-        result = fake(method, path, access_token, params, timeout, allow_during_cooldown)
-        if method == 'GET' and path.startswith('act_111/'):
-            main.meta_request_log(tid, connection_ref, method, path, params or {}, 1, 'success',
-                                  200, '', 0, 1, {}, '')
-        return result
-    monkeypatch.setattr(main, 'meta_graph', logged_graph)
+    def graph_get(url, *, params, timeout):
+        return httpx.Response(200, json=fake('GET', url.split('/', 4)[4], params['access_token'], params))
+
+    monkeypatch.setattr(main, 'meta_graph', REAL_META_GRAPH)
+    monkeypatch.setattr(main.httpx, 'get', graph_get)
     before = len(fake.calls)
     refreshed = client.post('/mcp/developer', headers=headers, json={
         'jsonrpc': '2.0', 'id': 3, 'method': 'tools/call', 'params': {
@@ -526,6 +526,52 @@ def test_developer_mcp_meta_refresh_is_guarded_read_only_and_tenant_scoped(clien
     assert all(item['outcome'] == 'success' and item['status_code'] == 200 for item in payload['requests'])
     assert len(fake.calls) - before == 7
     assert fake.posts() == []
+
+
+@pytest.mark.parametrize('case,stop_at,status', [
+    ('temporary', 1, 503),
+    ('expired', 1, 409),
+    ('pagination', 1, 409),
+    ('throttle', 7, 429),
+])
+def test_guarded_refresh_stops_and_keeps_existing_snapshot(client, fake, monkeypatch, case, stop_at, status):
+    tid, _ = ready_workspace(client, fake)
+    monkeypatch.setattr(main, 'MCP_AGENT_TOKEN', 'test-mcp-token')
+    monkeypatch.setattr(main, 'META_MAX_READ_RETRIES', 2)
+    monkeypatch.setattr(main, 'meta_graph', REAL_META_GRAPH)
+    calls = []
+
+    def graph_get(url, *, params, timeout):
+        calls.append(url.split('/', 4)[4])
+        if len(calls) != stop_at:
+            return httpx.Response(200, json={'data': []})
+        if case == 'temporary':
+            return httpx.Response(503, json={'error': {'code': 2}})
+        if case == 'expired':
+            return httpx.Response(400, json={'error': {'code': 190, 'error_subcode': 463}})
+        if case == 'pagination':
+            return httpx.Response(200, json={'data': [], 'paging': {'next': 'next-page'}})
+        return httpx.Response(200, json={'data': []},
+                              headers={'x-fb-ads-insights-throttle': '{"acc_id_util_pct":90}'})
+
+    monkeypatch.setattr(main.httpx, 'get', graph_get)
+    with main.connect() as db:
+        db.execute("INSERT INTO provider_snapshots(tenant_id,provider,payload,updated_at) VALUES(?,?,?,?)",
+                   (tid, 'meta', '{}', '2026-01-01T00:00:00+00:00'))
+    result = client.post('/mcp/developer', headers={'Authorization': 'Bearer test-mcp-token'}, json={
+        'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {
+            'name': 'run_safe_meta_refresh', 'arguments': {'tenant_id': tid}}})
+    assert result.status_code == status, result.text
+    assert len(calls) == stop_at and all(path.startswith('act_111/') for path in calls)
+    with main.connect() as db:
+        snapshot = main.qrow(db, "SELECT payload FROM provider_snapshots WHERE tenant_id=? AND provider='meta'", (tid,))
+        connection = main.qrow(db, "SELECT status FROM provider_connections WHERE tenant_id=? AND provider='meta'", (tid,))
+        requests = main.qrows(db, 'SELECT attempt,usage,cooling_decision FROM meta_api_requests WHERE tenant_id=?', (tid,))
+    assert snapshot['payload'] == '{}' and connection['status'] == 'connected'
+    assert len(requests) == stop_at and all(row['attempt'] == 1 for row in requests)
+    if case == 'throttle':
+        assert any(json.loads(row['usage']).get('insights_account_percent') == 90 and row['cooling_decision']
+                   for row in requests)
 
 
 def test_meta_errors_are_classified_and_expired_tokens_require_reconnect(client, fake):

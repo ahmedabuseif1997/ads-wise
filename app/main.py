@@ -925,6 +925,9 @@ def meta_error_kind(code: int, subcode: int) -> str:
 
 
 _META_TENANT_SCOPE: contextvars.ContextVar[str] = contextvars.ContextVar('meta_tenant_scope', default='')
+_META_REFRESH_CALLS = 7
+_META_REFRESH_REMAINING: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    'meta_refresh_remaining', default=None)
 
 
 def meta_set_scope(tenant_id: str) -> None:
@@ -1008,6 +1011,16 @@ def meta_track_usage(headers, tenant_id: str, rate_limited_code: int = 0) -> Non
                               META_DEFAULT_COOLDOWN_SECONDS, 'Meta ad account usage ceiling reached')
     except (TypeError, ValueError):
         pass
+    try:
+        insights = json.loads(headers.get('x-fb-ads-insights-throttle') or '{}')
+        if isinstance(insights, dict):
+            if float(insights.get('app_id_util_pct') or 0) >= META_USAGE_CEILING_PERCENT:
+                meta_set_cooldown('app', META_DEFAULT_COOLDOWN_SECONDS, 'Meta insights app usage ceiling reached')
+            if float(insights.get('acc_id_util_pct') or 0) >= META_USAGE_CEILING_PERCENT:
+                meta_set_cooldown(tenant_scope, META_DEFAULT_COOLDOWN_SECONDS,
+                                  'Meta insights account usage ceiling reached')
+    except (TypeError, ValueError):
+        pass
     if rate_limited_code:
         scope = 'app' if rate_limited_code == 4 else tenant_scope
         meta_set_cooldown(scope, eta_seconds or META_DEFAULT_COOLDOWN_SECONDS,
@@ -1060,6 +1073,13 @@ def meta_usage_snapshot(headers) -> dict:
         if isinstance(account, dict):
             snapshot['account_max_percent'] = _meta_usage_percent(account)
             snapshot['account_reset_seconds'] = int(float(account.get('reset_time_duration') or 0))
+    except (TypeError, ValueError):
+        pass
+    try:
+        insights = json.loads(headers.get('x-fb-ads-insights-throttle') or '{}')
+        if isinstance(insights, dict) and insights:
+            snapshot['insights_app_percent'] = float(insights.get('app_id_util_pct') or 0)
+            snapshot['insights_account_percent'] = float(insights.get('acc_id_util_pct') or 0)
     except (TypeError, ValueError):
         pass
     return snapshot
@@ -1150,6 +1170,9 @@ def meta_graph(method: str, path: str, access_token: str = '', params: dict | No
                timeout: int = 25, allow_during_cooldown: bool = False) -> dict:
     """Single controlled Graph API path with bounded retries for idempotent reads only."""
     tenant_id = _META_TENANT_SCOPE.get()
+    remaining = _META_REFRESH_REMAINING.get()
+    if remaining is not None and (method != 'GET' or remaining <= 0):
+        raise HTTPException(409, 'Guarded Meta refresh exhausted its read budget')
     cooling_until = '' if allow_during_cooldown else meta_cooldown_until(tenant_id)
     if cooling_until:
         raise MetaAPIError('cooling_down', cooling_until)
@@ -1159,11 +1182,13 @@ def meta_graph(method: str, path: str, access_token: str = '', params: dict | No
         request_params['access_token'] = access_token
         request_params['appsecret_proof'] = meta_appsecret_proof(access_token)
     url = f'https://graph.facebook.com/{META_GRAPH_VERSION}/{path.lstrip("/")}'
-    max_attempts = 1 + (META_MAX_READ_RETRIES if method == 'GET' else 0)
+    max_attempts = 1 + (META_MAX_READ_RETRIES if method == 'GET' and remaining is None else 0)
     for attempt in range(1, max_attempts + 1):
         started = time.monotonic()
         with _META_CONCURRENCY:
             scope, connection_ref = meta_rate_acquire(tenant_id)
+            if remaining is not None:
+                _META_REFRESH_REMAINING.set(remaining - 1)
             try:
                 response = (httpx.get(url, params=request_params, timeout=timeout) if method == 'GET' else
                             httpx.post(url, data=request_params, timeout=timeout))
@@ -1182,7 +1207,9 @@ def meta_graph(method: str, path: str, access_token: str = '', params: dict | No
             data = {}
         usage = meta_usage_snapshot(response.headers)
         duration = int((time.monotonic() - started) * 1000)
-        if response.status_code >= 400 or (isinstance(data, dict) and data.get('error')):
+        invalid_refresh_data = remaining is not None and (
+            response.status_code != 200 or not isinstance(data, dict) or not isinstance(data.get('data'), list))
+        if response.status_code >= 400 or (isinstance(data, dict) and data.get('error')) or invalid_refresh_data:
             error = data.get('error') if isinstance(data, dict) and isinstance(data.get('error'), dict) else {}
             try:
                 code, subcode = int(error.get('code') or 0), int(error.get('error_subcode') or 0)
@@ -1208,6 +1235,8 @@ def meta_graph(method: str, path: str, access_token: str = '', params: dict | No
                          response.status_code, '', 0, duration, usage,
                          f'paused_until:{cooling}' if cooling else '')
         meta_circuit_record(scope, tenant_id, False)
+        if remaining is not None and cooling:
+            raise MetaAPIError('cooling_down', cooling)
         return data if isinstance(data, dict) else {}
     raise MetaAPIError('temporary')
 
@@ -1222,6 +1251,8 @@ def meta_get_all(path: str, access_token: str, params: dict, max_items: int = 50
         items.extend(item for item in (data.get('data') or []) if isinstance(item, dict))
         paging = data.get('paging') or {}
         after = (paging.get('cursors') or {}).get('after', '')
+        if _META_REFRESH_REMAINING.get() is not None and paging.get('next') and len(items) < max_items:
+            raise HTTPException(409, 'Guarded Meta refresh needs another page. No snapshot was saved.')
         if not after or not paging.get('next') or len(items) >= max_items:
             break
     return items[:max_items]
@@ -2667,13 +2698,18 @@ def developer_mcp(request_body: dict, request: Request):
             report_range=str(args.get('range') or 'last_30_days')
             guard=meta_safe_refresh_guard(tenant_id)
             started_at=utcnow()
-            snapshot=meta_metrics_sync(tenant_id,range=report_range,force=True,
-                                       user={'user_id':'mcp:developer'})
+            _, connection_ref = meta_request_identity(tenant_id)
+            budget = _META_REFRESH_REMAINING.set(_META_REFRESH_CALLS)
+            try:
+                snapshot=meta_metrics_sync(tenant_id,range=report_range,force=True,
+                                           user={'user_id':'mcp:developer'})
+            finally:
+                _META_REFRESH_REMAINING.reset(budget)
             with connect() as db:
                 requests=qrows(db,'''SELECT endpoint,outcome,status_code,error_kind,attempt,usage,
                                       cooling_decision,created_at FROM meta_api_requests
-                                      WHERE tenant_id=? AND created_at>=? ORDER BY created_at''',
-                              (tenant_id,started_at))
+                                      WHERE tenant_id=? AND connection_ref=? AND created_at>=? ORDER BY created_at''',
+                              (tenant_id,connection_ref,started_at))
             payload={'ok':True,'tenant_id':tenant_id,'synced_at':snapshot['synced_at'],
                      'asset_inventory':snapshot.get('asset_inventory',{}),
                      'delivery_coverage':snapshot.get('delivery_coverage',{}),
@@ -4105,6 +4141,8 @@ def meta_metrics_sync(tenant_id: str, range: str = 'last_30_days', force: bool =
         synced_seconds_ago = (datetime.now(timezone.utc) -
                               datetime.fromisoformat(snapshot_row['updated_at'])).total_seconds()
         if not force or synced_seconds_ago < 60:
+            if _META_REFRESH_REMAINING.get() is not None:
+                raise HTTPException(429, 'Guarded Meta refresh found a newly synced snapshot')
             return cached
     meta_guard(tenant_id)
     access_token = meta_access_token(connection)
@@ -4132,7 +4170,12 @@ def meta_metrics_sync(tenant_id: str, range: str = 'last_30_days', force: bool =
             'level': 'account', 'fields': 'spend,impressions,clicks,actions', 'time_range': time_range,
             'time_increment': '1'}, 100)
     except MetaAPIError as exc:
+        if _META_REFRESH_REMAINING.get() is not None:
+            raise HTTPException(META_ERROR_STATUS.get(exc.kind, 502),
+                                exc.user_message('Meta metrics could not be loaded')) from exc
         raise meta_failure(tenant_id, exc, 'Meta metrics could not be loaded') from exc
+    if _META_REFRESH_REMAINING.get() not in (None, 0):
+        raise HTTPException(409, 'Guarded Meta refresh did not complete all seven reads')
     managed = meta_managed_campaigns(tenant_id)
     campaigns = {}
     for row in campaign_rows:
